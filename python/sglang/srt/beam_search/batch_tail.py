@@ -24,6 +24,8 @@ from typing import TYPE_CHECKING, Any, List, NamedTuple
 import msgspec
 import torch
 
+from sglang.srt.utils.common import is_pin_memory_available
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
@@ -66,17 +68,22 @@ def append_beam_tail(batch: ScheduleBatch) -> None:
     if not entries:
         return
 
-    leader_idx_cpu = torch.tensor(leader_idx, dtype=torch.int64)
-    widths_cpu = torch.tensor(widths, dtype=torch.int64)
+    pin_memory = is_pin_memory_available(batch.device)
+    leader_idx_cpu = torch.tensor(leader_idx, dtype=torch.int64, pin_memory=pin_memory)
+    widths_cpu = torch.tensor(widths, dtype=torch.int64, pin_memory=pin_memory)
     leader_idx_dev = leader_idx_cpu.to(batch.device, non_blocking=True)
     widths_dev = widths_cpu.to(batch.device, non_blocking=True)
 
     batch.req_pool_indices = torch.cat([batch.req_pool_indices, *tails])
     batch.req_pool_indices_cpu = torch.cat([batch.req_pool_indices_cpu, *tails_cpu])
+    # output_size: without it, device repeats are read back to size the output,
+    # which syncs the host while the overlap scheduler builds the next batch.
     batch.seq_lens = torch.cat(
         [
             batch.seq_lens,
-            torch.repeat_interleave(batch.seq_lens[leader_idx_dev], widths_dev),
+            torch.repeat_interleave(
+                batch.seq_lens[leader_idx_dev], widths_dev, output_size=t
+            ),
         ]
     )
     if batch.seq_lens_cpu is not None:
@@ -89,11 +96,30 @@ def append_beam_tail(batch: ScheduleBatch) -> None:
     batch.orig_seq_lens = torch.cat(
         [
             batch.orig_seq_lens,
-            torch.repeat_interleave(batch.orig_seq_lens[leader_idx_dev], widths_dev),
+            torch.repeat_interleave(
+                batch.orig_seq_lens[leader_idx_dev], widths_dev, output_size=t
+            ),
         ]
     )
     batch.seq_lens_sum = None
     batch.beam_tail = BeamTail(num_base_rows=len(batch.reqs), entries=entries)
+
+
+def trie_row_levels(batch: ScheduleBatch, *, max_level: int) -> torch.Tensor:
+    """Trie level of every row of a beam-only decode batch: the leaders, then
+    the tail's member rows, each at its group's depth capped at max_level."""
+    row_levels = [min(req.beam_group.num_generated, max_level) for req in batch.reqs]
+    if batch.beam_tail is not None:
+        for entry in batch.beam_tail.entries:
+            level = min(entry.group.num_generated, max_level)
+            row_levels.extend([level] * (entry.end - entry.start))
+    assert len(row_levels) == len(batch.seq_lens)
+    # Pinned and non-blocking, so the host never waits on the running forward.
+    return torch.tensor(
+        row_levels,
+        dtype=torch.int64,
+        pin_memory=is_pin_memory_available(batch.device),
+    ).to(batch.device, non_blocking=True)
 
 
 def strip_beam_tail(batch: ScheduleBatch) -> None:
