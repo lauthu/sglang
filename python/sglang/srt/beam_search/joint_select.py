@@ -43,6 +43,15 @@ class SelectResult(msgspec.Struct):
     num_finished: torch.Tensor  # [] int64
 
 
+class SurvivorSelect(msgspec.Struct):
+    """Top-beam_width extensions of a step whose candidates cannot be stop
+    tokens (the trie path), so every selection survives."""
+
+    next_tokens: torch.Tensor  # [beam_width] int64
+    parent_idx: torch.Tensor  # [beam_width] int64, row index into the input frontier
+    new_cum_logprobs: torch.Tensor  # [beam_width] float32
+
+
 class FinalSelect(msgspec.Struct):
     """Top-beam_width candidates of a length-terminated step (all finished)."""
 
