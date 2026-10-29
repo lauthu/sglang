@@ -28,11 +28,12 @@ not the individual row -- owns that region: it is freed once, deduped, at
 group finish.
 
 Every tick splits in two, and the whole file follows the naming. select_* is
-the launch half (tensor-side, no D2H) and must run before the next forward
-resolves its inputs, so the relayed tokens and reparented KV are the selected
-ones. commit_* is the deferred half (DAG build, finish/abort); under overlap it
-lags one forward and discards overshoot steps. Sync callers run both within one
-tick. Commits are tick-gated; BeamGroup.commit_pending documents why.
+the launch half (tensor-side, no host sync, so it queues behind the forward)
+and must run before the next forward resolves its inputs, so the relayed tokens
+and reparented KV are the selected ones. commit_* is the deferred half (DAG
+build, finish/abort); under overlap it lags one forward and discards overshoot
+steps. Sync callers run both within one tick. Commits are tick-gated;
+BeamGroup.commit_pending documents why.
 """
 
 from __future__ import annotations
@@ -70,6 +71,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
+from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -346,7 +348,9 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         if final:
             # Prefill-terminated (max_new_tokens == 1): no spawn, but the relay
             # slot still needs a token so an overshoot step has a valid input.
-            self._stash_next_tokens([req.kv.req_pool_idx], next_tokens[:1])
+            self._stash_next_tokens(
+                self._upload_rows([req.kv.req_pool_idx]), next_tokens[:1]
+            )
             return
         self._spawn_member_rows(group, req)
         req.output_ids.append(0)  # length placeholder; DAG owns history
@@ -372,8 +376,8 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             f"but only {self.req_to_token_pool.available_size()} are free; the "
             f"admission gate (get_num_allocatable_reqs) must reserve them."
         )
-        device = self.req_to_token_pool.device
-        member_rows = torch.tensor(rows, dtype=torch.int64, device=device)
+        all_rows = self._upload_rows([leader.kv.req_pool_idx, *rows])
+        member_rows = all_rows[1:]
         alias_members_prompt_kv(
             self.req_to_token_pool.req_to_token,
             member_rows,
@@ -382,10 +386,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         )
         group.member_rows = member_rows
         group.member_rows_cpu = torch.tensor(rows, dtype=torch.int64)
-        leader_row = torch.tensor(
-            [leader.kv.req_pool_idx], dtype=torch.int64, device=device
-        )
-        group.all_rows = torch.cat([leader_row, member_rows])
+        group.all_rows = all_rows
 
     def select_and_relay_decode(
         self, batch: ScheduleBatch, logits_output: LogitsProcessorOutput
@@ -614,11 +615,13 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             group._pending_steps.clear()
             self._num_live_groups -= 1
 
-    def _stash_next_tokens(self, rows, tokens) -> None:
-        # Accepts GPU tensors (decode path, no D2H) or host lists (prefill).
+    def _upload_rows(self, rows: List[int]) -> torch.Tensor:
+        # Pinned staging queues the copy; a pageable one would sync the host.
         device = self.req_to_token_pool.device
-        if not torch.is_tensor(rows):
-            rows = torch.tensor(rows, dtype=torch.int64, device=device)
-        if not torch.is_tensor(tokens):
-            tokens = torch.tensor(tokens, dtype=torch.int64, device=device)
+        staging = torch.tensor(
+            rows, dtype=torch.int64, pin_memory=is_pin_memory_available(device)
+        )
+        return staging.to(device, non_blocking=True)
+
+    def _stash_next_tokens(self, rows: torch.Tensor, tokens: torch.Tensor) -> None:
         self.future_map.stash(rows, RelayPayload(bonus_tokens=tokens))
