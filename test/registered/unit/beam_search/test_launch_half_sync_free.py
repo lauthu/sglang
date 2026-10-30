@@ -27,6 +27,10 @@ NUM_GROUPS = 2
 VOCAB = TOKEN_START + 3 * CODEBOOK + 7
 
 
+class _Req(SimpleNamespace):
+    """A Req stand-in that BeamGroup can hold weakly, as it holds a real Req."""
+
+
 class _ReqToTokenPool:
     def __init__(self):
         self.device = torch.device("cuda")
@@ -87,7 +91,7 @@ def _setup():
         )
         group.trie_prefix_codes = torch.empty((1, 0), dtype=torch.int64, device="cuda")
         group.prompt_len = PROMPT_LEN
-        req = SimpleNamespace(
+        req = _Req(
             beam_group=group,
             kv=ReqKvInfo(
                 req_pool_idx=row,
