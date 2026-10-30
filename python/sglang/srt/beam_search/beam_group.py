@@ -31,7 +31,11 @@ import torch
 
 from sglang.srt.beam_search.fork import StagedOrphans
 from sglang.srt.beam_search.history import BeamNode, materialize_tokens
-from sglang.srt.beam_search.joint_select import FinalSelect, SelectResult
+from sglang.srt.beam_search.joint_select import (
+    FinalSelect,
+    SelectResult,
+    SurvivorSelect,
+)
 
 
 class BeamGroupState(enum.Enum):
@@ -142,7 +146,9 @@ class BeamGroup:
         """Whether the launch half has already staged the terminal selection."""
         return self.num_generated >= self.max_new_tokens
 
-    def advance_frontier(self, sel: SelectResult, tick: int = 0) -> None:
+    def advance_frontier(
+        self, sel: SelectResult | SurvivorSelect, tick: int = 0
+    ) -> None:
         """Launch half of one selection step: evolve the frontier tensor and
         stage the result for commit, stamped with its forward tick."""
         assert self.state == BeamGroupState.DECODING
@@ -180,7 +186,7 @@ class BeamGroup:
                 return True
         return False
 
-    def _commit_step(self, sel: SelectResult) -> bool:
+    def _commit_step(self, sel: SelectResult | SurvivorSelect) -> bool:
         if self.device_history:
             self._device_tokens.append(sel.next_tokens[: self.beam_width])
             self._device_parents.append(sel.parent_idx[: self.beam_width])

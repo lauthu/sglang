@@ -28,17 +28,18 @@ not the individual row -- owns that region: it is freed once, deduped, at
 group finish.
 
 Every tick splits in two, and the whole file follows the naming. select_* is
-the launch half (tensor-side, no D2H) and must run before the next forward
-resolves its inputs, so the relayed tokens and reparented KV are the selected
-ones. commit_* is the deferred half (DAG build, finish/abort); under overlap it
-lags one forward and discards overshoot steps. Sync callers run both within one
-tick. Commits are tick-gated; BeamGroup.commit_pending documents why.
+the launch half (tensor-side, no host sync, so it queues behind the forward)
+and must run before the next forward resolves its inputs, so the relayed tokens
+and reparented KV are the selected ones. commit_* is the deferred half (DAG
+build, finish/abort); under overlap it lags one forward and discards overshoot
+steps. Sync callers run both within one tick. Commits are tick-gated;
+BeamGroup.commit_pending documents why.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, List, Optional, Sequence
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import msgspec
 import torch
@@ -53,8 +54,14 @@ from sglang.srt.beam_search.fork import (
     neutral_member_sampling_params,
     remap_kv_mapping,
 )
-from sglang.srt.beam_search.joint_select import joint_select, select_final_topk
+from sglang.srt.beam_search.joint_select import (
+    FinalSelect,
+    SurvivorSelect,
+    joint_select,
+    select_final_topk,
+)
 from sglang.srt.beam_search.trie_constraint import BeamTrieConstraint
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import (
@@ -70,6 +77,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
+from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -97,6 +105,11 @@ def _rows_topk_logprobs(pieces: Sequence[torch.Tensor], num_candidates: int):
         vals.append(v - lse)
         toks.append(t)
     return torch.cat(vals), torch.cat(toks)
+
+
+def _stack(tensors: Sequence[torch.Tensor]) -> torch.Tensor:
+    # A lone group needs no copy.
+    return tensors[0].unsqueeze(0) if len(tensors) == 1 else torch.stack(tensors)
 
 
 class BeamCoordinator(msgspec.Struct, kw_only=True):
@@ -333,20 +346,39 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         """Launch half of the leader's prefill tick: first selection, member-row
         spawn, and the relay overwrite (the sampled token is void)."""
         group: BeamGroup = req.beam_group
-        top_logprobs, top_tokens = self._group_topk_logprobs(
-            group,
-            [logits_output.beam.leader_logits[pos : pos + 1]],
-            self._capture_normalizers(
-                logits_output.beam,
-                leader_slice=slice(pos, pos + 1),
-            ),
+        logits = logits_output.beam.leader_logits[pos : pos + 1]
+        normalizers = self._capture_normalizers(
+            logits_output.beam, leader_slice=slice(pos, pos + 1)
         )
         final = group.next_step_is_final()
-        next_tokens, _ = self._select_group(group, top_logprobs, top_tokens, tick)
+        if self._fused_select_applies(
+            group, logits=logits, has_normalizer=normalizers is not None
+        ):
+            normalizer = (
+                normalizers[0]
+                if normalizers is not None
+                else torch.logsumexp(logits.float(), dim=-1, keepdim=True)
+            )
+            [(next_tokens, _)] = self._select_fused(
+                [group],
+                leader_logits=logits,
+                tail_logits=logits,
+                leader_normalizer=normalizer,
+                tail_normalizer=normalizer,
+                frontier_rows=[(0, 0)],
+                tick=tick,
+            )
+        else:
+            top_logprobs, top_tokens = self._group_topk_logprobs(
+                group, [logits], normalizers
+            )
+            next_tokens, _ = self._select_group(group, top_logprobs, top_tokens, tick)
         if final:
             # Prefill-terminated (max_new_tokens == 1): no spawn, but the relay
             # slot still needs a token so an overshoot step has a valid input.
-            self._stash_next_tokens([req.kv.req_pool_idx], next_tokens[:1])
+            self._stash_next_tokens(
+                self._upload_rows([req.kv.req_pool_idx]), next_tokens[:1]
+            )
             return
         self._spawn_member_rows(group, req)
         req.output_ids.append(0)  # length placeholder; DAG owns history
@@ -372,8 +404,8 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             f"but only {self.req_to_token_pool.available_size()} are free; the "
             f"admission gate (get_num_allocatable_reqs) must reserve them."
         )
-        device = self.req_to_token_pool.device
-        member_rows = torch.tensor(rows, dtype=torch.int64, device=device)
+        all_rows = self._upload_rows([leader.kv.req_pool_idx, *rows])
+        member_rows = all_rows[1:]
         alias_members_prompt_kv(
             self.req_to_token_pool.req_to_token,
             member_rows,
@@ -382,10 +414,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         )
         group.member_rows = member_rows
         group.member_rows_cpu = torch.tensor(rows, dtype=torch.int64)
-        leader_row = torch.tensor(
-            [leader.kv.req_pool_idx], dtype=torch.int64, device=device
-        )
-        group.all_rows = torch.cat([leader_row, member_rows])
+        group.all_rows = all_rows
 
     def select_and_relay_decode(
         self, batch: ScheduleBatch, logits_output: LogitsProcessorOutput
@@ -396,9 +425,22 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         if tail is None:
             return
         capture = logits_output.beam
+        fused = {}
         for gi, entry in enumerate(tail.entries):
             group = entry.group
             if group.retired or group.state != BeamGroupState.DECODING:
+                continue
+            if self._fused_select_applies(
+                group,
+                logits=capture.tail_logits,
+                has_normalizer=capture.leader_normalizer is not None,
+            ):
+                key = (
+                    group.beam_width,
+                    group.num_generated,
+                    group.next_step_is_final(),
+                )
+                fused.setdefault(key, []).append((gi, entry))
                 continue
             top_logprobs, top_tokens = self._group_topk_logprobs(
                 group,
@@ -416,6 +458,21 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 group, top_logprobs, top_tokens, batch.forward_iter
             )
             self._apply_survivors(group, next_tokens, parent_idx, batch.forward_iter)
+        for members in fused.values():
+            groups = [entry.group for _, entry in members]
+            selections = self._select_fused(
+                groups,
+                leader_logits=capture.leader_logits,
+                tail_logits=capture.tail_logits,
+                leader_normalizer=capture.leader_normalizer,
+                tail_normalizer=capture.tail_normalizer,
+                frontier_rows=[(gi, entry.start) for gi, entry in members],
+                tick=batch.forward_iter,
+            )
+            for group, (next_tokens, parent_idx) in zip(groups, selections):
+                self._apply_survivors(
+                    group, next_tokens, parent_idx, batch.forward_iter
+                )
 
     def commit_decode(self, batch: ScheduleBatch) -> set:
         """Deferred half: fold staged selections into the DAG and apply
@@ -476,6 +533,96 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 group.num_generated - 1,
             )
         return sel.next_tokens[:k], sel.parent_idx[:k]
+
+    def _fused_select_applies(
+        self, group: BeamGroup, *, logits: torch.Tensor, has_normalizer: bool
+    ) -> bool:
+        """Whether trie_select's kernels can run this group's next selection:
+        compact logits with the head's normalizer, or a dense prefill row."""
+        trie = self.trie_constraint
+        if trie is None or not envs.SGLANG_ENABLE_FUSED_BEAM_SELECT.get():
+            return False
+        from sglang.srt.beam_search.trie_select import fused_select_supported
+
+        config = trie.config
+        depth = group.num_generated
+        compact = logits.shape[1] == config.codebook_size
+        return (
+            depth < config.num_codebooks
+            and trie.dense_child_masks(depth) is not None
+            and (has_normalizer if compact else depth == 0)
+            and fused_select_supported(
+                beam_width=group.beam_width,
+                num_rows=group.frontier_cum_logprobs.shape[0],
+                codebook_size=config.codebook_size,
+            )
+        )
+
+    def _select_fused(
+        self,
+        groups: List[BeamGroup],
+        *,
+        leader_logits: torch.Tensor,
+        tail_logits: torch.Tensor,
+        leader_normalizer: torch.Tensor,
+        tail_normalizer: torch.Tensor,
+        frontier_rows: List[Tuple[int, int]],
+        tick: int,
+    ) -> List[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+        """_group_topk_logprobs + _select_group in one fused step for groups that
+        share beam width and depth; returns each group's (tokens, parent_idx)."""
+        from sglang.srt.beam_search.trie_select import select_trie_beams
+
+        trie = self.trie_constraint
+        config = trie.config
+        depth = groups[0].num_generated
+        final = groups[0].next_step_is_final()
+        token_start = config.token_start_for_depth(depth)
+        selection = select_trie_beams(
+            leader_logits=leader_logits,
+            tail_logits=tail_logits,
+            leader_normalizer=leader_normalizer.float(),
+            tail_normalizer=tail_normalizer.float(),
+            frontier_rows=self._upload_rows(
+                [row for rows in frontier_rows for row in rows]
+            ).view(-1, 2),
+            cum_logprobs=_stack([g.frontier_cum_logprobs for g in groups]),
+            prefix_codes=_stack([g.trie_prefix_codes for g in groups]),
+            child_masks=trie.dense_child_masks(depth),
+            codebook_size=config.codebook_size,
+            code_offset=(
+                0 if leader_logits.shape[1] == config.codebook_size else token_start
+            ),
+            token_start=token_start,
+            beam_width=groups[0].beam_width,
+            final=final,
+        )
+        results = []
+        for g, group in enumerate(groups):
+            tokens = selection.tokens[g]
+            parent_idx = selection.parent_idx[g]
+            if final:
+                group.advance_final_frontier(
+                    FinalSelect(
+                        tokens=tokens,
+                        parent_idx=parent_idx,
+                        cum_logprobs=selection.cum_logprobs[g],
+                    ),
+                    tick,
+                )
+                results.append((tokens, None))
+                continue
+            group.advance_frontier(
+                SurvivorSelect(
+                    next_tokens=tokens,
+                    parent_idx=parent_idx,
+                    new_cum_logprobs=selection.cum_logprobs[g],
+                ),
+                tick,
+            )
+            group.trie_prefix_codes = selection.prefix_codes[g]
+            results.append((tokens, parent_idx))
+        return results
 
     @staticmethod
     def _capture_normalizers(
@@ -614,11 +761,13 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             group._pending_steps.clear()
             self._num_live_groups -= 1
 
-    def _stash_next_tokens(self, rows, tokens) -> None:
-        # Accepts GPU tensors (decode path, no D2H) or host lists (prefill).
+    def _upload_rows(self, rows: List[int]) -> torch.Tensor:
+        # Pinned staging queues the copy; a pageable one would sync the host.
         device = self.req_to_token_pool.device
-        if not torch.is_tensor(rows):
-            rows = torch.tensor(rows, dtype=torch.int64, device=device)
-        if not torch.is_tensor(tokens):
-            tokens = torch.tensor(tokens, dtype=torch.int64, device=device)
+        staging = torch.tensor(
+            rows, dtype=torch.int64, pin_memory=is_pin_memory_available(device)
+        )
+        return staging.to(device, non_blocking=True)
+
+    def _stash_next_tokens(self, rows: torch.Tensor, tokens: torch.Tensor) -> None:
         self.future_map.stash(rows, RelayPayload(bonus_tokens=tokens))

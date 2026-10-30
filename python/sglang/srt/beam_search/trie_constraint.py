@@ -352,6 +352,15 @@ class BeamTrieConstraint:
             return self._sparse_level2_mask(prefix_codes)
         raise ValueError(f"Unsupported SID depth: {depth}")
 
+    def dense_child_masks(self, depth: int) -> Optional[torch.Tensor]:
+        """[prefixes, codebook_size] valid children at depth, indexed by the
+        prefix's flat code; None where the level is stored sparse."""
+        if depth == 0:
+            return self.root_mask.unsqueeze(0)
+        if depth == 1:
+            return self.level1_masks
+        return self.level2_masks
+
     def topk_logprobs(
         self,
         pieces: Sequence[torch.Tensor],
