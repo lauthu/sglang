@@ -32,6 +32,18 @@ candidate survives and joint_select's stop handling has nothing to do.
 Two launches per step. Each band program scores a band of frontier rows and
 keeps its best beam_width sort keys; one merge program per group selects from
 its bands and writes tokens, parents, scores and the next prefix codes.
+
+The kernels work at any prefix depth (codes chosen so far) whose valid children
+come as one dense table: a row per prefix, indexed by the prefix's codes read
+as a base-codebook_size number. BeamTrieConstraint has such tables at depths 0
+and 1, and at depth 2 when codebook_size**3 bytes fit its 512 MiB budget; it
+stores no deeper level, since trie_config admits exactly three codebooks.
+Everything else takes the torch path (coordinator._fused_select_applies):
+- a level stored sparse (level 2 above that budget);
+- compact logits without the output head's normalizer, and full-vocabulary
+  logits after the prefill;
+- shapes whose band or merge sort would hold more than _SORT_KEYS keys
+  (fused_select_supported), or with fewer candidates than beam_width.
 """
 
 from __future__ import annotations
@@ -89,7 +101,8 @@ def fused_select_supported(
     *, beam_width: int, num_rows: int, codebook_size: int
 ) -> bool:
     """Shapes whose sorts fit one program; fewer candidates than beam_width
-    need the torch path's -inf padding."""
+    need the torch path's -inf padding. The sort bounds also keep a
+    candidate's flat index under 2**24, inside the sort key's 31 bits."""
     if beam_width > num_rows * codebook_size:
         return False
     layout = _BandLayout.of(
@@ -155,16 +168,11 @@ def _score_band_kernel(
     )
 
     state_rows = group * num_rows + rows
-    if DEPTH == 0:
-        mask_rows = tl.zeros([BAND_ROWS], dtype=tl.int64)
-    elif DEPTH == 1:
-        mask_rows = tl.load(prefix_codes + state_rows * DEPTH, mask=row_ok, other=0)
-    else:
-        mask_rows = tl.load(
-            prefix_codes + state_rows * DEPTH, mask=row_ok, other=0
-        ) * codebook_size + tl.load(
-            prefix_codes + state_rows * DEPTH + 1, mask=row_ok, other=0
-        )
+    # The prefix's row in the dense table: its codes as a base-codebook_size number.
+    mask_rows = tl.zeros([BAND_ROWS], dtype=tl.int64)
+    for d in tl.static_range(DEPTH):
+        code = tl.load(prefix_codes + state_rows * DEPTH + d, mask=row_ok, other=0)
+        mask_rows = mask_rows * codebook_size + code
     allowed = ok & (
         tl.load(
             child_masks + mask_rows[:, None] * codebook_size + codes[None, :],
@@ -303,12 +311,16 @@ def select_trie_beams(
     frontier_rows: [num_groups, 2] integer, on the logits' device.
     cum_logprobs: [num_groups, num_rows] float32 frontier scores.
     prefix_codes: [num_groups, num_rows, depth] int64 codes chosen so far.
-    child_masks: [num_prefixes, codebook_size] bool valid children, indexed by
-        the prefix's flat code (one row at depth 0).
+    child_masks: [codebook_size**depth, codebook_size] bool valid children,
+        indexed by the prefix's flat code (one row at depth 0).
     """
     num_groups, num_rows, depth = prefix_codes.shape
     assert fused_select_supported(
         beam_width=beam_width, num_rows=num_rows, codebook_size=codebook_size
+    )
+    assert child_masks.shape == (codebook_size**depth, codebook_size), (
+        f"depth {depth} needs a dense child-mask table "
+        f"[{codebook_size**depth}, {codebook_size}], got {tuple(child_masks.shape)}"
     )
     assert leader_normalizer.dtype == torch.float32
     assert tail_normalizer.dtype == torch.float32
