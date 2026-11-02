@@ -21,10 +21,6 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.beam_search.beam_kernels import (
-    group_beam_rows,
-    ungroup_beam_rows,
-)
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -242,32 +238,21 @@ def forward(
     if k_buffer.ndim != 3 or v_buffer.ndim != 3:
         raise RuntimeError("Shared-context attention requires 3D MHA K/V cache buffers")
 
-    num_groups = metadata.num_groups
-    beam_width = metadata.beam_width
     q_heads = layer.tp_q_head_num
     head_dim = layer.head_dim
-    grouped_q = group_beam_rows(
-        q,
-        num_groups,
-        beam_width,
-    ).view(num_groups, beam_width, q_heads, head_dim)
     from sglang.srt.beam_search.shared_context_attention_kernel import (
         shared_context_attention,
     )
 
     output = shared_context_attention(
-        grouped_q,
+        q.reshape(-1, q_heads, head_dim),
         k_buffer,
         v_buffer,
         metadata.context_slots,
         metadata.context_cu_seqlens,
         metadata.decode_slots,
         metadata.decode_lens,
+        beam_width=metadata.beam_width,
         softmax_scale=layer.scaling,
     )
-    flat_output = ungroup_beam_rows(
-        output,
-        num_groups,
-        beam_width,
-    ).view(-1, q_heads, head_dim)
-    return flat_output.view(-1, q_heads * head_dim)
+    return output.view(-1, q_heads * head_dim)
