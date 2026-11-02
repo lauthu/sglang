@@ -558,6 +558,16 @@ RUN --mount=type=cache,target=/root/.cache/pip \
             "nvidia-nccl-cu13==${SGL_NCCL_VERSION}"; \
     fi
 
+# PyTorch 2.13 pins nvidia-cublas 13.1, which has no SM120 GEMM kernels and runs
+# Ampere cutlass_80 kernels there; 13.4 adds SM120-native ones. Declared here,
+# not with the stage's other ARGs, so changing it rebuilds only what follows.
+ARG SGL_CUBLAS_VERSION=13.4.3.11
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+        python3 -m pip install --force-reinstall --no-deps \
+            "nvidia-cublas==${SGL_CUBLAS_VERSION}"; \
+    fi
+
 # Per-CUDA-major package installs. The `nixl` stub package is needed (it owns
 # the `nixl` import path) but unconditionally requires nixl-cu12, so we install
 # it with --no-deps and pair it with the matching nixl-cu12 / nixl-cu13 binary
