@@ -13,11 +13,14 @@
 # ==============================================================================
 """Native Triton shared-context attention for wide beam decoding.
 
-The online-softmax helpers and the input checks are shared with the split-KV
-path in shared_context_split_kv_kernel.py.
+The online-softmax helpers and the input checks are shared with the opt-in
+split-KV and stream-K paths (shared_context_split_kv_kernel.py and
+shared_context_stream_k_kernel.py).
 """
 
 from __future__ import annotations
+
+import functools
 
 import torch
 import triton
@@ -246,6 +249,11 @@ def _shared_context_attention_kernel(
         result,
         mask=beam_mask[:, None] & dim_mask[None, :],
     )
+
+
+@functools.lru_cache(maxsize=None)
+def num_sms(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
 def check_shared_context_inputs(

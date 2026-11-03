@@ -13,18 +13,17 @@
 # ==============================================================================
 """Split-KV shared-context attention for wide beam decoding.
 
-Opt-in with SGLANG_BEAM_SHARED_CONTEXT_SPLIT_KV. Every beam of a group attends
-to the group's shared prompt and to its own decode tokens. The prompt part runs
-as tensor-core tiles of BLOCK_M beams of one query head, split along the prompt
-(split-KV) so that a few groups still fill the GPU; the last split adds the
-beams' own decode tokens with CUDA-core dot products, and a merge kernel
-combines the splits' partial results. Q and the output stay in the scheduler's
-row layout, so no row copies are needed.
+Opt-in with SGLANG_BEAM_SHARED_CONTEXT_KERNEL=split_kv. Every beam of a group
+attends to the group's shared prompt and to its own decode tokens. The prompt
+part runs as tensor-core tiles of BLOCK_M beams of one query head, split along
+the prompt (split-KV) so that a few groups still fill the GPU; the last split
+adds the beams' own decode tokens with CUDA-core dot products, and a merge
+kernel combines the splits' partial results. Q and the output stay in the
+scheduler's row layout, so no row copies are needed.
 """
 
 from __future__ import annotations
 
-import functools
 from typing import Optional
 
 import torch
@@ -37,6 +36,7 @@ from sglang.srt.beam_search.shared_context_attention_kernel import (
     attend_prompt_block,
     check_shared_context_inputs,
     empty_softmax_state,
+    num_sms,
 )
 
 # Measured on RTX PRO 6000 (SM120) at 256 beams, head_dim 128: fastest at 1-8
@@ -297,11 +297,6 @@ def _merge_splits_kernel(
     )
 
 
-@functools.lru_cache(maxsize=None)
-def _num_sms(device_index: int) -> int:
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
-
-
 def num_kv_splits(num_tiles: int, num_sms: int) -> int:
     """Pick the prompt split count from static shapes only, so graphs keep it."""
     best_splits, best_efficiency = 1, 0.0
@@ -362,7 +357,7 @@ def shared_context_attention_split_kv(
     if num_splits is None:
         num_splits = num_kv_splits(
             num_groups * q_heads * beam_blocks,
-            _num_sms(q.device.index),
+            num_sms(q.device.index),
         )
     output = torch.empty(
         (num_rows, q_heads, head_dim),
