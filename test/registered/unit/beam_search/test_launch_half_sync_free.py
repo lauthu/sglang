@@ -172,5 +172,45 @@ def test_beam_launch_half_never_syncs_the_host(fused):
         assert len(group._pending_steps) == 3
 
 
+@pytest.mark.parametrize("fused", [True, False])
+@pytest.mark.parametrize("boosted", [0, 3])
+def test_decode_selection_reads_each_groups_own_rows(fused, boosted):
+    """A decode forward's logits hold the leaders first (group i at row i) and
+    the beam tail after them (group i's members at NUM_GROUPS + their tail
+    offset). Raising one frontier row of group 1 far above the rest must make
+    it the parent of every selection that group makes."""
+    coordinator, reqs = _setup()
+    batch = SimpleNamespace(beam_tail=None, forward_mode=ForwardMode.EXTEND, reqs=reqs)
+    output, forward_batch = _forward(ForwardMode.EXTEND, NUM_GROUPS, VOCAB, False)
+    capture_pre_sample_logits(batch, forward_batch, output)
+    for pos, req in enumerate(reqs):
+        coordinator.select_leader_prefill(req, pos, output, tick=0)
+    for req in reqs:
+        req.kv.kv_committed_len = PROMPT_LEN + 1
+    members = BEAM - 1
+    batch = SimpleNamespace(
+        beam_tail=BeamTail(
+            num_base_rows=NUM_GROUPS,
+            entries=[
+                BeamTailEntry(req.beam_group, i, i * members, (i + 1) * members)
+                for i, req in enumerate(reqs)
+            ],
+        ),
+        forward_mode=ForwardMode.DECODE,
+        reqs=reqs,
+        forward_iter=1,
+    )
+    output, forward_batch = _forward(
+        ForwardMode.DECODE, NUM_GROUPS * BEAM, CODEBOOK, True
+    )
+    row = 1 if boosted == 0 else NUM_GROUPS + members + boosted - 1
+    output.next_token_logits[row] += 100
+    with envs.SGLANG_ENABLE_FUSED_BEAM_SELECT.override(fused):
+        capture_pre_sample_logits(batch, forward_batch, output)
+        coordinator.select_and_relay_decode(batch, output)
+    _, selection = reqs[1].beam_group._pending_steps[-1]
+    assert torch.all(selection.parent_idx == boosted)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

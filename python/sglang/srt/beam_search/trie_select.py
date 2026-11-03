@@ -33,6 +33,10 @@ Two launches per step. Each band program scores a band of frontier rows and
 keeps its best beam_width sort keys; one merge program per group selects from
 its bands and writes tokens, parents, scores and the next prefix codes.
 
+All groups read one logits tensor, the forward's. A batch holds one row per
+request first and the beam tail after them, so a group's frontier is its
+leader's row plus a run of member rows further down.
+
 The kernels work at any prefix depth (codes chosen so far) whose valid children
 come as one dense table: a row per prefix, indexed by the prefix's codes read
 as a base-codebook_size number. BeamTrieConstraint has such tables at depths 0
@@ -42,6 +46,8 @@ Everything else takes the torch path (coordinator._fused_select_applies):
 - a level stored sparse (level 2 above that budget);
 - compact logits without the output head's normalizer, and full-vocabulary
   logits after the prefill;
+- leaders whose logits were cloned away from the beam tail, in a forward that
+  also samples (logits_capture: not a beam-only batch);
 - shapes whose band or merge sort would hold more than _SORT_KEYS keys
   (fused_select_supported), or with fewer candidates than beam_width.
 """
@@ -116,10 +122,8 @@ def fused_select_supported(
 
 @triton.jit
 def _score_band_kernel(
-    leader_logits,
-    tail_logits,
-    leader_normalizer,
-    tail_normalizer,
+    logits_ptr,
+    normalizer_ptr,
     frontier_rows,
     cum_logprobs,
     prefix_codes,
@@ -130,10 +134,8 @@ def _score_band_kernel(
     codebook_size,
     code_offset,
     max_row_candidates,
-    leader_stride,
-    tail_stride,
-    leader_normalizer_stride,
-    tail_normalizer_stride,
+    logits_stride,
+    normalizer_stride,
     DEPTH: tl.constexpr,
     HAS_ROW_MAX: tl.constexpr,
     BAND_ROWS: tl.constexpr,
@@ -148,24 +150,16 @@ def _score_band_kernel(
     row_ok = rows < num_rows
     ok = row_ok[:, None] & (codes < codebook_size)[None, :]
 
-    # Frontier row 0 is the leader's logits row; rows 1.. are consecutive
-    # member rows of the tail.
+    # Frontier row 0 is the leader's row; rows 1.. are consecutive member rows.
     leader_row = tl.load(frontier_rows + group * 2).to(tl.int64)
-    member_rows = tl.load(frontier_rows + group * 2 + 1).to(tl.int64) + rows - 1
-    is_leader = rows == 0
-    logit_rows = tl.where(
-        is_leader[:, None],
-        leader_logits + leader_row * leader_stride,
-        tail_logits + member_rows[:, None] * tail_stride,
-    )
+    first_member_row = tl.load(frontier_rows + group * 2 + 1).to(tl.int64)
+    logit_rows = tl.where(rows == 0, leader_row, first_member_row + rows - 1)
     logits = tl.load(
-        logit_rows + code_offset + codes[None, :], mask=ok, other=float("-inf")
+        logits_ptr + logit_rows[:, None] * logits_stride + code_offset + codes[None, :],
+        mask=ok,
+        other=float("-inf"),
     ).to(tl.float32)
-    normalizer_rows = tl.where(
-        is_leader,
-        leader_normalizer + leader_row * leader_normalizer_stride,
-        tail_normalizer + member_rows * tail_normalizer_stride,
-    )
+    normalizer_rows = normalizer_ptr + logit_rows * normalizer_stride
 
     state_rows = group * num_rows + rows
     # The prefix's row in the dense table: its codes as a base-codebook_size number.
@@ -287,10 +281,8 @@ def _merge_bands_kernel(
 
 def select_trie_beams(
     *,
-    leader_logits: torch.Tensor,
-    tail_logits: torch.Tensor,
-    leader_normalizer: torch.Tensor,
-    tail_normalizer: torch.Tensor,
+    logits: torch.Tensor,
+    normalizer: torch.Tensor,
     frontier_rows: torch.Tensor,
     cum_logprobs: torch.Tensor,
     prefix_codes: torch.Tensor,
@@ -303,11 +295,11 @@ def select_trie_beams(
 ) -> TrieSelection:
     """One selection step for every group, as described in the module docstring.
 
-    leader_logits / tail_logits: [rows, >= code_offset + codebook_size] logits;
-        group g's frontier row 0 is leader row frontier_rows[g, 0], and row
-        b > 0 is tail row frontier_rows[g, 1] + b - 1.
-    leader_normalizer / tail_normalizer: float32 per logits row, [rows, 2] as
-        (row max, log-sum-exp after the max) or [rows, 1] as a log-sum-exp.
+    logits: [rows, >= code_offset + codebook_size]; group g's frontier row 0 is
+        logits row frontier_rows[g, 0] (its leader), and row b > 0 is logits row
+        frontier_rows[g, 1] + b - 1 (its members).
+    normalizer: float32 per logits row, [rows, 2] as (row max, log-sum-exp
+        after the max) or [rows, 1] as a log-sum-exp.
     frontier_rows: [num_groups, 2] integer, on the logits' device.
     cum_logprobs: [num_groups, num_rows] float32 frontier scores.
     prefix_codes: [num_groups, num_rows, depth] int64 codes chosen so far.
@@ -322,8 +314,10 @@ def select_trie_beams(
         f"depth {depth} needs a dense child-mask table "
         f"[{codebook_size**depth}, {codebook_size}], got {tuple(child_masks.shape)}"
     )
-    assert leader_normalizer.dtype == torch.float32
-    assert tail_normalizer.dtype == torch.float32
+    assert normalizer.dtype == torch.float32
+    assert (
+        normalizer.shape[0] == logits.shape[0]
+    ), f"one normalizer row per logits row: {normalizer.shape[0]} for {logits.shape[0]}"
     device = cum_logprobs.device
     # Depth 0 has no prefix to read, and an empty tensor has no device pointer.
     prefix_arg = prefix_codes if depth > 0 else frontier_rows
@@ -339,10 +333,8 @@ def select_trie_beams(
         (num_groups, num_rows), dtype=torch.int64, device=device
     )
     _score_band_kernel[(num_groups, num_bands)](
-        leader_logits,
-        tail_logits,
-        leader_normalizer,
-        tail_normalizer,
+        logits,
+        normalizer,
         frontier_rows,
         cum_logprobs,
         prefix_arg,
@@ -353,12 +345,10 @@ def select_trie_beams(
         codebook_size,
         code_offset,
         min(beam_width, codebook_size),
-        leader_logits.stride(0),
-        tail_logits.stride(0),
-        leader_normalizer.stride(0),
-        tail_normalizer.stride(0),
+        logits.stride(0),
+        normalizer.stride(0),
         DEPTH=depth,
-        HAS_ROW_MAX=leader_normalizer.shape[1] == 2,
+        HAS_ROW_MAX=normalizer.shape[1] == 2,
         BAND_ROWS=band_rows,
         CODE_BLOCK=code_block,
         BEAM_BLOCK=beam_block,

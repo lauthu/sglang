@@ -361,10 +361,8 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             )
             [(next_tokens, _)] = self._select_fused(
                 [group],
-                leader_logits=logits,
-                tail_logits=logits,
-                leader_normalizer=normalizer,
-                tail_normalizer=normalizer,
+                logits=logits,
+                normalizer=normalizer,
                 frontier_rows=[(0, 0)],
                 tick=tick,
             )
@@ -430,10 +428,12 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             group = entry.group
             if group.retired or group.state != BeamGroupState.DECODING:
                 continue
-            if self._fused_select_applies(
+            # The fused selection reads leaders and tail from the forward's one
+            # logits tensor, which the capture keeps unless it cloned the leaders.
+            if capture.logits is not None and self._fused_select_applies(
                 group,
-                logits=capture.tail_logits,
-                has_normalizer=capture.leader_normalizer is not None,
+                logits=capture.logits,
+                has_normalizer=capture.normalizer is not None,
             ):
                 key = (
                     group.beam_width,
@@ -460,13 +460,14 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             self._apply_survivors(group, next_tokens, parent_idx, batch.forward_iter)
         for members in fused.values():
             groups = [entry.group for _, entry in members]
+            # Leaders are rows [0, n) in entry order; the tail starts at row n.
             selections = self._select_fused(
                 groups,
-                leader_logits=capture.leader_logits,
-                tail_logits=capture.tail_logits,
-                leader_normalizer=capture.leader_normalizer,
-                tail_normalizer=capture.tail_normalizer,
-                frontier_rows=[(gi, entry.start) for gi, entry in members],
+                logits=capture.logits,
+                normalizer=capture.normalizer,
+                frontier_rows=[
+                    (gi, tail.num_base_rows + entry.start) for gi, entry in members
+                ],
                 tick=batch.forward_iter,
             )
             for group, (next_tokens, parent_idx) in zip(groups, selections):
@@ -562,10 +563,8 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         self,
         groups: List[BeamGroup],
         *,
-        leader_logits: torch.Tensor,
-        tail_logits: torch.Tensor,
-        leader_normalizer: torch.Tensor,
-        tail_normalizer: torch.Tensor,
+        logits: torch.Tensor,
+        normalizer: torch.Tensor,
         frontier_rows: List[Tuple[int, int]],
         tick: int,
     ) -> List[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
@@ -579,10 +578,8 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         final = groups[0].next_step_is_final()
         token_start = config.token_start_for_depth(depth)
         selection = select_trie_beams(
-            leader_logits=leader_logits,
-            tail_logits=tail_logits,
-            leader_normalizer=leader_normalizer.float(),
-            tail_normalizer=tail_normalizer.float(),
+            logits=logits,
+            normalizer=normalizer.float(),
             frontier_rows=self._upload_rows(
                 [row for rows in frontier_rows for row in rows]
             ).view(-1, 2),
@@ -590,9 +587,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             prefix_codes=_stack([g.trie_prefix_codes for g in groups]),
             child_masks=trie.dense_child_masks(depth),
             codebook_size=config.codebook_size,
-            code_offset=(
-                0 if leader_logits.shape[1] == config.codebook_size else token_start
-            ),
+            code_offset=(0 if logits.shape[1] == config.codebook_size else token_start),
             token_start=token_start,
             beam_width=groups[0].beam_width,
             final=final,

@@ -155,19 +155,14 @@ def _decode_case(
         trie = _constraint(codebook_size, density, generator)
     else:
         trie = _DenseTrie(codebook_size, num_codebooks, density, generator)
-    num_tail = num_groups * (beam_width - 1)
-    leader_logits = (
-        (torch.randn((num_groups, codebook_size), generator=generator) * 4)
+    # One forward's rows: the leaders, 3 unrelated rows, then the beam tail.
+    num_rows = num_groups + 3 + num_groups * (beam_width - 1)
+    logits = (
+        (torch.randn((num_rows, codebook_size), generator=generator) * 4)
         .to(dtype)
         .cuda()
     )
-    tail_logits = (
-        (torch.randn((num_tail + 3, codebook_size), generator=generator) * 4)
-        .to(dtype)
-        .cuda()
-    )
-    leader_norm = torch.randn((num_groups, 2), generator=generator).abs().cuda() + 10
-    tail_norm = torch.randn((num_tail + 3, 2), generator=generator).abs().cuda() + 10
+    norm = torch.randn((num_rows, 2), generator=generator).abs().cuda() + 10
     cum = -(torch.rand((num_groups, beam_width), generator=generator) * 20).cuda()
     prefix = torch.stack(
         [
@@ -176,39 +171,18 @@ def _decode_case(
         ]
     )
     # Groups' member rows sit at shuffled offsets in the tail, as batch order sets them.
-    starts = [3 + g * (beam_width - 1) for g in reversed(range(num_groups))]
+    tail_start = num_groups + 3
+    starts = [tail_start + g * (beam_width - 1) for g in reversed(range(num_groups))]
     leaders = list(reversed(range(num_groups)))
-    return (
-        trie,
-        leader_logits,
-        tail_logits,
-        leader_norm,
-        tail_norm,
-        cum,
-        prefix,
-        starts,
-        leaders,
-    )
+    return trie, logits, norm, cum, prefix, starts, leaders
 
 
 def _assert_decode_matches_torch_path(*, final, **case):
-    (
-        trie,
-        leader_logits,
-        tail_logits,
-        leader_norm,
-        tail_norm,
-        cum,
-        prefix,
-        starts,
-        leaders,
-    ) = _decode_case(**case)
+    trie, logits, norm, cum, prefix, starts, leaders = _decode_case(**case)
     beam_width, depth = case["beam_width"], case["depth"]
     fused = select_trie_beams(
-        leader_logits=leader_logits,
-        tail_logits=tail_logits,
-        leader_normalizer=leader_norm,
-        tail_normalizer=tail_norm,
+        logits=logits,
+        normalizer=norm,
         frontier_rows=torch.tensor(list(zip(leaders, starts)), device="cuda"),
         cum_logprobs=cum,
         prefix_codes=prefix,
@@ -220,11 +194,12 @@ def _assert_decode_matches_torch_path(*, final, **case):
         final=final,
     )
     for g in range(case["num_groups"]):
+        leader = slice(leaders[g], leaders[g] + 1)
         rows = slice(starts[g], starts[g] + beam_width - 1)
         tokens, parents, scores, next_prefix = _torch_path(
             trie,
-            [leader_logits[leaders[g] : leaders[g] + 1], tail_logits[rows]],
-            [leader_norm[leaders[g] : leaders[g] + 1], tail_norm[rows]],
+            [logits[leader], logits[rows]],
+            [norm[leader], norm[rows]],
             cum[g],
             prefix[g],
             depth,
@@ -297,14 +272,12 @@ def test_a_mask_table_of_another_depth_is_rejected():
         dtype=torch.float32,
         seed=3,
     )
-    trie, leader_logits, tail_logits, leader_norm, tail_norm, cum, prefix = case[:7]
+    trie, logits, norm, cum, prefix, starts, leaders = case
     with pytest.raises(AssertionError, match="dense child-mask table"):
         select_trie_beams(
-            leader_logits=leader_logits,
-            tail_logits=tail_logits,
-            leader_normalizer=leader_norm,
-            tail_normalizer=tail_norm,
-            frontier_rows=torch.tensor([[0, 3]], device="cuda"),
+            logits=logits,
+            normalizer=norm,
+            frontier_rows=torch.tensor(list(zip(leaders, starts)), device="cuda"),
             cum_logprobs=cum,
             prefix_codes=prefix,
             child_masks=trie.dense_child_masks(1),
@@ -332,10 +305,8 @@ def test_prefill_matches_torch_path(root_density):
     cum = torch.zeros((1, 1), device="cuda")
     prefix = torch.empty((1, 1, 0), dtype=torch.int64, device="cuda")
     fused = select_trie_beams(
-        leader_logits=piece,
-        tail_logits=piece,
-        leader_normalizer=lse,
-        tail_normalizer=lse,
+        logits=piece,
+        normalizer=lse,
         frontier_rows=torch.zeros((1, 2), dtype=torch.int64, device="cuda"),
         cum_logprobs=cum,
         prefix_codes=prefix,

@@ -60,6 +60,29 @@ class TestBeamOnlyBatch(CustomTestCase):
         capture_pre_sample_logits(batch, forward_batch, output)
         output.next_token_logits.mul_(0)
         self.assertTrue(torch.equal(output.beam.leader_logits[0], leader_row))
+        # The fused selection reads leaders from the forward's logits only when
+        # they were not sampled over.
+        self.assertIsNone(output.beam.logits)
+
+    def test_beam_only_decode_capture_keeps_the_forward_logits(self):
+        """The fused selection addresses leader g at row g and a member at row
+        n + its tail offset of the forward's logits, so a beam-only capture must
+        hand over that tensor with the leaders first and the tail after them."""
+        batch, num_tail = _decode_batch([_req(True), _req(True)])
+        logits = torch.randn((2 + num_tail, 4))
+        normalizer = torch.randn((2 + num_tail, 2))
+        output = LogitsProcessorOutput(
+            next_token_logits=logits, beam_normalizer=normalizer
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE, positions=torch.zeros(2 + num_tail)
+        )
+        capture_pre_sample_logits(batch, forward_batch, output)
+        beam = output.beam
+        self.assertIs(beam.logits, logits)
+        self.assertIs(beam.normalizer, normalizer)
+        self.assertEqual(beam.leader_logits.data_ptr(), logits[0].data_ptr())
+        self.assertEqual(beam.tail_logits.data_ptr(), logits[2].data_ptr())
 
 
 if __name__ == "__main__":

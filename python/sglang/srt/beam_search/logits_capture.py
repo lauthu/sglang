@@ -45,6 +45,10 @@ class BeamLogitsCapture(msgspec.Struct):
     leader_rows: Optional[List[int]] = None  # leaders' batch indices (extend)
     leader_normalizer: Optional[torch.Tensor] = None
     tail_normalizer: Optional[torch.Tensor] = None
+    # Beam-only decode: the forward's logits and normalizer, of which the leader
+    # and tail fields are the row ranges [0, n) and [n, ...).
+    logits: Optional[torch.Tensor] = None
+    normalizer: Optional[torch.Tensor] = None
 
 
 def is_beam_only_batch(batch: ScheduleBatch) -> bool:
@@ -89,6 +93,8 @@ def capture_pre_sample_logits(
                 tail_logits=logits[n:],
                 leader_normalizer=normalizer[:n] if normalizer is not None else None,
                 tail_normalizer=normalizer[n:] if normalizer is not None else None,
+                logits=logits,
+                normalizer=normalizer,
             )
         else:
             leader_rows = [e.leader_idx for e in batch.beam_tail.entries]
