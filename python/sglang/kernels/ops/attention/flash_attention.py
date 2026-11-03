@@ -1,9 +1,21 @@
+from functools import lru_cache
 from typing import Optional, Union
 
 import torch
 
 from .flash_attention_v3 import flash_attn_varlen_func as fa3_flash_attn_varlen_func
 from .flash_attention_v3 import flash_attn_with_kvcache as fa3_flash_attn_with_kvcache
+
+
+@lru_cache(maxsize=None)
+def _fa4_entry_points(device: torch.device):
+    # SM12x has its own FA4 entry points, written for its forward host: they honor
+    # `out`, return the LSE only on request and use the host's cached launch plans.
+    if torch.cuda.get_device_capability(device)[0] == 12:
+        from . import flash_attention_v4_sm120 as entry_points
+    else:
+        from . import flash_attention_v4 as entry_points
+    return entry_points
 
 
 def flash_attn_with_kvcache(
@@ -176,11 +188,7 @@ def flash_attn_with_kvcache(
             out=out,
         )
     elif ver == 4:
-        from .flash_attention_v4 import (
-            flash_attn_with_kvcache as fa4_flash_attn_with_kvcache,
-        )
-
-        return fa4_flash_attn_with_kvcache(
+        return _fa4_entry_points(q.device).flash_attn_with_kvcache(
             q,
             k_cache,
             v_cache,
@@ -287,11 +295,7 @@ def flash_attn_varlen_func(
             out=out,
         )
     elif ver == 4:
-        from .flash_attention_v4 import (
-            flash_attn_varlen_func as fa4_flash_attn_varlen_func,
-        )
-
-        return fa4_flash_attn_varlen_func(
+        return _fa4_entry_points(q.device).flash_attn_varlen_func(
             q,
             k,
             v,
