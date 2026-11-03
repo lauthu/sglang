@@ -29,6 +29,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.beam_search.beam_kernels import scheduler_beam_rows
+
 # Measured on RTX PRO 6000 (SM120) at 256 beams, head_dim 128: fastest at 1-8
 # groups and 256-2048 prompt tokens.
 _BLOCK_M = 128
@@ -39,16 +41,6 @@ _MAX_SPLITS = 8
 # Measured: the smallest split count that fills this share of the last wave is
 # within 1-2% of the best one at 1-8 groups; more splits only add merge traffic.
 _MIN_WAVE_EFFICIENCY = 0.8
-
-
-@triton.jit
-def _beam_rows(group, beams, num_groups, BEAM_WIDTH: tl.constexpr):
-    # Scheduler row layout: one leader row per group, then the groups' other beams.
-    return tl.where(
-        beams == 0,
-        group,
-        num_groups + group * (BEAM_WIDTH - 1) + beams - 1,
-    )
 
 
 @triton.jit
@@ -95,7 +87,7 @@ def _shared_context_attention_kernel(
 
     beams = tl.program_id(2) * BLOCK_M + tl.arange(0, BLOCK_M)
     beam_mask = beams < BEAM_WIDTH
-    rows = _beam_rows(group, beams, num_groups, BEAM_WIDTH)
+    rows = scheduler_beam_rows(group, beams, num_groups, BEAM_WIDTH)
     context_offsets = tl.arange(0, BLOCK_N)
     dims = tl.arange(0, BLOCK_D)
     dim_mask = dims < HEAD_DIM
