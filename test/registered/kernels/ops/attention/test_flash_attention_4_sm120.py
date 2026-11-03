@@ -82,6 +82,37 @@ def test_sm120_preallocated_output_contract_is_validated_before_launch():
         flash_attn_with_kvcache(q, k, v, out=strided_out)
 
 
+def test_sm120_version_dispatch_writes_the_preallocated_output():
+    """FlashAttentionBackend calls FA4 through the version dispatcher. On SM12x
+    that must reach the SM12x entry points, which write into the caller's `out`;
+    the generic ones allocated their own, so each attention layer copied it back."""
+    from sglang.kernels.ops.attention.flash_attention import (
+        flash_attn_with_kvcache as dispatch_flash_attn_with_kvcache,
+    )
+
+    torch.manual_seed(20261104)
+    tokens, num_q_heads, num_kv_heads, head_dim = 96, 16, 8, 128
+    q = torch.randn(tokens, num_q_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    k_cache = torch.randn(
+        tokens, 1, num_kv_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    out = torch.empty_like(q)
+    result = dispatch_flash_attn_with_kvcache(
+        q=q,
+        k_cache=k_cache,
+        v_cache=torch.randn_like(k_cache),
+        page_table=torch.arange(tokens, device="cuda", dtype=torch.int32)[None],
+        cache_seqlens=torch.tensor([tokens], device="cuda", dtype=torch.int32),
+        cu_seqlens_q=torch.tensor([0, tokens], device="cuda", dtype=torch.int32),
+        max_seqlen_q=tokens,
+        causal=True,
+        num_splits=1,
+        out=out,
+        ver=4,
+    )
+    assert result.data_ptr() == out.data_ptr()
+
+
 @pytest.mark.parametrize(
     (
         "head_dim",
