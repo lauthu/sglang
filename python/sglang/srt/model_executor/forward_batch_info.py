@@ -32,7 +32,7 @@ import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import Any, TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -781,19 +781,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             and batch.reqs
             and all(req.beam_group is not None for req in batch.reqs)
         ):
-            max_level = beam_trie_config.num_codebooks - 1
-            row_levels = [
-                min(req.beam_group.num_generated, max_level) for req in batch.reqs
-            ]
-            if batch.beam_tail is not None:
-                for entry in batch.beam_tail.entries:
-                    level = min(entry.group.num_generated, max_level)
-                    row_levels.extend([level] * (entry.end - entry.start))
-            assert len(row_levels) == len(batch.seq_lens)
-            beam_trie_levels = torch.tensor(
-                row_levels,
-                dtype=torch.int64,
-                device=batch.device,
+            from sglang.srt.beam_search.batch_tail import trie_row_levels
+
+            beam_trie_levels = trie_row_levels(
+                batch, max_level=beam_trie_config.num_codebooks - 1
             )
         beam_attention_metadata = None
         if batch.forward_mode.is_decode() and batch.beam_tail is not None:

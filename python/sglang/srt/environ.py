@@ -606,6 +606,9 @@ class Envs:
     # Approximate constrained scores by normalizing only the retained trie
     # candidates instead of streaming a full-vocabulary normalizer.
     SGLANG_BEAM_TRIE_TOPK_LOGPROB = EnvBool(False)
+    # Trie-constrained beam selection in fused kernels (beam_search/trie_select);
+    # False runs the torch path, trie_constraint.topk_logprobs + joint_select.
+    SGLANG_ENABLE_FUSED_BEAM_SELECT = EnvBool(True)
     # Experimental shared-context decode attention for wide beam batches.
     SGLANG_BEAM_SHARED_CONTEXT_ATTENTION = EnvBool(False)
     SGLANG_BEAM_SHARED_CONTEXT_WIDTH = EnvInt(2000)

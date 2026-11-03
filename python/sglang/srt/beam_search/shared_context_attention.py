@@ -26,6 +26,7 @@ from sglang.srt.beam_search.beam_kernels import (
     ungroup_beam_rows,
 )
 from sglang.srt.environ import envs
+from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -162,6 +163,9 @@ def build_metadata(
     if len(entries) * beam_width != len(batch.seq_lens):
         return None
 
+    # Uploads are pinned and non-blocking, and no index reads the device back,
+    # so building this metadata never waits on the running forward.
+    pin_memory = is_pin_memory_available(batch.device)
     num_base_rows = batch.beam_tail.num_base_rows
     group_rows_cpu = torch.tensor(
         [
@@ -175,8 +179,9 @@ def build_metadata(
             for entry in entries
         ],
         dtype=torch.int64,
+        pin_memory=pin_memory,
     )
-    group_rows = group_rows_cpu.to(batch.device)
+    group_rows = group_rows_cpu.to(batch.device, non_blocking=True)
     req_rows = batch.req_pool_indices[group_rows]
     req_to_token = model_runner.req_to_token_pool.req_to_token
 
@@ -191,7 +196,8 @@ def build_metadata(
         if decode_len <= 0:
             return None
         group_req_rows = req_rows[group_index]
-        context_parts.append(req_to_token[group_req_rows[0], :prompt_len])
+        # A slice, not group_req_rows[0]: a 0-d CUDA index is read back to host.
+        context_parts.append(req_to_token[group_req_rows[:1], :prompt_len].flatten())
         decode_parts.append(
             req_to_token[
                 group_req_rows,
@@ -210,8 +216,8 @@ def build_metadata(
     context_cu_seqlens = torch.tensor(
         [0, *itertools.accumulate(prompt_lens)],
         dtype=torch.int32,
-        device=batch.device,
-    )
+        pin_memory=pin_memory,
+    ).to(batch.device, non_blocking=True)
     return BeamAttentionMetadata(
         num_groups=len(entries),
         context_slots=torch.cat(context_parts),

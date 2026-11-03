@@ -24,14 +24,19 @@ split documented in coordinator.py.
 from __future__ import annotations
 
 import enum
-from typing import List, Optional, Sequence
+import weakref
+from typing import Any, List, Optional, Sequence
 
 import msgspec
 import torch
 
 from sglang.srt.beam_search.fork import StagedOrphans
 from sglang.srt.beam_search.history import BeamNode, materialize_tokens
-from sglang.srt.beam_search.joint_select import FinalSelect, SelectResult
+from sglang.srt.beam_search.joint_select import (
+    FinalSelect,
+    SelectResult,
+    SurvivorSelect,
+)
 
 
 class BeamGroupState(enum.Enum):
@@ -104,7 +109,7 @@ class BeamGroup:
 
         # Scheduler wiring, filled in from outside the search core. Members have
         # no Req, so their seq len and KV lengths are implied by the leader's.
-        self.leader = None
+        self._leader: Optional[weakref.ref] = None
         # Device [k-1] member row indices, and the same rows on host (for
         # row-slot free). None until the post-prefill spawn / after free.
         self.member_rows: Optional[torch.Tensor] = None
@@ -117,6 +122,17 @@ class BeamGroup:
         # Running total the GC has returned, so held KV is a host-side
         # arithmetic (allocated - freed) rather than a tensor read.
         self.slots_freed = 0
+
+    @property
+    def leader(self) -> Any:
+        """The leader Req, held weakly: the Req owns its group through
+        req.beam_group, and a strong back-reference would make every finished
+        request cyclic garbage that only a full GC pass frees."""
+        return None if self._leader is None else self._leader()
+
+    @leader.setter
+    def leader(self, req: Any) -> None:
+        self._leader = None if req is None else weakref.ref(req)
 
     @property
     def num_member_rows(self) -> int:
@@ -142,7 +158,9 @@ class BeamGroup:
         """Whether the launch half has already staged the terminal selection."""
         return self.num_generated >= self.max_new_tokens
 
-    def advance_frontier(self, sel: SelectResult, tick: int = 0) -> None:
+    def advance_frontier(
+        self, sel: SelectResult | SurvivorSelect, tick: int = 0
+    ) -> None:
         """Launch half of one selection step: evolve the frontier tensor and
         stage the result for commit, stamped with its forward tick."""
         assert self.state == BeamGroupState.DECODING
@@ -180,7 +198,7 @@ class BeamGroup:
                 return True
         return False
 
-    def _commit_step(self, sel: SelectResult) -> bool:
+    def _commit_step(self, sel: SelectResult | SurvivorSelect) -> bool:
         if self.device_history:
             self._device_tokens.append(sel.next_tokens[: self.beam_width])
             self._device_parents.append(sel.parent_idx[: self.beam_width])
