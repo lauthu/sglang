@@ -171,6 +171,59 @@ class TestFreeMemberRows(CustomTestCase):
         self.assertEqual(sorted(pool.freed), [1, 2])
 
 
+class TestFinishedGroupMemberKv(CustomTestCase):
+    def test_finish_frees_member_kv_only_when_asked(self):
+        """A finished group's reply must not wait for its member KV free, which
+        syncs the host; the leader's own release runs in between, so finishing
+        must rewind the leader at once and free nothing until asked, once."""
+        from sglang.srt.beam_search.coordinator import BeamCoordinator
+
+        req_to_token = torch.arange(36, dtype=torch.int64).reshape(3, 12)
+        pool = _FakeReqToTokenPool(req_to_token)
+        allocator = _FakeAllocator()
+        coordinator = BeamCoordinator(
+            model_config=None,
+            spec_algorithm=None,
+            dllm_enabled=False,
+            max_req_len=0,
+            req_to_token_pool=pool,
+            token_to_kv_pool_allocator=allocator,
+            tree_cache=None,
+            future_map=None,
+        )
+        coordinator._num_live_groups = 1
+        leader = SimpleNamespace(
+            kv=ReqKvInfo(kv_allocated_len=8, kv_committed_len=8),
+        )
+        group = SimpleNamespace(
+            leader=leader,
+            prompt_len=5,
+            member_rows=torch.tensor([1, 2], dtype=torch.int64),
+            member_rows_cpu=torch.tensor([1, 2], dtype=torch.int64),
+            all_rows=torch.tensor([0, 1, 2], dtype=torch.int64),
+            finalize=lambda: [SimpleNamespace(matched_token=None)],
+            num_committed=3,
+            pending_orphans=[],
+            slots_freed=0,
+            retired=False,
+            _pending_steps=[],
+        )
+        decode_region = req_to_token[:, 5:8].flatten().tolist()
+
+        coordinator._finish_group(group)
+
+        self.assertEqual(allocator.freed, [])
+        self.assertEqual(pool.freed, [])
+        self.assertEqual(leader.kv.kv_allocated_len, 5)
+        self.assertEqual(leader.kv.kv_committed_len, 5)
+
+        coordinator.free_finished_member_kv()
+        coordinator.free_finished_member_kv()
+
+        self.assertEqual(sorted(allocator.freed), sorted(decode_region))
+        self.assertEqual(sorted(pool.freed), [1, 2])
+
+
 class TestRetireReclaimsStagedOrphans(CustomTestCase):
     """Regression: aborting a group must not leak the orphan slots staged by the
     launch half, which no surviving row names."""
