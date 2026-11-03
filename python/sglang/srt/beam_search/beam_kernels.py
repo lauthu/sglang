@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""CUDA kernels for beam-row layout conversion."""
+"""The scheduler's beam-row layout and CUDA kernels that convert it."""
 
 from __future__ import annotations
 
@@ -20,6 +20,16 @@ import triton
 import triton.language as tl
 
 _ROW_COPY_BLOCK_SIZE = 512
+
+
+@triton.jit
+def scheduler_beam_rows(group, beams, num_groups, beam_width: tl.constexpr):
+    # Scheduler row layout: one leader row per group, then the groups' other beams.
+    return tl.where(
+        beams == 0,
+        group,
+        num_groups + group * (beam_width - 1) + beams - 1,
+    )
 
 
 @triton.jit
@@ -37,11 +47,7 @@ def _copy_grouped_beam_rows_kernel(
     valid = columns < row_size
     group = grouped_row // beam_width
     beam = grouped_row % beam_width
-    physical_row = tl.where(
-        beam == 0,
-        group,
-        num_groups + group * (beam_width - 1) + beam - 1,
-    )
+    physical_row = scheduler_beam_rows(group, beam, num_groups, beam_width)
     if reverse:
         source_row = grouped_row
         output_row = physical_row

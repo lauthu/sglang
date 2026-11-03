@@ -12,29 +12,131 @@
 # limitations under the License.
 # ==============================================================================
 
-import os
+import itertools
 import math
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
+from sglang.srt.beam_search import (
+    shared_context_split_kv_kernel,
+    shared_context_stream_k_kernel,
+)
 from sglang.srt.beam_search.shared_context_attention import (
     BeamAttentionMetadata,
     build_graph_capture_metadata,
     build_metadata,
     forward,
     graph_compatible,
+    selected_kernel,
     stage_graph_metadata,
 )
 from sglang.srt.beam_search.shared_context_attention_kernel import (
     shared_context_attention,
 )
+from sglang.srt.beam_search.shared_context_split_kv_kernel import (
+    shared_context_attention_split_kv,
+)
+from sglang.srt.beam_search.shared_context_stream_k_kernel import (
+    shared_context_attention_stream_k,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+def _scheduler_layout_case(context_lens, decode_lens=None, decode_capacity=3):
+    """Random beam rows in the scheduler's row layout and their fp32 reference.
+
+    Prompts and decode tokens sit at scattered K/V slots, and the decode-slot
+    capacity runs past the decode lengths (2 per group by default).
+    """
+    decode_lens = decode_lens or [2] * len(context_lens)
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    beam_width = 4
+    q_heads = 4
+    kv_heads = 2
+    head_dim = 64
+    num_groups = len(context_lens)
+    num_slots = 1024
+
+    q = torch.randn(
+        num_groups * beam_width,
+        q_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    k_buffer = torch.randn(
+        num_slots,
+        kv_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    v_buffer = torch.randn_like(k_buffer)
+    slots = torch.randperm(num_slots, device=device).to(torch.int32)
+    context_slots = slots[: sum(context_lens)]
+    context_cu_seqlens = torch.tensor(
+        [0, *itertools.accumulate(context_lens)],
+        dtype=torch.int32,
+        device=device,
+    )
+    decode_slots = slots[
+        sum(context_lens) : sum(context_lens)
+        + num_groups * decode_capacity * beam_width
+    ].view(num_groups, decode_capacity * beam_width)
+    decode_len_tensor = torch.tensor(decode_lens, dtype=torch.int32, device=device)
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    reference = torch.empty(q.shape, dtype=torch.float32, device=device)
+    for group, (start, end) in enumerate(
+        itertools.pairwise(context_cu_seqlens.tolist())
+    ):
+        for beam_index in range(beam_width):
+            # Scheduler rows: group leaders first, then the groups' other beams.
+            row = (
+                group
+                if beam_index == 0
+                else num_groups + group * (beam_width - 1) + beam_index - 1
+            )
+            slot_ids = torch.cat(
+                (
+                    context_slots[start:end],
+                    decode_slots[group, beam_index::beam_width][: decode_lens[group]],
+                )
+            ).long()
+            for q_head in range(q_heads):
+                kv_head = q_head // (q_heads // kv_heads)
+                scores = k_buffer[slot_ids, kv_head].float() @ q[row, q_head].float()
+                probabilities = torch.softmax(scores * softmax_scale, dim=0)
+                reference[row, q_head] = (
+                    probabilities[:, None] * v_buffer[slot_ids, kv_head].float()
+                ).sum(dim=0)
+
+    metadata = BeamAttentionMetadata(
+        num_groups=num_groups,
+        context_slots=context_slots,
+        context_cu_seqlens=context_cu_seqlens,
+        decode_slots=decode_slots,
+        beam_width=beam_width,
+        decode_len=max(decode_lens),
+        decode_lens=decode_len_tensor,
+    )
+    return SimpleNamespace(
+        q=q,
+        k_buffer=k_buffer,
+        v_buffer=v_buffer,
+        metadata=metadata,
+        softmax_scale=softmax_scale,
+        reference=reference,
+    )
+
 
 _GRAPH_ENV = {
     "SGLANG_BEAM_SHARED_CONTEXT_ATTENTION": "true",
@@ -145,6 +247,112 @@ class TestSharedContextAttentionMetadata(CustomTestCase):
             rtol=1e-2,
             atol=1e-2,
         )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_split_kv_matches_fp32_reference(self):
+        """Every split count gives the unsplit result, also when a short prompt
+        leaves splits empty; decode slots past a group's decode length are unread."""
+        case = _scheduler_layout_case([1, 70, 300])
+        metadata = case.metadata
+        for num_splits in (1, 3, 8):
+            with self.subTest(num_splits=num_splits):
+                output = shared_context_attention_split_kv(
+                    case.q,
+                    case.k_buffer,
+                    case.v_buffer,
+                    metadata.context_slots,
+                    metadata.context_cu_seqlens,
+                    metadata.decode_slots,
+                    metadata.decode_lens,
+                    beam_width=metadata.beam_width,
+                    softmax_scale=case.softmax_scale,
+                    num_splits=num_splits,
+                )
+                torch.testing.assert_close(
+                    output.float(),
+                    case.reference,
+                    rtol=1e-2,
+                    atol=1e-2,
+                )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_stream_k_matches_fp32_reference(self):
+        """Whole tiles, tiles split across CTAs and CTAs without work give the same
+        result; decode slots past a group's decode length are unread."""
+        case = _scheduler_layout_case([1, 70, 300], decode_lens=[2, 1, 2])
+        metadata = case.metadata
+        # One CTA takes every tile whole; 200 CTAs outnumber the work units.
+        for num_ctas in (1, 3, 7, 40, 200):
+            with self.subTest(num_ctas=num_ctas):
+                output = shared_context_attention_stream_k(
+                    case.q,
+                    case.k_buffer,
+                    case.v_buffer,
+                    metadata.context_slots,
+                    metadata.context_cu_seqlens,
+                    metadata.decode_slots,
+                    metadata.decode_lens,
+                    beam_width=metadata.beam_width,
+                    softmax_scale=case.softmax_scale,
+                    num_ctas=num_ctas,
+                )
+                torch.testing.assert_close(
+                    output.float(),
+                    case.reference,
+                    rtol=1e-2,
+                    atol=1e-2,
+                )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_forward_runs_the_selected_kernel(self):
+        """Every kernel matches the reference; the selector decides which one runs."""
+        case = _scheduler_layout_case([1, 70, 300])
+        num_rows, q_heads, head_dim = case.q.shape
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=q_heads,
+            head_dim=head_dim,
+            scaling=case.softmax_scale,
+        )
+        forward_batch = SimpleNamespace(beam_attention_metadata=case.metadata)
+        token_to_kv_pool = SimpleNamespace(
+            get_kv_buffer=lambda layer_id: (case.k_buffer, case.v_buffer)
+        )
+        for kernel in ("default", "split_kv", "stream_k"):
+            env = {"SGLANG_BEAM_SHARED_CONTEXT_KERNEL": kernel}
+            with (
+                self.subTest(kernel=kernel),
+                patch.dict(os.environ, env),
+                patch.object(
+                    shared_context_split_kv_kernel,
+                    "shared_context_attention_split_kv",
+                    wraps=shared_context_split_kv_kernel.shared_context_attention_split_kv,
+                ) as split_kv,
+                patch.object(
+                    shared_context_stream_k_kernel,
+                    "shared_context_attention_stream_k",
+                    wraps=shared_context_stream_k_kernel.shared_context_attention_stream_k,
+                ) as stream_k,
+            ):
+                output = forward(
+                    case.q.view(num_rows, q_heads * head_dim),
+                    layer,
+                    forward_batch,
+                    token_to_kv_pool,
+                )
+                self.assertEqual(split_kv.called, kernel == "split_kv")
+                self.assertEqual(stream_k.called, kernel == "stream_k")
+                torch.testing.assert_close(
+                    output.view(num_rows, q_heads, head_dim).float(),
+                    case.reference,
+                    rtol=1e-2,
+                    atol=1e-2,
+                )
+
+    @patch.dict(os.environ, {"SGLANG_BEAM_SHARED_CONTEXT_KERNEL": "splitkv"})
+    def test_unknown_kernel_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "SGLANG_BEAM_SHARED_CONTEXT_KERNEL"):
+            selected_kernel()
 
     @patch.dict(os.environ, _LONG_CONTEXT_GRAPH_ENV)
     def test_graph_metadata_supports_32k_context_capacity(self):

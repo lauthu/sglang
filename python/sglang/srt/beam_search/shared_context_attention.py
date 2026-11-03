@@ -50,6 +50,18 @@ def enabled() -> bool:
     return envs.SGLANG_BEAM_SHARED_CONTEXT_ATTENTION.get()
 
 
+_KERNELS = ("default", "split_kv", "stream_k")
+
+
+def selected_kernel() -> str:
+    kernel = envs.SGLANG_BEAM_SHARED_CONTEXT_KERNEL.get()
+    if kernel not in _KERNELS:
+        raise ValueError(
+            f"SGLANG_BEAM_SHARED_CONTEXT_KERNEL is {kernel!r}, not one of {_KERNELS}"
+        )
+    return kernel
+
+
 def _positive_int_env(field) -> int:
     value = field.get()
     if value <= 0:
@@ -246,6 +258,31 @@ def forward(
     beam_width = metadata.beam_width
     q_heads = layer.tp_q_head_num
     head_dim = layer.head_dim
+    kernel = selected_kernel()
+    if kernel != "default":
+        if kernel == "split_kv":
+            from sglang.srt.beam_search.shared_context_split_kv_kernel import (
+                shared_context_attention_split_kv as attention,
+            )
+        else:
+            from sglang.srt.beam_search.shared_context_stream_k_kernel import (
+                shared_context_attention_stream_k as attention,
+            )
+
+        # Both read Q and write the output in the scheduler's row layout: no copies.
+        output = attention(
+            q.reshape(-1, q_heads, head_dim),
+            k_buffer,
+            v_buffer,
+            metadata.context_slots,
+            metadata.context_cu_seqlens,
+            metadata.decode_slots,
+            metadata.decode_lens,
+            beam_width=beam_width,
+            softmax_scale=layer.scaling,
+        )
+        return output.view(-1, q_heads * head_dim)
+
     grouped_q = group_beam_rows(
         q,
         num_groups,
