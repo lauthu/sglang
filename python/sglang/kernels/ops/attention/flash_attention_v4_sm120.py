@@ -22,12 +22,12 @@ if os.environ.get("SGLANG_INKLING_FA4_USE_PIP") == "1":
     # The pip escape hatch deliberately bypasses SGLang-owned SM12x kernels.
     get_forward_arch = None
     resolve_runtime_policy = None
-    try_cached_paged_decode = None
+    try_cached_paged = None
 else:
     from sglang.kernels.ops.attention.fa4_sm120.dispatch import (
         get_forward_arch,
         resolve_runtime_policy,
-        try_cached_paged_decode,
+        try_cached_paged,
     )
 
 
@@ -277,7 +277,7 @@ def flash_attn_with_kvcache(
         cu_seqlens_q, cache_seqlens, page_table = [
             _maybe_contiguous(t) for t in (cu_seqlens_q, cache_seqlens, page_table)
         ]
-        fast_result = try_cached_paged_decode(
+        fast_result = try_cached_paged(
             arch=forward_arch,
             q=q,
             k=k_cache,
