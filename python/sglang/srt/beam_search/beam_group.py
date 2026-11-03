@@ -39,14 +39,6 @@ from sglang.srt.beam_search.joint_select import (
 )
 
 
-def _to_host_lists(*tensors: torch.Tensor) -> List[list]:
-    # One host sync for all of them, where .tolist() would sync once per tensor.
-    host = [t.to("cpu", non_blocking=True) for t in tensors]
-    if tensors[0].is_cuda:
-        torch.cuda.current_stream(tensors[0].device).synchronize()
-    return [t.tolist() for t in host]
-
-
 class BeamGroupState(enum.Enum):
     DECODING = enum.auto()
     FINISHED = enum.auto()
@@ -308,9 +300,8 @@ class BeamGroup:
         if self.device_history:
             assert self._device_final_tokens is not None
             assert self._device_final_cum_logprobs is not None
-            token_rows, cum_logprobs = _to_host_lists(
-                self._device_final_tokens, self._device_final_cum_logprobs
-            )
+            token_rows = self._device_final_tokens.tolist()
+            cum_logprobs = self._device_final_cum_logprobs.tolist()
             results = [
                 BeamResult(
                     tokens=tokens,

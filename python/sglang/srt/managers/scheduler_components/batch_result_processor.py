@@ -439,7 +439,6 @@ class SchedulerBatchResultProcessor:
         self.output_streamer.stream_output(
             batch.reqs, batch.return_logprob, skip_stream_req
         )
-        self.beam_coordinator.free_finished_member_kv()
 
         can_run_cuda_graph = result.can_run_cuda_graph
         # None on decode->extend converted batches; they are decode work and
@@ -1006,7 +1005,6 @@ class SchedulerBatchResultProcessor:
             )
 
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
-        self.beam_coordinator.free_finished_member_kv()
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.metrics_reporter.forward_ct_decode = (

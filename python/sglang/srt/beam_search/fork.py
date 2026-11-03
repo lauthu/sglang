@@ -30,9 +30,8 @@ decode step computes the selected token's KV like normal decode.
 
 from __future__ import annotations
 
-from typing import List, NamedTuple, Optional
+from typing import NamedTuple
 
-import msgspec
 import torch
 
 
@@ -81,51 +80,25 @@ def alias_members_prompt_kv(
     req_to_token[dst_rows, :prompt_len] = req_to_token[leader_row, :prompt_len]
 
 
-class DetachedMemberKv(msgspec.Struct, frozen=True):
-    """A group's decode region (its rows' req_to_token slots) and member rows,
-    taken out of the group but still allocated until free()."""
-
-    slots: Optional[torch.Tensor]
-    member_rows: List[int]
-
-    def free(self, req_to_token_pool, token_to_kv_pool_allocator) -> None:
-        # Several rows can name one slot; the dedup's data-dependent shape syncs.
-        if self.slots is not None:
-            token_to_kv_pool_allocator.free(self.slots.flatten().unique())
-        req_to_token_pool.free_rows(self.member_rows)
-
-
-def detach_member_rows(group, req_to_token_pool) -> Optional[DetachedMemberKv]:
-    """Take the decode region and member rows out of the group without freeing
-    them. Idempotent; must run while the leader's kv info still carries the
-    lockstep allocated length."""
-    if group.member_rows is None:
-        return None
-    leader = group.leader
-    start = group.prompt_len
-    end = leader.kv.kv_allocated_len
-    slots = None
-    if end > start:
-        slots = req_to_token_pool.req_to_token[group.all_rows, start:end]
-        # Rewind now, not in free(): the leader's own per-Req release may run
-        # first, and would free this decode region a second time.
-        leader.kv.kv_committed_len = start
-        leader.kv.kv_allocated_len = start
-    detached = DetachedMemberKv(
-        slots=slots, member_rows=group.member_rows_cpu.tolist()
-    )
-    group.member_rows = None
-    group.member_rows_cpu = None
-    group.all_rows = None
-    return detached
-
-
 def free_member_rows(group, req_to_token_pool, token_to_kv_pool_allocator) -> None:
     """Release the decode-suffix KV plus the member row slots. Idempotent; must
     run while the leader's kv info still carries the lockstep allocated length."""
-    detached = detach_member_rows(group, req_to_token_pool)
-    if detached is not None:
-        detached.free(req_to_token_pool, token_to_kv_pool_allocator)
+    if group.member_rows is None:
+        return
+    leader = group.leader
+    start = group.prompt_len
+    end = leader.kv.kv_allocated_len
+    if end > start:
+        # The rewind below is required: without it the leader's own per-Req
+        # release frees this decode region a second time.
+        slots = req_to_token_pool.req_to_token[group.all_rows, start:end]
+        token_to_kv_pool_allocator.free(slots.flatten().unique())
+        leader.kv.kv_committed_len = start
+        leader.kv.kv_allocated_len = start
+    req_to_token_pool.free_rows(group.member_rows_cpu.tolist())
+    group.member_rows = None
+    group.member_rows_cpu = None
+    group.all_rows = None
 
 
 def remap_kv_mapping(

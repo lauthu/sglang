@@ -47,11 +47,10 @@ import torch
 from sglang.srt.beam_search.beam_group import BeamGroup, BeamGroupState
 from sglang.srt.beam_search.fork import (
     MEMBER_LENGTH_MARGIN,
-    DetachedMemberKv,
     StagedOrphans,
     alias_members_prompt_kv,
     collect_orphan_slots,
-    detach_member_rows,
+    free_member_rows,
     neutral_member_sampling_params,
     remap_kv_mapping,
 )
@@ -126,9 +125,6 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
 
     # Live (non-retired) groups; the O(1) gate for the per-forward relay hook.
     _num_live_groups: int = 0
-    # Member KV of groups finished by the current result pass, freed after
-    # their outputs are streamed.
-    _finished_member_kv: List[DetachedMemberKv] = []
 
     @staticmethod
     def request_beam_width(recv_req) -> int:
@@ -721,18 +717,8 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             leader.finished_reason = FINISH_MATCHED_TOKEN(matched=top.matched_token)
         else:
             leader.finished_reason = FINISH_LENGTH(length=group.num_committed)
-        # The reply needs none of the member KV, and freeing it syncs the host.
-        detached = self._detach_member_rows(group)
-        if detached is not None:
-            self._finished_member_kv.append(detached)
+        self._free_member_rows(group)
         self._retire_group(group)
-
-    def free_finished_member_kv(self) -> None:
-        """Free the member KV of the groups this result pass finished. Call it
-        after streaming their outputs: the free syncs the host."""
-        finished, self._finished_member_kv = self._finished_member_kv, []
-        for detached in finished:
-            detached.free(self.req_to_token_pool, self.token_to_kv_pool_allocator)
 
     def _abort_group(self, group: BeamGroup) -> None:
         group.state = BeamGroupState.FINISHED
@@ -753,16 +739,11 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         group.final_results = []
         self._retire_group(group)
 
-    def _detach_member_rows(self, group: BeamGroup) -> Optional[DetachedMemberKv]:
-        # Staged orphans are unreachable from every row, so the group-wide
-        # dedup free of the detached region would miss them.
-        self._reclaim_orphans(group)
-        return detach_member_rows(group, self.req_to_token_pool)
-
     def _free_member_rows(self, group: BeamGroup) -> None:
-        detached = self._detach_member_rows(group)
-        if detached is not None:
-            detached.free(self.req_to_token_pool, self.token_to_kv_pool_allocator)
+        # Staged orphans are unreachable from every row, so the group-wide
+        # dedup free below would miss them.
+        self._reclaim_orphans(group)
+        free_member_rows(group, self.req_to_token_pool, self.token_to_kv_pool_allocator)
 
     def _retire_group(self, group: BeamGroup) -> None:
         # Exactly once per group, so the O(1) live gate stays accurate.
