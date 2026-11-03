@@ -12,8 +12,9 @@
 # limitations under the License.
 # ==============================================================================
 
-import os
+import itertools
 import math
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -73,7 +74,6 @@ class TestSharedContextAttentionMetadata(CustomTestCase):
         num_slots = context_len + decode_len * beam_width
 
         q = torch.randn(
-            1,
             beam_width,
             q_heads,
             head_dim,
@@ -115,6 +115,7 @@ class TestSharedContextAttentionMetadata(CustomTestCase):
             context_cu_seqlens,
             decode_slots,
             decode_lens,
+            beam_width=beam_width,
             softmax_scale=softmax_scale,
         )
 
@@ -133,11 +134,11 @@ class TestSharedContextAttentionMetadata(CustomTestCase):
                 kv_head = q_head // (q_heads // kv_heads)
                 keys = k_buffer[slot_ids, kv_head].float()
                 values = v_buffer[slot_ids, kv_head].float()
-                scores = keys @ q[0, beam_index, q_head].float()
+                scores = keys @ q[beam_index, q_head].float()
                 probabilities = torch.softmax(scores * softmax_scale, dim=0)
-                reference[0, beam_index, q_head] = (
-                    probabilities[:, None] * values
-                ).sum(dim=0)
+                reference[beam_index, q_head] = (probabilities[:, None] * values).sum(
+                    dim=0
+                )
 
         torch.testing.assert_close(
             output.float(),
@@ -145,6 +146,104 @@ class TestSharedContextAttentionMetadata(CustomTestCase):
             rtol=1e-2,
             atol=1e-2,
         )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_split_prompts_match_fp32_reference(self):
+        """Every split count gives the unsplit result, also when a short prompt
+        leaves splits empty; decode slots past a group's decode length are unread."""
+        torch.manual_seed(0)
+        device = torch.device("cuda")
+        beam_width = 4
+        q_heads = 4
+        kv_heads = 2
+        head_dim = 64
+        context_lens = [1, 70, 300]
+        decode_len = 2
+        decode_capacity = 3
+        num_groups = len(context_lens)
+        num_slots = 1024
+
+        q = torch.randn(
+            num_groups * beam_width,
+            q_heads,
+            head_dim,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        k_buffer = torch.randn(
+            num_slots,
+            kv_heads,
+            head_dim,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        v_buffer = torch.randn_like(k_buffer)
+        slots = torch.randperm(num_slots, device=device).to(torch.int32)
+        context_slots = slots[: sum(context_lens)]
+        context_cu_seqlens = torch.tensor(
+            [0, *itertools.accumulate(context_lens)],
+            dtype=torch.int32,
+            device=device,
+        )
+        decode_slots = slots[
+            sum(context_lens) : sum(context_lens)
+            + num_groups * decode_capacity * beam_width
+        ].view(num_groups, decode_capacity * beam_width)
+        decode_lens = torch.full(
+            (num_groups,),
+            decode_len,
+            dtype=torch.int32,
+            device=device,
+        )
+        softmax_scale = 1.0 / math.sqrt(head_dim)
+
+        reference = torch.empty(q.shape, dtype=torch.float32, device=device)
+        for group, (start, end) in enumerate(
+            itertools.pairwise(context_cu_seqlens.tolist())
+        ):
+            for beam_index in range(beam_width):
+                # Scheduler rows: group leaders first, then the groups' other beams.
+                row = (
+                    group
+                    if beam_index == 0
+                    else num_groups + group * (beam_width - 1) + beam_index - 1
+                )
+                slot_ids = torch.cat(
+                    (
+                        context_slots[start:end],
+                        decode_slots[group, beam_index::beam_width][:decode_len],
+                    )
+                ).long()
+                for q_head in range(q_heads):
+                    kv_head = q_head // (q_heads // kv_heads)
+                    scores = (
+                        k_buffer[slot_ids, kv_head].float() @ q[row, q_head].float()
+                    )
+                    probabilities = torch.softmax(scores * softmax_scale, dim=0)
+                    reference[row, q_head] = (
+                        probabilities[:, None] * v_buffer[slot_ids, kv_head].float()
+                    ).sum(dim=0)
+
+        for num_splits in (1, 3, 8):
+            with self.subTest(num_splits=num_splits):
+                output = shared_context_attention(
+                    q,
+                    k_buffer,
+                    v_buffer,
+                    context_slots,
+                    context_cu_seqlens,
+                    decode_slots,
+                    decode_lens,
+                    beam_width=beam_width,
+                    softmax_scale=softmax_scale,
+                    num_splits=num_splits,
+                )
+                torch.testing.assert_close(
+                    output.float(),
+                    reference,
+                    rtol=1e-2,
+                    atol=1e-2,
+                )
 
     @patch.dict(os.environ, _LONG_CONTEXT_GRAPH_ENV)
     def test_graph_metadata_supports_32k_context_capacity(self):
