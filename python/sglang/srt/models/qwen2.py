@@ -22,10 +22,15 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
+from sglang.kernels.ops.gemm.quack_swiglu_gemm import (
+    quack_swiglu_gemm,
+    quack_swiglu_gemm_supported,
+)
 from sglang.srt.distributed import (
     get_pp_group,
     get_pp_indices,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -50,7 +55,7 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel, get_platform
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -90,6 +95,16 @@ class Qwen2MLP(nn.Module):
                 "Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        deterministic = get_exec().deterministic
+        self.quack_swiglu_enabled = (
+            envs.SGLANG_ENABLE_QUACK_SWIGLU_GEMM.get()
+            and get_platform().is_sm120
+            and quant_config is None
+            # Batch invariance overrides aten::mm, which the fused GEMM never calls.
+            and not deterministic.enable_deterministic_inference
+            # On-policy RL must match the trainer's unfused bf16 SwiGLU bit for bit.
+            and deterministic.rl_on_policy_target is None
+        )
 
     def forward(
         self,
@@ -99,10 +114,23 @@ class Qwen2MLP(nn.Module):
         if get_exec().deterministic.rl_on_policy_target is not None:
             x = x.bfloat16()
 
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        if self._use_quack_swiglu(x):
+            x = quack_swiglu_gemm(x, self.gate_up_proj.weight)
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(x, forward_batch=forward_batch)
         return x
+
+    def _use_quack_swiglu(self, x: torch.Tensor) -> bool:
+        # The fused GEMM bypasses gate_up_proj.forward, so a LoRA wrapper that
+        # replaced the layer after construction keeps the unfused path.
+        return (
+            self.quack_swiglu_enabled
+            and not torch.compiler.is_compiling()
+            and type(self.gate_up_proj) is MergedColumnParallelLinear
+            and quack_swiglu_gemm_supported(x, self.gate_up_proj.weight)
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights with centralized gate_up_proj stacked dispatch."""
