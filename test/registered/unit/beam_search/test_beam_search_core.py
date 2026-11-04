@@ -390,7 +390,7 @@ class TestWidthFreeTrieGraphState(CustomTestCase):
 
         with (
             envs.SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION.override(True),
-            envs.SGLANG_BEAM_DECODE_GRAPH_LEVEL.override(1),
+            envs.SGLANG_BEAM_DECODE_GRAPH_LEVEL.override(2),
         ):
             state = _trie_graph_state(max_rows=600)
             self.assertTrue(state.supports_rows(431))

@@ -570,7 +570,7 @@ def _run_ragged(case, metadata, *, q=None, req_pool_indices=None, seq_lens=None)
 
 
 class TestRaggedSharedContextAttention(CustomTestCase):
-    """SGLANG_BEAM_DECODE_GRAPH_LEVEL=1: one launch for any split of rows into groups."""
+    """SGLANG_BEAM_DECODE_GRAPH_LEVEL=2: one launch for any split of rows into groups."""
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_any_split_matches_fp32_reference(self):
@@ -653,17 +653,20 @@ class TestRaggedSharedContextAttention(CustomTestCase):
                 self.assertEqual(int(output[rows:].abs().sum()), 0)
 
     def test_level_rejects_what_it_cannot_run(self):
-        """Level 2 is not implemented, and level 1 runs only its own kernel: neither
-        may silently fall back to fixed-width behavior."""
+        """Level 1 has no mode of its own, level 3 is not implemented, and level 2
+        runs only its own kernel: none may silently fall back to fixed widths."""
         from sglang.srt.beam_search.shared_context_ragged import decode_graph_level
         from sglang.srt.environ import envs
 
-        with envs.SGLANG_BEAM_DECODE_GRAPH_LEVEL.override(2):
+        with envs.SGLANG_BEAM_DECODE_GRAPH_LEVEL.override(1):
+            with self.assertRaisesRegex(ValueError, "use 2"):
+                decode_graph_level()
+        with envs.SGLANG_BEAM_DECODE_GRAPH_LEVEL.override(3):
             with self.assertRaises(NotImplementedError):
                 decode_graph_level()
-        with envs.SGLANG_BEAM_DECODE_GRAPH_LEVEL.override(1):
+        with envs.SGLANG_BEAM_DECODE_GRAPH_LEVEL.override(2):
             with envs.SGLANG_BEAM_SHARED_CONTEXT_KERNEL.override("split_kv"):
-                with self.assertRaisesRegex(ValueError, "level 1"):
+                with self.assertRaisesRegex(ValueError, "level 2"):
                     decode_graph_level()
 
 

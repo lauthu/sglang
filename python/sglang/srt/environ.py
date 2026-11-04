@@ -253,6 +253,10 @@ class InvariantCheckLevel(IntEnum):
 class BeamDecodeGraphLevel(IntEnum):
     """Which trie beam decode steps replay a CUDA graph with shared-context attention.
 
+    Values are levels of beam-width support: 0 one width per server, 1 one width per
+    step, 2 any widths in a step, 3 beam and ordinary requests in a step. Level 1 has
+    no mode of its own, since MIXED_WIDTHS also replays steps of one width.
+
     FIXED_WIDTH: steps whose groups all have SGLANG_BEAM_SHARED_CONTEXT_WIDTH beams and
         whose row count is a captured size.
     MIXED_WIDTHS: steps of beam requests with any widths, padded to a captured size.
@@ -260,8 +264,8 @@ class BeamDecodeGraphLevel(IntEnum):
     """
 
     FIXED_WIDTH = 0
-    MIXED_WIDTHS = 1
-    MIXED_REQUESTS = 2
+    MIXED_WIDTHS = 2
+    MIXED_REQUESTS = 3
 
 
 class Envs:

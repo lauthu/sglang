@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Width-free shared-context attention metadata (SGLANG_BEAM_DECODE_GRAPH_LEVEL >= 1).
+"""Width-free shared-context attention metadata (SGLANG_BEAM_DECODE_GRAPH_LEVEL >= 2).
 
 A decode step describes its beam groups in one small int32 layout instead of
 per-width buckets of gathered KV slots. One kernel launch then serves every
@@ -70,17 +70,23 @@ class RaggedBeamAttentionMetadata(msgspec.Struct):
 
 
 def decode_graph_level() -> BeamDecodeGraphLevel:
-    level = BeamDecodeGraphLevel(envs.SGLANG_BEAM_DECODE_GRAPH_LEVEL.get())
+    value = envs.SGLANG_BEAM_DECODE_GRAPH_LEVEL.get()
+    if value == 1:
+        raise ValueError(
+            "SGLANG_BEAM_DECODE_GRAPH_LEVEL=1 (one width per step) has no mode of its "
+            "own: use 2, which also replays steps of one width"
+        )
+    level = BeamDecodeGraphLevel(value)
     if level == BeamDecodeGraphLevel.MIXED_REQUESTS:
         raise NotImplementedError(
-            "SGLANG_BEAM_DECODE_GRAPH_LEVEL=2 (beam and ordinary requests in one "
-            "graph) is not implemented yet; use 0 or 1"
+            "SGLANG_BEAM_DECODE_GRAPH_LEVEL=3 (beam and ordinary requests in one "
+            "graph) is not implemented yet; use 0 or 2"
         )
     kernel = envs.SGLANG_BEAM_SHARED_CONTEXT_KERNEL.get()
     if level != BeamDecodeGraphLevel.FIXED_WIDTH and kernel != "default":
         raise ValueError(
             f"SGLANG_BEAM_SHARED_CONTEXT_KERNEL={kernel!r} supports only "
-            "SGLANG_BEAM_DECODE_GRAPH_LEVEL=0; level 1 runs its own kernel"
+            "SGLANG_BEAM_DECODE_GRAPH_LEVEL=0; level 2 runs its own kernel"
         )
     return level
 
@@ -101,7 +107,7 @@ def warn_unused_fixed_width_settings() -> None:
     ]
     if unused:
         logger.warning(
-            "%s have no effect with SGLANG_BEAM_DECODE_GRAPH_LEVEL>=1: beam decode "
+            "%s have no effect with SGLANG_BEAM_DECODE_GRAPH_LEVEL>=2: beam decode "
             "graphs serve any width and read KV slots from req_to_token",
             ", ".join(unused),
         )
