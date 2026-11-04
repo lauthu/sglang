@@ -40,6 +40,7 @@ from sglang.kernels.ops.attention.position import compute_position_triton
 from sglang.kernels.ops.memory.small_copy import write_host_ints
 from sglang.srt.beam_search import shared_context_attention
 from sglang.srt.beam_search.shared_context_attention import BeamAttentionMetadata
+from sglang.srt.beam_search.shared_context_ragged import RaggedBeamAttentionMetadata
 from sglang.srt.beam_search.trie_output_head import build_trie_row_levels
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.utils import all_gather_single
@@ -490,7 +491,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Per-row SID codebook depths for trie-conditioned decode batches.
     beam_trie_levels: Optional[torch.Tensor] = None
     # Shared-context attention metadata for all-beam decode batches.
-    beam_attention_metadata: Optional[BeamAttentionMetadata] = None
+    beam_attention_metadata: Optional[
+        BeamAttentionMetadata | RaggedBeamAttentionMetadata
+    ] = None
     spec_algorithm: SpeculativeAlgorithm = None
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None

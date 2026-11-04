@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.beam_search import shared_context_attention
+from sglang.srt.beam_search.shared_context_ragged import RaggedBeamAttentionMetadata
 from sglang.srt.layers.attention.flashinfer_backend import (
     DecodeMetadata,
     FlashInferAttnBackend,
@@ -37,6 +38,17 @@ class BeamSharedContextFlashInferAttnBackend(FlashInferAttnBackend):
         if forward_batch.beam_attention_metadata is None:
             return super().init_forward_metadata(forward_batch)
         self.forward_metadata = DecodeMetadata([])
+
+    def init_forward_metadata_out_graph(
+        self, forward_batch: ForwardBatch, in_capture: bool = False
+    ):
+        # A width-free beam step runs no FlashInfer attention: skip its per-row plan.
+        if isinstance(
+            forward_batch.beam_attention_metadata, RaggedBeamAttentionMetadata
+        ):
+            self.forward_metadata = DecodeMetadata([])
+            return
+        super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
 
     def forward_decode(
         self,

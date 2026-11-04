@@ -341,5 +341,99 @@ class TestBeamGroup(CustomTestCase):
         self.assertAlmostEqual(group2.beam_score(-0.3, 2), -0.15, places=6)
 
 
+def _trie_graph_state(max_rows):
+    from sglang.srt.beam_search.trie_cuda_graph import TrieDecodeGraphState
+    from sglang.srt.configs.model_config import AttentionArch
+
+    runner = SimpleNamespace(
+        decode_attention_backend_str="flashinfer",
+        sliding_window_size=None,
+        model_config=SimpleNamespace(
+            is_encoder_decoder=False, attention_arch=AttentionArch.MHA
+        ),
+        kv_cache_dtype=torch.bfloat16,
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=torch.zeros(4, 8, dtype=torch.int32)
+        ),
+    )
+    return TrieDecodeGraphState(runner, max_rows, torch.device("cpu"))
+
+
+def _beam_step(widths, prompt_len=7, decode_len=2):
+    """A decode step's beam tail: leader rows first, then each group's members."""
+    from sglang.srt.beam_search.batch_tail import BeamTailEntry
+
+    entries, start = [], 0
+    for group, width in enumerate(widths):
+        entries.append(
+            BeamTailEntry(
+                SimpleNamespace(prompt_len=prompt_len), group, start, start + width - 1
+            )
+        )
+        start += width - 1
+    rows = sum(widths)
+    seq_lens = torch.full((rows,), prompt_len + decode_len, dtype=torch.int64)
+    return SimpleNamespace(
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens,
+        beam_tail=SimpleNamespace(num_base_rows=len(widths), entries=entries),
+        device=torch.device("cpu"),
+    )
+
+
+class TestWidthFreeTrieGraphState(CustomTestCase):
+    def test_any_split_replays_padded_into_a_captured_row_count(self):
+        """Level 1 captures a beam graph for any row count and stages any split into
+        it: the tiles cover every row exactly once and padded levels are zero."""
+        from sglang.srt.beam_search.shared_context_ragged import build_ragged_metadata
+        from sglang.srt.environ import envs
+
+        with (
+            envs.SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION.override(True),
+            envs.SGLANG_BEAM_DECODE_GRAPH_LEVEL.override(1),
+        ):
+            state = _trie_graph_state(max_rows=600)
+            self.assertTrue(state.supports_rows(431))
+            state.prepare_capture(SimpleNamespace(), 512)
+
+            widths = (2, 129, 300)
+            metadata = build_ragged_metadata(
+                _beam_step(widths), state.ragged_template.req_to_token
+            )
+            step = SimpleNamespace(
+                beam_trie_levels=torch.ones(431, dtype=torch.int64),
+                beam_attention_metadata=metadata,
+            )
+            self.assertTrue(state.can_replay(step, 431, 512))
+            state.levels.fill_(1)  # a previous, larger step's levels
+            staged = state.stage(step, 431, 512, 512)
+
+            num_groups, num_tiles, num_rows = staged.counts().tolist()
+            self.assertEqual((num_groups, num_rows), (3, 431))
+            groups = staged.groups()[:num_groups].tolist()
+            covered = []
+            for group, first_beam in staged.tiles()[:num_tiles].tolist():
+                leader, first_member, members, _ = groups[group]
+                for beam in range(
+                    first_beam, min(first_beam + staged.block_m, members + 1)
+                ):
+                    covered.append(leader if beam == 0 else first_member + beam - 1)
+            self.assertEqual(sorted(covered), list(range(431)))
+            self.assertEqual(int(state.levels[431:512].abs().sum()), 0)
+
+    def test_fixed_width_level_keeps_exact_multiples(self):
+        """The default level keeps the configured width's graphs only."""
+        from sglang.srt.environ import envs
+
+        with (
+            envs.SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION.override(True),
+            envs.SGLANG_BEAM_SHARED_CONTEXT_WIDTH.override(256),
+        ):
+            state = _trie_graph_state(max_rows=600)
+            self.assertIsNone(state.ragged_template)
+            self.assertFalse(state.supports_rows(431))
+            self.assertTrue(state.supports_rows(512))
+
+
 if __name__ == "__main__":
     unittest.main()

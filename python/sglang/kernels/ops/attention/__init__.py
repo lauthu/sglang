@@ -65,6 +65,7 @@ _TRITON_KERNELS = [
     ("beam_shared_context", "shared_context_attention"),
     ("beam_shared_context_split_kv", "shared_context_attention_split_kv"),
     ("beam_shared_context_stream_k", "shared_context_attention_stream_k"),
+    ("beam_shared_context_ragged", "shared_context_attention_ragged"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(
