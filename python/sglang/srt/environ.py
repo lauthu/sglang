@@ -250,6 +250,24 @@ class InvariantCheckLevel(IntEnum):
     STRICT = 2
 
 
+class BeamDecodeGraphLevel(IntEnum):
+    """Which trie beam decode steps replay a CUDA graph with shared-context attention.
+
+    Values are levels of beam-width support: 0 one width per server, 1 one width per
+    step, 2 any widths in a step, 3 beam and ordinary requests in a step. Level 1 has
+    no mode of its own, since MIXED_WIDTHS also replays steps of one width.
+
+    FIXED_WIDTH: steps whose groups all have SGLANG_BEAM_SHARED_CONTEXT_WIDTH beams and
+        whose row count is a captured size.
+    MIXED_WIDTHS: steps of beam requests with any widths, padded to a captured size.
+    MIXED_REQUESTS: MIXED_WIDTHS plus ordinary requests in the step (not implemented).
+    """
+
+    FIXED_WIDTH = 0
+    MIXED_WIDTHS = 2
+    MIXED_REQUESTS = 3
+
+
 class Envs:
     # Organization principles for this registry:
     # - Put every field in exactly one topical section. Prefer an existing
@@ -735,6 +753,8 @@ class Envs:
     # Shared-context attention kernel: "default", "split_kv" (prompt split across
     # CTAs) or "stream_k" (persistent grid).
     SGLANG_BEAM_SHARED_CONTEXT_KERNEL = EnvStr("default")
+    # BeamDecodeGraphLevel; above FIXED_WIDTH, the WIDTH and GRAPH_MAX_* settings are unused.
+    SGLANG_BEAM_DECODE_GRAPH_LEVEL = EnvInt(BeamDecodeGraphLevel.FIXED_WIDTH)
 
     # ===================================================================
     # Overlap scheduler and pipeline parallelism

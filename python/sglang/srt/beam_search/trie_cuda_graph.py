@@ -20,7 +20,8 @@ from dataclasses import dataclass
 import torch
 
 from sglang.srt.beam_search import shared_context_attention as shared
-from sglang.srt.environ import envs
+from sglang.srt.beam_search import shared_context_ragged as ragged
+from sglang.srt.environ import BeamDecodeGraphLevel, envs
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 
 
@@ -36,34 +37,56 @@ class TrieDecodeGraphState:
         self.use_shared = shared.enabled() and self.shared_supported
         self.levels = torch.zeros(max_tokens, dtype=torch.int64, device=device)
         self.metadata = {}
+        # One layout for every row count, when any split of the rows can replay.
+        self.ragged_template = None
+        if self.use_shared and ragged.ragged_enabled():
+            ragged.warn_unused_fixed_width_settings()
+            self.ragged_template = ragged.allocate_capture_layout(
+                max_tokens, device, model_runner.req_to_token_pool.req_to_token
+            )
 
     def current_signature(self):
         attention = shared.enabled()
+        level = ragged.decode_graph_level()
         return (
             attention,
             envs.SGLANG_OPT_BEAM_TRIE_TOPK_LOGPROB.get(),
+            level,
             (
                 shared.graph_beam_width(),
                 shared.graph_max_context(),
                 shared.graph_max_decode(),
             )
-            if attention and self.shared_supported
+            if attention
+            and self.shared_supported
+            and level == BeamDecodeGraphLevel.FIXED_WIDTH
             else None,
         )
 
     def supports_rows(self, rows: int) -> bool:
-        return not self.use_shared or (
-            rows >= shared.graph_beam_width() and rows % shared.graph_beam_width() == 0
+        return (
+            not self.use_shared
+            or self.ragged_template is not None
+            or (
+                rows >= shared.graph_beam_width()
+                and rows % shared.graph_beam_width() == 0
+            )
         )
+
+    def _capture_metadata(self, rows: int):
+        if not self.use_shared:
+            return None
+        if self.ragged_template is not None:
+            return ragged.capture_metadata(self.ragged_template, rows)
+        return shared.build_graph_capture_metadata(rows, self.levels.device)
 
     def prepare_capture(self, forward_batch, rows: int) -> None:
         forward_batch.beam_trie_levels = self.levels[:rows]
         if rows not in self.metadata:
-            self.metadata[rows] = (
-                shared.build_graph_capture_metadata(rows, self.levels.device)
-                if self.use_shared
-                else None
-            )
+            self.metadata[rows] = self._capture_metadata(rows)
+        if self.ragged_template is not None:
+            # A recapture must not replay a staged step's tables while recording.
+            self.ragged_template.counts().zero_()
         forward_batch.beam_attention_metadata = self.metadata[rows]
 
     def can_replay(self, forward_batch, rows: int, captured_rows: int) -> bool:
@@ -74,6 +97,12 @@ class TrieDecodeGraphState:
             or forward_batch.beam_trie_levels.dtype != torch.int64
         ):
             return False
+        if self.ragged_template is not None:
+            return ragged.graph_compatible(
+                forward_batch.beam_attention_metadata,
+                rows,
+                self.metadata[captured_rows],
+            )
         if self.use_shared:
             return shared.graph_compatible(
                 forward_batch.beam_attention_metadata, rows, captured_rows
@@ -88,6 +117,8 @@ class TrieDecodeGraphState:
         self.levels[:rows].copy_(forward_batch.beam_trie_levels)
         self.levels[rows:captured_rows].zero_()
         metadata = self.metadata[graph_size]
-        if metadata is not None:
+        if self.ragged_template is not None:
+            ragged.stage_graph_metadata(metadata, forward_batch.beam_attention_metadata)
+        elif metadata is not None:
             shared.stage_graph_metadata(metadata, forward_batch.beam_attention_metadata)
         return metadata

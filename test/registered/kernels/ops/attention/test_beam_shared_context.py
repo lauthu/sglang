@@ -459,5 +459,216 @@ class TestBeamSharedContextAttention(CustomTestCase):
                 selected_kernel()
 
 
+def _ragged_case(
+    widths,
+    prompt_lens,
+    decode_lens,
+    *,
+    q_heads=4,
+    kv_heads=2,
+    head_dim=64,
+    num_slots=1 << 15,
+    max_context=1024,
+    seed=0,
+):
+    """A decode step's rows as the scheduler lays them out: one leader row per
+    group, then each group's member rows. Members alias the leader's prompt slots
+    in their own req_to_token rows and own their decode slots; every row of a
+    group has the leader's length. Returns the batch view the metadata builder
+    reads, the kernel inputs and the FP32 reference."""
+    from sglang.srt.beam_search.batch_tail import BeamTailEntry
+
+    torch.manual_seed(seed)
+    device = torch.device("cuda")
+    num_groups = len(widths)
+    num_rows = sum(widths)
+    pools = torch.randperm(num_rows + 16, device=device)[:num_rows]
+    req_to_token = torch.zeros(
+        (num_rows + 16, max_context), dtype=torch.int32, device=device
+    )
+    slots = torch.randperm(num_slots, device=device).to(torch.int32)
+    seq_lens = torch.zeros(num_rows, dtype=torch.int64, device=device)
+    entries, group_rows = [], []
+    next_member, next_slot = num_groups, 0
+    for group, (width, prompt_len, decode_len) in enumerate(
+        zip(widths, prompt_lens, decode_lens, strict=True)
+    ):
+        rows = [group, *range(next_member, next_member + width - 1)]
+        prompt = slots[next_slot : next_slot + prompt_len]
+        next_slot += prompt_len
+        for row in rows:
+            req_to_token[pools[row], :prompt_len] = prompt
+            req_to_token[pools[row], prompt_len : prompt_len + decode_len] = slots[
+                next_slot : next_slot + decode_len
+            ]
+            next_slot += decode_len
+            seq_lens[row] = prompt_len + decode_len
+        entries.append(
+            BeamTailEntry(
+                SimpleNamespace(prompt_len=prompt_len),
+                group,
+                next_member - num_groups,
+                next_member - num_groups + width - 1,
+            )
+        )
+        group_rows.append(rows)
+        next_member += width - 1
+
+    q = torch.randn(num_rows, q_heads, head_dim, dtype=torch.bfloat16, device=device)
+    k_buffer = torch.randn(
+        num_slots, kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    v_buffer = torch.randn_like(k_buffer)
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+    q_per_kv = q_heads // kv_heads
+    reference = torch.empty(q.shape, dtype=torch.float32, device=device)
+    for rows in group_rows:
+        for row in rows:
+            keys = req_to_token[pools[row], : int(seq_lens[row])].long()
+            k = k_buffer[keys].repeat_interleave(q_per_kv, dim=1).float()
+            v = v_buffer[keys].repeat_interleave(q_per_kv, dim=1).float()
+            scores = torch.einsum("hd,thd->ht", q[row].float(), k) * softmax_scale
+            reference[row] = torch.einsum("ht,thd->hd", scores.softmax(dim=-1), v)
+
+    batch = SimpleNamespace(
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens.cpu(),
+        beam_tail=SimpleNamespace(num_base_rows=num_groups, entries=entries),
+        device=device,
+    )
+    return SimpleNamespace(
+        batch=batch,
+        q=q,
+        k_buffer=k_buffer,
+        v_buffer=v_buffer,
+        req_to_token=req_to_token,
+        req_pool_indices=pools.to(torch.int64),
+        seq_lens=seq_lens,
+        softmax_scale=softmax_scale,
+        reference=reference,
+    )
+
+
+def _run_ragged(case, metadata, *, q=None, req_pool_indices=None, seq_lens=None):
+    from sglang.kernels.ops.attention.beam_shared_context_ragged import (
+        shared_context_attention_ragged,
+    )
+
+    return shared_context_attention_ragged(
+        case.q if q is None else q,
+        case.k_buffer,
+        case.v_buffer,
+        metadata.req_to_token,
+        case.req_pool_indices if req_pool_indices is None else req_pool_indices,
+        case.seq_lens if seq_lens is None else seq_lens,
+        metadata.counts(),
+        metadata.groups(),
+        metadata.tiles(),
+        block_m=metadata.block_m,
+        softmax_scale=case.softmax_scale,
+    )
+
+
+class TestRaggedSharedContextAttention(CustomTestCase):
+    """SGLANG_BEAM_DECODE_GRAPH_LEVEL=2: one launch for any split of rows into groups."""
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_any_split_matches_fp32_reference(self):
+        """Mixed widths across the 128-beam tile edge, each group with its own prompt
+        and decode length, leaders apart from their member rows."""
+        from sglang.srt.beam_search.shared_context_ragged import build_ragged_metadata
+
+        widths = (2, 3, 127, 128, 129, 256, 300)
+        case = _ragged_case(
+            widths,
+            prompt_lens=(1, 700, 64, 65, 300, 129, 513),
+            decode_lens=(1, 4, 2, 3, 1, 2, 4),
+        )
+        metadata = build_ragged_metadata(case.batch, case.req_to_token)
+        output = _run_ragged(case, metadata)
+        torch.testing.assert_close(output.float(), case.reference, rtol=1e-2, atol=1e-2)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_graph_captured_once_replays_any_split(self):
+        """Nothing about widths, group count or lengths is recorded at capture: one
+        graph replays every split staged into its layout, and padded rows read 0."""
+        from sglang.srt.beam_search.shared_context_ragged import (
+            allocate_capture_layout,
+            build_ragged_metadata,
+            capture_metadata,
+            stage_graph_metadata,
+        )
+
+        captured_rows = 512
+        cases = tuple(
+            _ragged_case(*split, max_context=4096, seed=seed)
+            for seed, split in enumerate(
+                (
+                    ((256, 256), (2048, 7), (2, 1)),
+                    ((2, 129, 300), (5, 1000, 64), (3, 1, 2)),
+                    ((7,), (33,), (4,)),
+                )
+            )
+        )
+        first = cases[0]
+        with torch.device("cuda"):
+            q = torch.zeros(captured_rows, *first.q.shape[1:], dtype=torch.bfloat16)
+            pools = torch.zeros(captured_rows, dtype=torch.int64)
+            seq_lens = torch.ones(captured_rows, dtype=torch.int64)
+        req_to_token = torch.zeros(
+            (len(first.req_to_token) * 2, first.req_to_token.shape[1]),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        template = allocate_capture_layout(captured_rows, q.device, req_to_token)
+        target = capture_metadata(template, captured_rows)
+
+        def run():
+            return _run_ragged(
+                first, target, q=q, req_pool_indices=pools, seq_lens=seq_lens
+            )
+
+        run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = run()
+        for index, case in enumerate(cases):
+            with self.subTest(split=index):
+                rows = case.q.shape[0]
+                q[:rows].copy_(case.q)
+                pools[:rows].copy_(case.req_pool_indices)
+                seq_lens[:rows].copy_(case.seq_lens)
+                req_to_token[: len(case.req_to_token)].copy_(case.req_to_token)
+                # The cases share K/V buffers' shapes; replay reads the first case's.
+                first.k_buffer.copy_(case.k_buffer)
+                first.v_buffer.copy_(case.v_buffer)
+                stage_graph_metadata(
+                    target, build_ragged_metadata(case.batch, case.req_to_token)
+                )
+                graph.replay()
+                torch.cuda.synchronize()
+                torch.testing.assert_close(
+                    output[:rows].float(), case.reference, rtol=1e-2, atol=1e-2
+                )
+                self.assertEqual(int(output[rows:].abs().sum()), 0)
+
+    def test_level_rejects_what_it_cannot_run(self):
+        """Level 1 has no mode of its own, level 3 is not implemented, and level 2
+        runs only its own kernel: none may silently fall back to fixed widths."""
+        from sglang.srt.beam_search.shared_context_ragged import decode_graph_level
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_BEAM_DECODE_GRAPH_LEVEL.override(1):
+            with self.assertRaisesRegex(ValueError, "use 2"):
+                decode_graph_level()
+        with envs.SGLANG_BEAM_DECODE_GRAPH_LEVEL.override(3):
+            with self.assertRaises(NotImplementedError):
+                decode_graph_level()
+        with envs.SGLANG_BEAM_DECODE_GRAPH_LEVEL.override(2):
+            with envs.SGLANG_BEAM_SHARED_CONTEXT_KERNEL.override("split_kv"):
+                with self.assertRaisesRegex(ValueError, "level 2"):
+                    decode_graph_level()
+
+
 if __name__ == "__main__":
     unittest.main()
