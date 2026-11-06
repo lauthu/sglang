@@ -732,6 +732,9 @@ class Envs:
     SGLANG_BEAM_SHARED_CONTEXT_WIDTH = EnvInt(2000)
     SGLANG_BEAM_SHARED_CONTEXT_GRAPH_MAX_CONTEXT = EnvInt(32768)
     SGLANG_BEAM_SHARED_CONTEXT_GRAPH_MAX_DECODE = EnvInt(8)
+    # Shared-context attention kernel: "default", "split_kv" (prompt split across
+    # CTAs) or "stream_k" (persistent grid).
+    SGLANG_BEAM_SHARED_CONTEXT_KERNEL = EnvStr("default")
 
     # ===================================================================
     # Overlap scheduler and pipeline parallelism
@@ -1594,6 +1597,8 @@ class Envs:
     # auto-select by priority. "torch" flips all fused ops to their pure-torch
     # reference implementations for numerical-bug bisection.
     SGLANG_FORCE_FUSED_OP_BACKEND = EnvStr(None)
+    # SM120 dense gated MLPs: fuse SiLU-and-mul into the gate_up GEMM (quack).
+    SGLANG_ENABLE_QUACK_SWIGLU_GEMM = EnvBool(False)
     USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
     SGLANG_MOE_PADDING = EnvBool(False)
 
