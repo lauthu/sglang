@@ -36,7 +36,9 @@ def _row_logsumexp_keep_rows_kernel(
     row = tl.program_id(0).to(tl.int64)
     row_ptr = x_ptr + row * row_stride
     kept_row_ptr = kept_ptr + row * kept_row_stride
-    keep = row < tl.minimum(tl.load(kept_count_ptr), kept_capacity)
+    # Rows past the capacity skip the count load, and a uniform branch skips the
+    # stores: measured on SM120, keeping no rows then costs what row_logsumexp does.
+    keep = row < tl.load(kept_count_ptr, mask=row < kept_capacity, other=0)
 
     m_i = float("-inf")
     l_i = 0.0
@@ -46,8 +48,9 @@ def _row_logsumexp_keep_rows_kernel(
         x = tl.load(row_ptr + offs * col_stride, mask=in_row, other=float("-inf")).to(
             tl.float32
         )
-        tl.store(kept_row_ptr + offs, x, mask=in_row & keep)
         m_i, l_i, _ = _accumulate_block_lse(x, m_i, l_i)
+        if keep:
+            tl.store(kept_row_ptr + offs, x, mask=in_row)
 
     tl.store(out_max_ptr + row, m_i)
     tl.store(out_log_sum_ptr + row, tl.log(l_i))
