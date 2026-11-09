@@ -235,6 +235,10 @@ def build_replay_fb_view(
         can_run_decode_cuda_graph=forward_batch.can_run_decode_cuda_graph,
         global_num_tokens_cpu=global_num_tokens_cpu,
         dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+        # Backends read these on every replay; a beam replay sets them to the
+        # trie graph state's captured inputs.
+        beam_trie_levels=None,
+        beam_attention_metadata=None,
     )
 
 

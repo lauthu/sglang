@@ -434,6 +434,69 @@ class TestWidthFreeTrieGraphState(CustomTestCase):
             self.assertFalse(state.supports_rows(431))
             self.assertTrue(state.supports_rows(512))
 
+    def test_ordinary_decode_replay_keeps_the_flashinfer_plan(self):
+        """With shared-context attention on, a decode step of ordinary requests
+        replays the ordinary graph: its replay view carries no beam inputs, and the
+        backend must plan FlashInfer for it instead of failing on them."""
+        from unittest import mock
+
+        from sglang.srt.beam_search.shared_context_backend import (
+            BeamSharedContextFlashInferAttnBackend,
+        )
+        from sglang.srt.layers.attention.flashinfer_backend import (
+            FlashInferAttnBackend,
+        )
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            build_replay_fb_view,
+        )
+
+        rows = torch.zeros(4, dtype=torch.int64)
+        step = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            seq_lens_sum=None,
+            seq_lens_cpu=None,
+            max_seq_len_host=None,
+            out_cache_loc_virtual=None,
+            iteration_ids=None,
+            iteration_cols=None,
+            max_seq_len_override=None,
+            spec_info=None,
+            ragged_verify_layout=None,
+            lora_ids=None,
+            can_run_decode_cuda_graph=True,
+        )
+        buffers = SimpleNamespace(
+            input_ids=rows,
+            positions=rows,
+            req_pool_indices=rows,
+            seq_lens=rows,
+            seq_lens_cpu=rows,
+            mamba_track_indices=None,
+        )
+        view = build_replay_fb_view(
+            forward_batch=step,
+            buffers=buffers,
+            bs=4,
+            raw_bs=3,
+            num_tokens=4,
+            global_num_tokens_cpu=None,
+            seq_len_fill_value=1,
+            capture_forward_mode=ForwardMode.DECODE,
+            is_encoder_decoder=False,
+        )
+        planned = []
+
+        def plan(backend, forward_batch, in_capture=False):
+            planned.append(forward_batch)
+
+        backend = object.__new__(BeamSharedContextFlashInferAttnBackend)
+        with mock.patch.object(
+            FlashInferAttnBackend, "init_forward_metadata_out_graph", plan
+        ):
+            backend.init_forward_metadata_out_graph(view)
+        self.assertEqual(planned, [view])
+
 
 if __name__ == "__main__":
     unittest.main()
