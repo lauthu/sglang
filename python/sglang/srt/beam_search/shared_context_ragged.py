@@ -16,7 +16,9 @@
 A decode step describes its beam groups in one small int32 layout instead of
 per-width buckets of gathered KV slots. One kernel launch then serves every
 width in the step, and a CUDA graph captured for a row count replays for any
-split of those rows into groups.
+split of those rows into groups. At level 3, every other row of the step (an
+ordinary request, or a finished group's leader) is a one-row group whose whole
+KV is its prompt.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 import torch
 
+from sglang.srt.beam_search import mixed_requests
 from sglang.srt.environ import BeamDecodeGraphLevel, envs
 
 if TYPE_CHECKING:
@@ -77,22 +80,22 @@ def decode_graph_level() -> BeamDecodeGraphLevel:
             "own: use 2, which also replays steps of one width"
         )
     level = BeamDecodeGraphLevel(value)
-    if level == BeamDecodeGraphLevel.MIXED_REQUESTS:
-        raise NotImplementedError(
-            "SGLANG_BEAM_DECODE_GRAPH_LEVEL=3 (beam and ordinary requests in one "
-            "graph) is not implemented yet; use 0 or 2"
+    if (
+        level == BeamDecodeGraphLevel.MIXED_REQUESTS
+        and envs.SGLANG_OPT_BEAM_TRIE_TOPK_LOGPROB.get()
+    ):
+        raise ValueError(
+            "SGLANG_BEAM_DECODE_GRAPH_LEVEL=3 samples ordinary requests from the "
+            "full-vocabulary logits of the trie head's normalizer pass, which "
+            "SGLANG_OPT_BEAM_TRIE_TOPK_LOGPROB=true skips; use level 2"
         )
     kernel = envs.SGLANG_BEAM_SHARED_CONTEXT_KERNEL.get()
     if level != BeamDecodeGraphLevel.FIXED_WIDTH and kernel != "default":
         raise ValueError(
             f"SGLANG_BEAM_SHARED_CONTEXT_KERNEL={kernel!r} supports only "
-            "SGLANG_BEAM_DECODE_GRAPH_LEVEL=0; level 2 runs its own kernel"
+            "SGLANG_BEAM_DECODE_GRAPH_LEVEL=0; levels 2 and 3 run their own kernel"
         )
     return level
-
-
-def ragged_enabled() -> bool:
-    return decode_graph_level() >= BeamDecodeGraphLevel.MIXED_WIDTHS
 
 
 def warn_unused_fixed_width_settings() -> None:
@@ -128,10 +131,14 @@ def _layout_tensor(values: list[int], device) -> torch.Tensor:
 
 
 def build_ragged_metadata(
-    batch: ScheduleBatch, req_to_token: torch.Tensor
+    batch: ScheduleBatch,
+    req_to_token: torch.Tensor,
+    *,
+    one_row_groups: bool = False,
 ) -> Optional[RaggedBeamAttentionMetadata]:
-    """Group and tile tables of an all-beam decode step, built on the host from the
-    beam tail; None leaves the step to ordinary attention."""
+    """Group and tile tables of a beam decode step, built on the host from the beam
+    tail; None leaves the step to ordinary attention. Every row must belong to a
+    beam group unless one_row_groups (level 3) covers the rest."""
     num_rows = len(batch.seq_lens)
     num_base_rows = batch.beam_tail.num_base_rows
     groups: list[int] = []
@@ -150,6 +157,12 @@ def build_ragged_metadata(
         for first_beam in range(0, num_members + 1, RAGGED_BLOCK_M):
             tiles.extend((group, first_beam))
         covered_rows += num_members + 1
+    if (
+        covered_rows < num_rows
+        and one_row_groups
+        and mixed_requests.fits_beam_step(batch)
+    ):
+        covered_rows += _append_one_row_groups(batch, groups, tiles)
     if covered_rows != num_rows:
         return None
 
@@ -167,12 +180,29 @@ def build_ragged_metadata(
     )
 
 
+def _append_one_row_groups(
+    batch: ScheduleBatch, groups: list[int], tiles: list[int]
+) -> int:
+    """Add each base row outside the beam tail as a one-row group with its whole KV
+    as the prompt, so the kernel's decode loop is empty; returns the rows added."""
+    leaders = {entry.leader_idx for entry in batch.beam_tail.entries}
+    seq_lens = batch.seq_lens_cpu[: batch.beam_tail.num_base_rows].tolist()
+    added = 0
+    for row, seq_len in enumerate(seq_lens):
+        if row in leaders:
+            continue
+        tiles.extend((len(groups) // _GROUP_FIELDS, 0))
+        groups.extend((row, row, 0, seq_len))
+        added += 1
+    return added
+
+
 def allocate_capture_layout(
-    max_rows: int, device, req_to_token: torch.Tensor
+    max_rows: int, device, req_to_token: torch.Tensor, *, one_row_groups: bool = False
 ) -> RaggedBeamAttentionMetadata:
     """One layout for every captured row count: only one graph replays at a time."""
-    # Every beam group has at least two rows.
-    group_capacity = max(1, max_rows // 2)
+    # Every beam group has at least two rows, unless one-row groups are allowed.
+    group_capacity = max_rows if one_row_groups else max(1, max_rows // 2)
     tile_capacity = ragged_tile_capacity(max_rows, group_capacity, RAGGED_BLOCK_M)
     size = _NUM_COUNTS + _GROUP_FIELDS * group_capacity + _TILE_FIELDS * tile_capacity
     return RaggedBeamAttentionMetadata(

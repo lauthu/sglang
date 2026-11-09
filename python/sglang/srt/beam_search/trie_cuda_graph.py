@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 import torch
 
+from sglang.srt.beam_search import mixed_requests
 from sglang.srt.beam_search import shared_context_attention as shared
 from sglang.srt.beam_search import shared_context_ragged as ragged
 from sglang.srt.environ import BeamDecodeGraphLevel, envs
@@ -39,10 +40,20 @@ class TrieDecodeGraphState:
         self.metadata = {}
         # One layout for every row count, when any split of the rows can replay.
         self.ragged_template = None
-        if self.use_shared and ragged.ragged_enabled():
+        level = ragged.decode_graph_level()
+        if self.use_shared and level >= BeamDecodeGraphLevel.MIXED_WIDTHS:
             ragged.warn_unused_fixed_width_settings()
             self.ragged_template = ragged.allocate_capture_layout(
-                max_tokens, device, model_runner.req_to_token_pool.req_to_token
+                max_tokens,
+                device,
+                model_runner.req_to_token_pool.req_to_token,
+                one_row_groups=level >= BeamDecodeGraphLevel.MIXED_REQUESTS,
+            )
+        # Full-vocabulary rows every beam graph may keep, for ordinary requests.
+        self.dense_rows = None
+        if level >= BeamDecodeGraphLevel.MIXED_REQUESTS:
+            self.dense_rows = mixed_requests.allocate_capture_dense_rows(
+                max_tokens, model_runner.model_config.vocab_size, device
             )
 
     def current_signature(self):
@@ -52,6 +63,11 @@ class TrieDecodeGraphState:
             attention,
             envs.SGLANG_OPT_BEAM_TRIE_TOPK_LOGPROB.get(),
             level,
+            (
+                mixed_requests.max_mixed_requests()
+                if level >= BeamDecodeGraphLevel.MIXED_REQUESTS
+                else None
+            ),
             (
                 shared.graph_beam_width(),
                 shared.graph_max_context(),
@@ -88,6 +104,9 @@ class TrieDecodeGraphState:
             # A recapture must not replay a staged step's tables while recording.
             self.ragged_template.counts().zero_()
         forward_batch.beam_attention_metadata = self.metadata[rows]
+        if self.dense_rows is not None:
+            self.dense_rows.count.zero_()
+            forward_batch.beam_dense_rows = self.dense_rows
 
     def can_replay(self, forward_batch, rows: int, captured_rows: int) -> bool:
         if (
@@ -95,6 +114,11 @@ class TrieDecodeGraphState:
             or captured_rows not in self.metadata
             or forward_batch.beam_trie_levels.shape != (rows,)
             or forward_batch.beam_trie_levels.dtype != torch.int64
+        ):
+            return False
+        dense_rows = forward_batch.beam_dense_rows
+        if dense_rows is not None and (
+            self.dense_rows is None or dense_rows.num_rows > self.dense_rows.num_rows
         ):
             return False
         if self.ragged_template is not None:
@@ -121,4 +145,8 @@ class TrieDecodeGraphState:
             ragged.stage_graph_metadata(metadata, forward_batch.beam_attention_metadata)
         elif metadata is not None:
             shared.stage_graph_metadata(metadata, forward_batch.beam_attention_metadata)
+        if self.dense_rows is not None:
+            mixed_requests.stage_dense_rows(
+                self.dense_rows, forward_batch.beam_dense_rows
+            )
         return metadata

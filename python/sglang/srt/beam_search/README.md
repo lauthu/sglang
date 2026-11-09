@@ -38,6 +38,22 @@ incompatible row layout. Different per-request decode lengths are supported
 within a uniform-width batch: private slot arrays are padded and actual lengths
 are refreshed for each group on every replay.
 
+`SGLANG_BEAM_DECODE_GRAPH_LEVEL` widens which decode steps replay a beam graph
+with shared-context attention, without the width setting above:
+
+| Level | A beam decode step replays a captured beam graph when |
+| --- | --- |
+| 0 (default) | it matches the width and capacities above, as described |
+| 2 | every request in it is a beam request, of any width; rows pad up to a captured size |
+| 3 | as level 2, and ordinary requests may join it, up to `SGLANG_BEAM_DECODE_GRAPH_MAX_MIXED_REQUESTS` (64) requests per step |
+
+At level 3 an ordinary request runs as a one-row group, and the trie head keeps
+its full-vocabulary logits, which the normalizer pass computes anyway, for the
+regular sampler. A step with more requests runs the ordinary decode path and is
+counted in the log. Level 3 needs the full-vocabulary normalizer, so it refuses
+to start with `SGLANG_OPT_BEAM_TRIE_TOPK_LOGPROB=true`. Levels 2 and 3 use their
+own kernel and reject `SGLANG_BEAM_SHARED_CONTEXT_KERNEL` other than `default`.
+
 `SGLANG_ENABLE_BEAM_TRIE_SELECTION_GRAPH=true` separately replays the existing
 compact-trie selection tensor operations. It is off by default. Requests with
 other widths, stop-token handling, or unsupported layouts retain the native

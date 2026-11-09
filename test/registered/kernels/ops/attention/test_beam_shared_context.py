@@ -474,8 +474,9 @@ def _ragged_case(
     """A decode step's rows as the scheduler lays them out: one leader row per
     group, then each group's member rows. Members alias the leader's prompt slots
     in their own req_to_token rows and own their decode slots; every row of a
-    group has the leader's length. Returns the batch view the metadata builder
-    reads, the kernel inputs and the FP32 reference."""
+    group has the leader's length. A width of 1 is an ordinary request: one base
+    row, outside the beam tail. Returns the batch view the metadata builder reads,
+    the kernel inputs and the FP32 reference."""
     from sglang.srt.beam_search.batch_tail import BeamTailEntry
 
     torch.manual_seed(seed)
@@ -503,14 +504,15 @@ def _ragged_case(
             ]
             next_slot += decode_len
             seq_lens[row] = prompt_len + decode_len
-        entries.append(
-            BeamTailEntry(
-                SimpleNamespace(prompt_len=prompt_len),
-                group,
-                next_member - num_groups,
-                next_member - num_groups + width - 1,
+        if width > 1:
+            entries.append(
+                BeamTailEntry(
+                    SimpleNamespace(prompt_len=prompt_len),
+                    group,
+                    next_member - num_groups,
+                    next_member - num_groups + width - 1,
+                )
             )
-        )
         group_rows.append(rows)
         next_member += width - 1
 
@@ -531,6 +533,10 @@ def _ragged_case(
             reference[row] = torch.einsum("ht,thd->hd", scores.softmax(dim=-1), v)
 
     batch = SimpleNamespace(
+        reqs=[
+            SimpleNamespace(beam_group=None if width == 1 else object())
+            for width in widths
+        ],
         seq_lens=seq_lens,
         seq_lens_cpu=seq_lens.cpu(),
         beam_tail=SimpleNamespace(num_base_rows=num_groups, entries=entries),
@@ -589,9 +595,28 @@ class TestRaggedSharedContextAttention(CustomTestCase):
         torch.testing.assert_close(output.float(), case.reference, rtol=1e-2, atol=1e-2)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_ordinary_rows_as_one_row_groups_match_fp32_reference(self):
+        """Level 3: ordinary requests among beam groups attend over their whole KV as
+        one-row groups, up to 5,000 tokens, in the same launch as the beams."""
+        from sglang.srt.beam_search.shared_context_ragged import build_ragged_metadata
+
+        case = _ragged_case(
+            (1, 129, 1, 2, 1, 300),
+            prompt_lens=(1, 700, 2048, 64, 5000, 513),
+            decode_lens=(5, 1, 3, 2, 0, 4),
+            max_context=8192,
+        )
+        metadata = build_ragged_metadata(
+            case.batch, case.req_to_token, one_row_groups=True
+        )
+        output = _run_ragged(case, metadata)
+        torch.testing.assert_close(output.float(), case.reference, rtol=1e-2, atol=1e-2)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_graph_captured_once_replays_any_split(self):
         """Nothing about widths, group count or lengths is recorded at capture: one
-        graph replays every split staged into its layout, and padded rows read 0."""
+        graph replays every split staged into its layout, ordinary requests as
+        one-row groups included, and padded rows read 0."""
         from sglang.srt.beam_search.shared_context_ragged import (
             allocate_capture_layout,
             build_ragged_metadata,
@@ -607,6 +632,7 @@ class TestRaggedSharedContextAttention(CustomTestCase):
                     ((256, 256), (2048, 7), (2, 1)),
                     ((2, 129, 300), (5, 1000, 64), (3, 1, 2)),
                     ((7,), (33,), (4,)),
+                    ((1, 256, 1, 1), (900, 2048, 3000, 1), (2, 1, 0, 6)),
                 )
             )
         )
@@ -620,7 +646,9 @@ class TestRaggedSharedContextAttention(CustomTestCase):
             dtype=torch.int32,
             device="cuda",
         )
-        template = allocate_capture_layout(captured_rows, q.device, req_to_token)
+        template = allocate_capture_layout(
+            captured_rows, q.device, req_to_token, one_row_groups=True
+        )
         target = capture_metadata(template, captured_rows)
 
         def run():
@@ -643,7 +671,10 @@ class TestRaggedSharedContextAttention(CustomTestCase):
                 first.k_buffer.copy_(case.k_buffer)
                 first.v_buffer.copy_(case.v_buffer)
                 stage_graph_metadata(
-                    target, build_ragged_metadata(case.batch, case.req_to_token)
+                    target,
+                    build_ragged_metadata(
+                        case.batch, case.req_to_token, one_row_groups=True
+                    ),
                 )
                 graph.replay()
                 torch.cuda.synchronize()
@@ -653,20 +684,24 @@ class TestRaggedSharedContextAttention(CustomTestCase):
                 self.assertEqual(int(output[rows:].abs().sum()), 0)
 
     def test_level_rejects_what_it_cannot_run(self):
-        """Level 1 has no mode of its own, level 3 is not implemented, and level 2
-        runs only its own kernel: none may silently fall back to fixed widths."""
+        """Level 1 has no mode of its own, levels 2 and 3 run only their own kernel,
+        and level 3 needs the full-vocabulary normalizer pass that approximate
+        scoring skips: none may silently run something else."""
         from sglang.srt.beam_search.shared_context_ragged import decode_graph_level
-        from sglang.srt.environ import envs
+        from sglang.srt.environ import BeamDecodeGraphLevel, envs
 
         with envs.SGLANG_BEAM_DECODE_GRAPH_LEVEL.override(1):
             with self.assertRaisesRegex(ValueError, "use 2"):
                 decode_graph_level()
+        for level in (2, 3):
+            with envs.SGLANG_BEAM_DECODE_GRAPH_LEVEL.override(level):
+                with envs.SGLANG_BEAM_SHARED_CONTEXT_KERNEL.override("split_kv"):
+                    with self.assertRaisesRegex(ValueError, "levels 2 and 3"):
+                        decode_graph_level()
         with envs.SGLANG_BEAM_DECODE_GRAPH_LEVEL.override(3):
-            with self.assertRaises(NotImplementedError):
-                decode_graph_level()
-        with envs.SGLANG_BEAM_DECODE_GRAPH_LEVEL.override(2):
-            with envs.SGLANG_BEAM_SHARED_CONTEXT_KERNEL.override("split_kv"):
-                with self.assertRaisesRegex(ValueError, "level 2"):
+            self.assertEqual(decode_graph_level(), BeamDecodeGraphLevel.MIXED_REQUESTS)
+            with envs.SGLANG_OPT_BEAM_TRIE_TOPK_LOGPROB.override(True):
+                with self.assertRaisesRegex(ValueError, "use level 2"):
                     decode_graph_level()
 
 

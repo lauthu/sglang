@@ -22,7 +22,7 @@ import msgspec
 import torch
 
 from sglang.srt.beam_search import shared_context_ragged as ragged
-from sglang.srt.environ import envs
+from sglang.srt.environ import BeamDecodeGraphLevel, envs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -220,9 +220,12 @@ def build_metadata(
     entries = batch.beam_tail.entries
     if not entries or batch.seq_lens_cpu is None:
         return None
-    if ragged.ragged_enabled():
+    level = ragged.decode_graph_level()
+    if level >= BeamDecodeGraphLevel.MIXED_WIDTHS:
         return ragged.build_ragged_metadata(
-            batch, model_runner.req_to_token_pool.req_to_token
+            batch,
+            model_runner.req_to_token_pool.req_to_token,
+            one_row_groups=level >= BeamDecodeGraphLevel.MIXED_REQUESTS,
         )
 
     widths = [entry.end - entry.start + 1 for entry in entries]

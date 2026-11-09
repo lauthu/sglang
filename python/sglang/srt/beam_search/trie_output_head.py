@@ -21,6 +21,9 @@ from typing import TYPE_CHECKING, Callable, Optional
 import msgspec
 import torch
 
+from sglang.srt.beam_search import mixed_requests
+from sglang.srt.beam_search.mixed_requests import BeamDenseRows
+from sglang.srt.beam_search.shared_context_ragged import decode_graph_level
 from sglang.srt.beam_search.trie_config import TrieOutputHeadConfig
 from sglang.srt.environ import envs
 
@@ -35,6 +38,8 @@ logger = logging.getLogger(__name__)
 class BeamTrieHeadOutput(msgspec.Struct, frozen=True):
     logits: torch.Tensor
     normalizer: Optional[torch.Tensor]
+    # fp32 [kept rows, vocab]: full-vocabulary logits of the step's first rows.
+    dense_logits: Optional[torch.Tensor] = None
 
 
 def use_topk_logprob() -> bool:
@@ -53,6 +58,8 @@ def configure_model_trie_output_heads(
 ) -> bool:
     from sglang.srt.layers.logits_processor import LogitsProcessor
 
+    # Reject a level the settings cannot run at startup, not at a beam decode step.
+    decode_graph_level()
     enabled = config is not None and (
         device == "cuda"
         and tp_size == 1
@@ -79,23 +86,40 @@ def configure_model_trie_output_heads(
     return enabled
 
 
+def _runs_compact_head(batch: ScheduleBatch) -> bool:
+    if all(req.beam_group is not None for req in batch.reqs):
+        return True
+    if not mixed_requests.ordinary_requests_enabled():
+        return False
+    if mixed_requests.fits_beam_step(batch):
+        return True
+    mixed_requests.note_overflow(len(batch.reqs))
+    return False
+
+
 def build_trie_row_levels(
     batch: ScheduleBatch, model_runner: ModelRunner
 ) -> Optional[torch.Tensor]:
-    """Per-row SID codebook depths of an all-beam decode batch on the compact
-    head; None runs the dense LM head."""
+    """Per-row SID codebook depths of a beam decode batch on the compact head; None
+    runs the dense LM head. Every request must be a beam request, except at level 3,
+    where an ordinary request's row gets depth 0 and keeps full-vocabulary logits."""
     if (
         batch.forward_mode.is_decode()
         and batch.beam_tail is not None
         and model_runner.beam_trie_compact_enabled
         and batch.reqs
-        and all(req.beam_group is not None for req in batch.reqs)
+        and _runs_compact_head(batch)
     ):
         beam_trie_config = model_runner.model_config.beam_trie_config
         assert beam_trie_config is not None
         max_level = beam_trie_config.num_codebooks - 1
         row_levels = [
-            min(req.beam_group.num_generated, max_level) for req in batch.reqs
+            (
+                0
+                if req.beam_group is None
+                else min(req.beam_group.num_generated, max_level)
+            )
+            for req in batch.reqs
         ]
         if batch.beam_tail is not None:
             for entry in batch.beam_tail.entries:
@@ -131,6 +155,7 @@ class BeamTrieOutputHead:
         project: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
         transform: Callable[[torch.Tensor], torch.Tensor],
         use_grouped_projection: bool = False,
+        dense_rows: Optional[BeamDenseRows] = None,
     ) -> BeamTrieHeadOutput:
         start = self.config.token_start
         end = self.config.token_end
@@ -156,6 +181,14 @@ class BeamTrieOutputHead:
                 hidden_states.shape[0], device=hidden_states.device
             )
             logits = all_logits[row_indices, depths]
+        kept = None
+        if dense_rows is not None:
+            if use_topk_logprob():
+                raise RuntimeError(
+                    "Full-vocabulary rows come from the normalizer pass, which "
+                    "SGLANG_OPT_BEAM_TRIE_TOPK_LOGPROB=true skips"
+                )
+            kept = dense_rows.target(self.vocab_size, hidden_states.device)
         normalizer = (
             None
             if use_topk_logprob()
@@ -164,9 +197,12 @@ class BeamTrieOutputHead:
                 weight,
                 project,
                 transform,
+                kept=kept,
             )
         )
-        return BeamTrieHeadOutput(logits, normalizer)
+        return BeamTrieHeadOutput(
+            logits, normalizer, dense_logits=None if kept is None else kept[0]
+        )
 
     def _stream_normalizer(
         self,
@@ -174,7 +210,11 @@ class BeamTrieOutputHead:
         weight: torch.Tensor,
         project: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
         transform: Callable[[torch.Tensor], torch.Tensor],
+        kept: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
+        """Each row's (max, log-sum-exp - max) over the vocabulary. With `kept`, a
+        (logits [rows, vocab] fp32, count int32 [1]) pair, also writes the first
+        count rows' transformed logits into those buffers on the way."""
         if self.vocab_size > weight.shape[0]:
             raise RuntimeError(
                 f"Model vocabulary ({self.vocab_size}) exceeds LM-head rows "
@@ -187,12 +227,23 @@ class BeamTrieOutputHead:
             logical_end = min(start + self.chunk_size, self.vocab_size)
             chunk_logits = project(hidden_states, weight[start:logical_end])
             chunk_logits = transform(chunk_logits)
-            if chunk_logits.is_cuda:
+            if chunk_logits.is_cuda and kept is not None:
+                from sglang.kernels.ops.sampling.row_logsumexp_keep_rows import (
+                    row_logsumexp_keep_rows,
+                )
+
+                chunk_max, chunk_log_sum = row_logsumexp_keep_rows(
+                    chunk_logits, kept[0][:, start:logical_end], kept[1]
+                )
+            elif chunk_logits.is_cuda:
                 from sglang.srt.layers.logsumexp import row_logsumexp
 
                 chunk_max, chunk_log_sum = row_logsumexp(chunk_logits)
             else:
                 chunk_logits = chunk_logits.float()
+                if kept is not None:
+                    rows = min(int(kept[1]), kept[0].shape[0], chunk_logits.shape[0])
+                    kept[0][:rows, start:logical_end] = chunk_logits[:rows]
                 chunk_max = chunk_logits.max(dim=-1).values
                 chunk_log_sum = torch.log(
                     torch.exp(chunk_logits - chunk_max[:, None]).sum(dim=-1)

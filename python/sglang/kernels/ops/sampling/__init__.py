@@ -148,3 +148,14 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="sampling.row_logsumexp_keep_rows",
+        backend=KernelBackend.TRITON,
+        target=(
+            "sglang.kernels.ops.sampling.row_logsumexp_keep_rows:"
+            "row_logsumexp_keep_rows"
+        ),
+        capabilities=CUDA_ONLY,
+    )
+)
