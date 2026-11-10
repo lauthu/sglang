@@ -23,13 +23,13 @@ KV is its prompt.
 
 from __future__ import annotations
 
+import itertools
 import logging
 from typing import TYPE_CHECKING, Optional
 
 import msgspec
 import torch
 
-from sglang.srt.beam_search import mixed_requests
 from sglang.srt.environ import BeamDecodeGraphLevel, envs
 
 if TYPE_CHECKING:
@@ -51,6 +51,7 @@ _TILE_FIELDS = 2
 class RaggedBeamAttentionMetadata(msgspec.Struct):
     # int32 [3 + 4 * group_capacity + 2 * tile_capacity]
     layout: torch.Tensor
+    # A step's own group and tile counts, or the most a captured layout holds.
     group_capacity: int
     tile_capacity: int
     block_m: int
@@ -138,63 +139,58 @@ def build_ragged_metadata(
 ) -> Optional[RaggedBeamAttentionMetadata]:
     """Group and tile tables of a beam decode step, built on the host from the beam
     tail; None leaves the step to ordinary attention. Every row must belong to a
-    beam group unless one_row_groups (level 3) covers the rest."""
+    beam group, unless one_row_groups lets the other base rows (ordinary requests,
+    finished groups' leaders) run as one-row groups."""
     num_rows = len(batch.seq_lens)
     num_base_rows = batch.beam_tail.num_base_rows
-    groups: list[int] = []
-    tiles: list[int] = []
-    covered_rows = 0
-    for group, entry in enumerate(batch.beam_tail.entries):
+    # Leaders and one-row groups are base rows.
+    base_lens = batch.seq_lens_cpu[:num_base_rows].tolist()
+    # Rows of the group table: (leader row, first member row, members, prompt length).
+    groups: list[tuple[int, int, int, int]] = []
+    for entry in batch.beam_tail.entries:
         num_members = entry.end - entry.start
         prompt_len = int(entry.group.prompt_len)
-        if num_members < 1:
+        if num_members < 1 or base_lens[entry.leader_idx] <= prompt_len:
             return None
-        if int(batch.seq_lens_cpu[entry.leader_idx]) <= prompt_len:
-            return None
-        groups.extend(
+        groups.append(
             (entry.leader_idx, num_base_rows + entry.start, num_members, prompt_len)
         )
-        for first_beam in range(0, num_members + 1, RAGGED_BLOCK_M):
-            tiles.extend((group, first_beam))
-        covered_rows += num_members + 1
-    if (
-        covered_rows < num_rows
-        and one_row_groups
-        and mixed_requests.fits_beam_step(batch)
-    ):
-        covered_rows += _append_one_row_groups(batch, groups, tiles)
+    covered_rows = sum(num_members + 1 for _, _, num_members, _ in groups)
+    if covered_rows < num_rows and one_row_groups:
+        # The row's whole KV is its prompt, so the kernel's decode loop is empty.
+        leaders = {leader for leader, _, _, _ in groups}
+        groups += [
+            (row, row, 0, seq_len)
+            for row, seq_len in enumerate(base_lens)
+            if row not in leaders
+        ]
+        covered_rows = sum(num_members + 1 for _, _, num_members, _ in groups)
     if covered_rows != num_rows:
         return None
 
-    num_groups = len(groups) // _GROUP_FIELDS
-    num_tiles = len(tiles) // _TILE_FIELDS
+    # A tile is RAGGED_BLOCK_M beams of one group, the leader first.
+    tiles = [
+        (group, first_beam)
+        for group, (_, _, num_members, _) in enumerate(groups)
+        for first_beam in range(0, num_members + 1, RAGGED_BLOCK_M)
+    ]
     return RaggedBeamAttentionMetadata(
         layout=_layout_tensor(
-            [num_groups, num_tiles, num_rows, *groups, *tiles], batch.device
+            [
+                len(groups),
+                len(tiles),
+                num_rows,
+                *itertools.chain.from_iterable(groups),
+                *itertools.chain.from_iterable(tiles),
+            ],
+            batch.device,
         ),
-        group_capacity=num_groups,
-        tile_capacity=num_tiles,
+        group_capacity=len(groups),
+        tile_capacity=len(tiles),
         block_m=RAGGED_BLOCK_M,
         num_rows=num_rows,
         req_to_token=req_to_token,
     )
-
-
-def _append_one_row_groups(
-    batch: ScheduleBatch, groups: list[int], tiles: list[int]
-) -> int:
-    """Add each base row outside the beam tail as a one-row group with its whole KV
-    as the prompt, so the kernel's decode loop is empty; returns the rows added."""
-    leaders = {entry.leader_idx for entry in batch.beam_tail.entries}
-    seq_lens = batch.seq_lens_cpu[: batch.beam_tail.num_base_rows].tolist()
-    added = 0
-    for row, seq_len in enumerate(seq_lens):
-        if row in leaders:
-            continue
-        tiles.extend((len(groups) // _GROUP_FIELDS, 0))
-        groups.extend((row, row, 0, seq_len))
-        added += 1
-    return added
 
 
 def allocate_capture_layout(
@@ -218,11 +214,10 @@ def allocate_capture_layout(
 def capture_metadata(
     template: RaggedBeamAttentionMetadata, num_rows: int
 ) -> RaggedBeamAttentionMetadata:
-    """The template's layout for a graph of num_rows rows; zero counts while
-    capturing record the launch with its fixed grid and no work."""
+    """The template's layout for a graph of num_rows rows. Capture it with zero
+    counts: they record the launch with its fixed grid and no work."""
     if num_rows > template.num_rows:
         raise ValueError(f"{num_rows} rows exceed the layout's {template.num_rows}")
-    template.counts().zero_()
     return msgspec.structs.replace(template, num_rows=num_rows)
 
 

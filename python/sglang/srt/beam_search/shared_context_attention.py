@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 import torch
 
+from sglang.srt.beam_search import mixed_requests
 from sglang.srt.beam_search import shared_context_ragged as ragged
 from sglang.srt.environ import BeamDecodeGraphLevel, envs
 
@@ -225,7 +226,8 @@ def build_metadata(
         return ragged.build_ragged_metadata(
             batch,
             model_runner.req_to_token_pool.req_to_token,
-            one_row_groups=level >= BeamDecodeGraphLevel.MIXED_REQUESTS,
+            one_row_groups=level >= BeamDecodeGraphLevel.MIXED_REQUESTS
+            and mixed_requests.admits(batch),
         )
 
     widths = [entry.end - entry.start + 1 for entry in entries]
@@ -341,7 +343,14 @@ def forward(
     if k_buffer.ndim != 3 or v_buffer.ndim != 3:
         raise RuntimeError("Shared-context attention requires 3D MHA K/V cache buffers")
     if isinstance(metadata, ragged.RaggedBeamAttentionMetadata):
-        return ragged.forward(q, layer, forward_batch, metadata, k_buffer, v_buffer)
+        return ragged.forward(
+            q=q,
+            layer=layer,
+            forward_batch=forward_batch,
+            metadata=metadata,
+            k_buffer=k_buffer,
+            v_buffer=v_buffer,
+        )
 
     q_heads = layer.tp_q_head_num
     head_dim = layer.head_dim

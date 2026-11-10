@@ -533,10 +533,6 @@ def _ragged_case(
             reference[row] = torch.einsum("ht,thd->hd", scores.softmax(dim=-1), v)
 
     batch = SimpleNamespace(
-        reqs=[
-            SimpleNamespace(beam_group=None if width == 1 else object())
-            for width in widths
-        ],
         seq_lens=seq_lens,
         seq_lens_cpu=seq_lens.cpu(),
         beam_tail=SimpleNamespace(num_base_rows=num_groups, entries=entries),

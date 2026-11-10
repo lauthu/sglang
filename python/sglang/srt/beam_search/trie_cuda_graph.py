@@ -101,7 +101,8 @@ class TrieDecodeGraphState:
         if rows not in self.metadata:
             self.metadata[rows] = self._capture_metadata(rows)
         if self.ragged_template is not None:
-            # A recapture must not replay a staged step's tables while recording.
+            # Capture with no work: a staged step's tables must not run on the
+            # capture's placeholder inputs.
             self.ragged_template.counts().zero_()
         forward_batch.beam_attention_metadata = self.metadata[rows]
         if self.dense_rows is not None:

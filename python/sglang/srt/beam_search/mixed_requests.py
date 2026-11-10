@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 import torch
 
+from sglang.srt.beam_search.shared_context_ragged import decode_graph_level
 from sglang.srt.environ import BeamDecodeGraphLevel, envs
 
 if TYPE_CHECKING:
@@ -54,28 +55,26 @@ class BeamDenseRows(msgspec.Struct):
     # fp32 [num_rows, vocab].
     logits: Optional[torch.Tensor] = None
 
-    def target(
-        self, vocab_size: int, device: torch.device
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """The (logits, count) the head writes: a captured graph's buffers, or new
-        ones holding this step's rows."""
+    def with_buffers(self, vocab_size: int, device: torch.device) -> BeamDenseRows:
+        """The buffers the head writes: this value when it holds a captured graph's,
+        else one with new buffers that keep this step's rows."""
         if self.logits is not None:
             if self.logits.shape[1] != vocab_size:
                 raise ValueError(
                     f"Kept logits have {self.logits.shape[1]} columns, the "
                     f"vocabulary {vocab_size}"
                 )
-            return self.logits, self.count
-        logits = torch.empty(
-            (self.num_rows, vocab_size), dtype=torch.float32, device=device
+            return self
+        return BeamDenseRows(
+            num_rows=self.num_rows,
+            count=torch.full((1,), self.num_rows, dtype=torch.int32, device=device),
+            logits=torch.empty(
+                (self.num_rows, vocab_size), dtype=torch.float32, device=device
+            ),
         )
-        count = torch.full((1,), self.num_rows, dtype=torch.int32, device=device)
-        return logits, count
 
 
 def ordinary_requests_enabled() -> bool:
-    from sglang.srt.beam_search.shared_context_ragged import decode_graph_level
-
     return decode_graph_level() >= BeamDecodeGraphLevel.MIXED_REQUESTS
 
 
@@ -91,9 +90,13 @@ def has_ordinary_request(batch: ScheduleBatch) -> bool:
     return any(req.beam_group is None for req in batch.reqs)
 
 
-def fits_beam_step(batch: ScheduleBatch) -> bool:
-    """Whether a decode step's ordinary requests, if any, may join its beam rows."""
-    return len(batch.reqs) <= max_mixed_requests() or not has_ordinary_request(batch)
+def admits(batch: ScheduleBatch) -> bool:
+    """Whether every request of a decode step may run the beam path: beam requests
+    always; ordinary ones at level 3, in a step of at most
+    SGLANG_BEAM_DECODE_GRAPH_MAX_MIXED_REQUESTS requests."""
+    if not has_ordinary_request(batch):
+        return True
+    return ordinary_requests_enabled() and len(batch.reqs) <= max_mixed_requests()
 
 
 _overflow_steps = 0

@@ -87,13 +87,11 @@ def configure_model_trie_output_heads(
 
 
 def _runs_compact_head(batch: ScheduleBatch) -> bool:
-    if all(req.beam_group is not None for req in batch.reqs):
+    if mixed_requests.admits(batch):
         return True
-    if not mixed_requests.ordinary_requests_enabled():
-        return False
-    if mixed_requests.fits_beam_step(batch):
-        return True
-    mixed_requests.note_overflow(len(batch.reqs))
+    # At level 3 only the request cap turns a step away.
+    if mixed_requests.ordinary_requests_enabled():
+        mixed_requests.note_overflow(len(batch.reqs))
     return False
 
 
@@ -188,7 +186,7 @@ class BeamTrieOutputHead:
                     "Full-vocabulary rows come from the normalizer pass, which "
                     "SGLANG_OPT_BEAM_TRIE_TOPK_LOGPROB=true skips"
                 )
-            kept = dense_rows.target(self.vocab_size, hidden_states.device)
+            kept = dense_rows.with_buffers(self.vocab_size, hidden_states.device)
         normalizer = (
             None
             if use_topk_logprob()
@@ -201,7 +199,7 @@ class BeamTrieOutputHead:
             )
         )
         return BeamTrieHeadOutput(
-            logits, normalizer, dense_logits=None if kept is None else kept[0]
+            logits, normalizer, dense_logits=None if kept is None else kept.logits
         )
 
     def _stream_normalizer(
@@ -210,11 +208,11 @@ class BeamTrieOutputHead:
         weight: torch.Tensor,
         project: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
         transform: Callable[[torch.Tensor], torch.Tensor],
-        kept: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        kept: Optional[BeamDenseRows] = None,
     ) -> torch.Tensor:
-        """Each row's (max, log-sum-exp - max) over the vocabulary. With `kept`, a
-        (logits [rows, vocab] fp32, count int32 [1]) pair, also writes the first
-        count rows' transformed logits into those buffers on the way."""
+        """Each row's (max, log-sum-exp - max) over the vocabulary. With `kept`, also
+        writes the first kept.count rows' transformed logits into kept.logits on the
+        way."""
         if self.vocab_size > weight.shape[0]:
             raise RuntimeError(
                 f"Model vocabulary ({self.vocab_size}) exceeds LM-head rows "
@@ -233,7 +231,7 @@ class BeamTrieOutputHead:
                 )
 
                 chunk_max, chunk_log_sum = row_logsumexp_keep_rows(
-                    chunk_logits, kept[0][:, start:logical_end], kept[1]
+                    chunk_logits, kept.logits[:, start:logical_end], kept.count
                 )
             elif chunk_logits.is_cuda:
                 from sglang.srt.layers.logsumexp import row_logsumexp
@@ -242,8 +240,8 @@ class BeamTrieOutputHead:
             else:
                 chunk_logits = chunk_logits.float()
                 if kept is not None:
-                    rows = min(int(kept[1]), kept[0].shape[0], chunk_logits.shape[0])
-                    kept[0][:rows, start:logical_end] = chunk_logits[:rows]
+                    rows = min(int(kept.count), len(kept.logits), len(chunk_logits))
+                    kept.logits[:rows, start:logical_end] = chunk_logits[:rows]
                 chunk_max = chunk_logits.max(dim=-1).values
                 chunk_log_sum = torch.log(
                     torch.exp(chunk_logits - chunk_max[:, None]).sum(dim=-1)

@@ -54,6 +54,15 @@ counted in the log. Level 3 needs the full-vocabulary normalizer, so it refuses
 to start with `SGLANG_OPT_BEAM_TRIE_TOPK_LOGPROB=true`. Levels 2 and 3 use their
 own kernel and reject `SGLANG_BEAM_SHARED_CONTEXT_KERNEL` other than `default`.
 
+Where levels 2 and 3 live: `shared_context_ragged.py` resolves the level and
+builds each step's group and tile tables, which the kernel in
+`sglang/kernels/ops/attention/beam_shared_context_ragged.py` reads.
+`trie_cuda_graph.py` captures one layout for every row count and stages a step's
+tables into it. `mixed_requests.py` holds level 3's rule for which steps admit
+ordinary requests, and the kept full-vocabulary rows, which
+`sglang/kernels/ops/sampling/row_logsumexp_keep_rows.py` writes and
+`logits_capture.py` hands to the sampler.
+
 `SGLANG_ENABLE_BEAM_TRIE_SELECTION_GRAPH=true` separately replays the existing
 compact-trie selection tensor operations. It is off by default. Requests with
 other widths, stop-token handling, or unsupported layouts retain the native
