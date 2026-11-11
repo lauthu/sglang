@@ -218,7 +218,7 @@ def ragged_num_ctas(device_index: int, q_heads: int) -> int:
     return max(1, triton.cdiv(_WAVES * num_sms(device_index), q_heads))
 
 
-def shared_context_attention_ragged(
+def check_ragged_inputs(
     q: torch.Tensor,
     k_buffer: torch.Tensor,
     v_buffer: torch.Tensor,
@@ -228,15 +228,10 @@ def shared_context_attention_ragged(
     counts: torch.Tensor,
     groups: torch.Tensor,
     tiles: torch.Tensor,
-    *,
-    block_m: int,
-    output: torch.Tensor | None = None,
-    softmax_scale: float,
+    output: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Attention of every beam of every group in one launch, for any group widths.
-
-    `q` is [rows, q_heads, head_dim]; rows past `counts[2]` are written as zeros.
-    """
+    """Check the inputs every kernel of this layout reads; returns the output to
+    write."""
     if q.ndim != 3 or q.stride(2) != 1:
         raise ValueError(
             f"Expected Q [rows, heads, dim] with unit dim stride, got {q.shape}"
@@ -260,9 +255,45 @@ def shared_context_attention_ragged(
     if req_pool_indices.shape[0] < num_rows or seq_lens.shape[0] < num_rows:
         raise ValueError("req_pool_indices and seq_lens must cover every row of Q")
     if output is None:
-        output = torch.empty_like(q)
-    elif output.shape != q.shape or output.stride(2) != 1:
+        return torch.empty_like(q)
+    if output.shape != q.shape or output.stride(2) != 1:
         raise ValueError("Output must match Q's shape with a unit dim stride")
+    return output
+
+
+def shared_context_attention_ragged(
+    q: torch.Tensor,
+    k_buffer: torch.Tensor,
+    v_buffer: torch.Tensor,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    counts: torch.Tensor,
+    groups: torch.Tensor,
+    tiles: torch.Tensor,
+    *,
+    block_m: int,
+    output: torch.Tensor | None = None,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Attention of every beam of every group in one launch, for any group widths.
+
+    `q` is [rows, q_heads, head_dim]; rows past `counts[2]` are written as zeros.
+    """
+    output = check_ragged_inputs(
+        q,
+        k_buffer,
+        v_buffer,
+        req_to_token,
+        req_pool_indices,
+        seq_lens,
+        counts,
+        groups,
+        tiles,
+        output,
+    )
+    num_rows, q_heads, head_dim = q.shape
+    kv_heads = k_buffer.shape[1]
 
     grid = (ragged_num_ctas(q.device.index, q_heads), q_heads)
     _ragged_shared_context_kernel[grid](

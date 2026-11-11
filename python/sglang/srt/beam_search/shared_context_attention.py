@@ -228,6 +228,7 @@ def build_metadata(
             model_runner.req_to_token_pool.req_to_token,
             one_row_groups=level >= BeamDecodeGraphLevel.MIXED_REQUESTS
             and mixed_requests.admits(batch),
+            stream_k=ragged.stream_k_selected(),
         )
 
     widths = [entry.end - entry.start + 1 for entry in entries]

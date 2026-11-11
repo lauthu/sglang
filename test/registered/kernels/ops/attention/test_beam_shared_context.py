@@ -551,12 +551,17 @@ def _ragged_case(
     )
 
 
-def _run_ragged(case, metadata, *, q=None, req_pool_indices=None, seq_lens=None):
+def _run_ragged(
+    case, metadata, *, q=None, req_pool_indices=None, seq_lens=None, **stream_k
+):
     from sglang.kernels.ops.attention.beam_shared_context_ragged import (
         shared_context_attention_ragged,
     )
+    from sglang.kernels.ops.attention.beam_shared_context_ragged_stream_k import (
+        shared_context_attention_ragged_stream_k,
+    )
 
-    return shared_context_attention_ragged(
+    inputs = (
         case.q if q is None else q,
         case.k_buffer,
         case.v_buffer,
@@ -566,8 +571,17 @@ def _run_ragged(case, metadata, *, q=None, req_pool_indices=None, seq_lens=None)
         metadata.counts(),
         metadata.groups(),
         metadata.tiles(),
-        block_m=metadata.block_m,
-        softmax_scale=case.softmax_scale,
+    )
+    if metadata.stream_k:
+        return shared_context_attention_ragged_stream_k(
+            *inputs,
+            metadata.schedule(),
+            block_m=metadata.block_m,
+            softmax_scale=case.softmax_scale,
+            **stream_k,
+        )
+    return shared_context_attention_ragged(
+        *inputs, block_m=metadata.block_m, softmax_scale=case.softmax_scale
     )
 
 
@@ -609,10 +623,66 @@ class TestRaggedSharedContextAttention(CustomTestCase):
         torch.testing.assert_close(output.float(), case.reference, rtol=1e-2, atol=1e-2)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_stream_k_any_cut_of_the_units_matches_fp32_reference(self):
+        """Stream-K: wherever the CTA runs cut the work (inside a prompt, at a decode
+        step, across heads, tiles and groups, CTAs without units), the partial
+        segments merge into the same attention; so do whole tiles per CTA."""
+        from sglang.srt.beam_search.shared_context_ragged import build_ragged_metadata
+
+        never, always = 1 << 20, -(1 << 20)
+        mixed = _ragged_case(
+            (1, 129, 2, 300, 1, 7),
+            prompt_lens=(1, 700, 64, 513, 2048, 130),
+            decode_lens=(5, 1, 2, 4, 0, 3),
+            max_context=4096,
+        )
+        tiny = _ragged_case((2,), prompt_lens=(1,), decode_lens=(1,))
+        runs = (
+            (mixed, 1, always),
+            (mixed, 3, always),
+            (mixed, 7, always),
+            (mixed, 188, always),
+            (mixed, 188, never),
+            (tiny, 64, always),
+        )
+        for index, (case, num_ctas, split_cost_units) in enumerate(runs):
+            with self.subTest(run=index, num_ctas=num_ctas, whole=split_cost_units > 0):
+                metadata = build_ragged_metadata(
+                    case.batch, case.req_to_token, one_row_groups=True, stream_k=True
+                )
+                output = _run_ragged(
+                    case,
+                    metadata,
+                    num_ctas=num_ctas,
+                    split_cost_units=split_cost_units,
+                )
+                torch.testing.assert_close(
+                    output.float(), case.reference, rtol=1e-2, atol=1e-2
+                )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_graph_captured_once_replays_any_split(self):
         """Nothing about widths, group count or lengths is recorded at capture: one
         graph replays every split staged into its layout, ordinary requests as
-        one-row groups included, and padded rows read 0."""
+        one-row groups included, and padded rows read 0. With stream-K, the steps
+        alternate between splitting the units and whole tiles per CTA (40 tiles)."""
+        cases = tuple(
+            _ragged_case(*split, max_context=4096, seed=seed)
+            for seed, split in enumerate(
+                (
+                    ((256, 256), (2048, 7), (2, 1)),
+                    ((2, 129, 300), (5, 1000, 64), (3, 1, 2)),
+                    ((2,) * 40, (64,) * 40, (1,) * 40),
+                    ((7,), (33,), (4,)),
+                    ((1, 256, 1, 1), (900, 2048, 3000, 1), (2, 1, 0, 6)),
+                )
+            )
+        )
+        for stream_k in (False, True):
+            with self.subTest(stream_k=stream_k):
+                self._replay_splits_in_one_graph(cases, stream_k=stream_k)
+
+    def _replay_splits_in_one_graph(self, cases, *, stream_k):
         from sglang.srt.beam_search.shared_context_ragged import (
             allocate_capture_layout,
             build_ragged_metadata,
@@ -621,55 +691,49 @@ class TestRaggedSharedContextAttention(CustomTestCase):
         )
 
         captured_rows = 512
-        cases = tuple(
-            _ragged_case(*split, max_context=4096, seed=seed)
-            for seed, split in enumerate(
-                (
-                    ((256, 256), (2048, 7), (2, 1)),
-                    ((2, 129, 300), (5, 1000, 64), (3, 1, 2)),
-                    ((7,), (33,), (4,)),
-                    ((1, 256, 1, 1), (900, 2048, 3000, 1), (2, 1, 0, 6)),
-                )
-            )
-        )
         first = cases[0]
+        # The graph's own inputs; each replay stages a case into them.
         with torch.device("cuda"):
-            q = torch.zeros(captured_rows, *first.q.shape[1:], dtype=torch.bfloat16)
-            pools = torch.zeros(captured_rows, dtype=torch.int64)
-            seq_lens = torch.ones(captured_rows, dtype=torch.int64)
-        req_to_token = torch.zeros(
-            (len(first.req_to_token) * 2, first.req_to_token.shape[1]),
-            dtype=torch.int32,
-            device="cuda",
-        )
+            graph_inputs = SimpleNamespace(
+                q=torch.zeros(captured_rows, *first.q.shape[1:], dtype=torch.bfloat16),
+                k_buffer=torch.zeros_like(first.k_buffer),
+                v_buffer=torch.zeros_like(first.v_buffer),
+                req_pool_indices=torch.zeros(captured_rows, dtype=torch.int64),
+                seq_lens=torch.ones(captured_rows, dtype=torch.int64),
+                softmax_scale=first.softmax_scale,
+            )
+            req_to_token = torch.zeros(
+                (len(first.req_to_token) * 2, first.req_to_token.shape[1]),
+                dtype=torch.int32,
+            )
         template = allocate_capture_layout(
-            captured_rows, q.device, req_to_token, one_row_groups=True
+            captured_rows,
+            req_to_token.device,
+            req_to_token,
+            one_row_groups=True,
+            stream_k=stream_k,
         )
         target = capture_metadata(template, captured_rows)
-
-        def run():
-            return _run_ragged(
-                first, target, q=q, req_pool_indices=pools, seq_lens=seq_lens
-            )
-
-        run()
+        _run_ragged(graph_inputs, target)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            output = run()
+            output = _run_ragged(graph_inputs, target)
         for index, case in enumerate(cases):
             with self.subTest(split=index):
                 rows = case.q.shape[0]
-                q[:rows].copy_(case.q)
-                pools[:rows].copy_(case.req_pool_indices)
-                seq_lens[:rows].copy_(case.seq_lens)
+                graph_inputs.q[:rows].copy_(case.q)
+                graph_inputs.k_buffer.copy_(case.k_buffer)
+                graph_inputs.v_buffer.copy_(case.v_buffer)
+                graph_inputs.req_pool_indices[:rows].copy_(case.req_pool_indices)
+                graph_inputs.seq_lens[:rows].copy_(case.seq_lens)
                 req_to_token[: len(case.req_to_token)].copy_(case.req_to_token)
-                # The cases share K/V buffers' shapes; replay reads the first case's.
-                first.k_buffer.copy_(case.k_buffer)
-                first.v_buffer.copy_(case.v_buffer)
                 stage_graph_metadata(
                     target,
                     build_ragged_metadata(
-                        case.batch, case.req_to_token, one_row_groups=True
+                        case.batch,
+                        case.req_to_token,
+                        one_row_groups=True,
+                        stream_k=stream_k,
                     ),
                 )
                 graph.replay()
@@ -694,6 +758,8 @@ class TestRaggedSharedContextAttention(CustomTestCase):
                 with envs.SGLANG_BEAM_SHARED_CONTEXT_KERNEL.override("split_kv"):
                     with self.assertRaisesRegex(ValueError, "levels 2 and 3"):
                         decode_graph_level()
+                with envs.SGLANG_BEAM_SHARED_CONTEXT_KERNEL.override("stream_k"):
+                    self.assertEqual(decode_graph_level(), level)
         with envs.SGLANG_BEAM_DECODE_GRAPH_LEVEL.override(3):
             self.assertEqual(decode_graph_level(), BeamDecodeGraphLevel.MIXED_REQUESTS)
             with envs.SGLANG_OPT_BEAM_TRIE_TOPK_LOGPROB.override(True):

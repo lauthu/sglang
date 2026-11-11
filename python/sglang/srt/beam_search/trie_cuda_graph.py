@@ -48,6 +48,7 @@ class TrieDecodeGraphState:
                 device,
                 model_runner.req_to_token_pool.req_to_token,
                 one_row_groups=level >= BeamDecodeGraphLevel.MIXED_REQUESTS,
+                stream_k=ragged.stream_k_selected(),
             )
         # Full-vocabulary rows every beam graph may keep, for ordinary requests.
         self.dense_rows = None
@@ -66,6 +67,11 @@ class TrieDecodeGraphState:
             (
                 mixed_requests.max_mixed_requests()
                 if level >= BeamDecodeGraphLevel.MIXED_REQUESTS
+                else None
+            ),
+            (
+                ragged.stream_k_selected()
+                if level >= BeamDecodeGraphLevel.MIXED_WIDTHS
                 else None
             ),
             (

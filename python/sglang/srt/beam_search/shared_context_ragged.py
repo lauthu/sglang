@@ -18,7 +18,8 @@ per-width buckets of gathered KV slots. One kernel launch then serves every
 width in the step, and a CUDA graph captured for a row count replays for any
 split of those rows into groups. At level 3, every other row of the step (an
 ordinary request, or a finished group's leader) is a one-row group whose whole
-KV is its prompt.
+KV is its prompt. With SGLANG_BEAM_SHARED_CONTEXT_KERNEL=stream_k the layout ends
+with the stream-K kernel's schedule: each tile's work units.
 """
 
 from __future__ import annotations
@@ -46,10 +47,16 @@ RAGGED_BLOCK_M = 128
 _NUM_COUNTS = 3
 _GROUP_FIELDS = 4
 _TILE_FIELDS = 2
+# SGLANG_BEAM_SHARED_CONTEXT_KERNEL values levels 2 and 3 run.
+_RAGGED_KERNELS = ("default", "stream_k")
+
+
+def _tables_size(group_capacity: int, tile_capacity: int) -> int:
+    return _NUM_COUNTS + _GROUP_FIELDS * group_capacity + _TILE_FIELDS * tile_capacity
 
 
 class RaggedBeamAttentionMetadata(msgspec.Struct):
-    # int32 [3 + 4 * group_capacity + 2 * tile_capacity]
+    # int32 [3 + 4 * group_capacity + 2 * tile_capacity], then the schedule if stream_k
     layout: torch.Tensor
     # A step's own group and tile counts, or the most a captured layout holds.
     group_capacity: int
@@ -58,6 +65,8 @@ class RaggedBeamAttentionMetadata(msgspec.Struct):
     # Rows of Q the kernel reads: the step's rows, or a captured row count.
     num_rows: int
     req_to_token: torch.Tensor
+    # Run the stream-K kernel, which reads the schedule at the layout's end.
+    stream_k: bool = False
 
     def counts(self) -> torch.Tensor:
         return self.layout[:_NUM_COUNTS]
@@ -71,6 +80,9 @@ class RaggedBeamAttentionMetadata(msgspec.Struct):
         start = _NUM_COUNTS + _GROUP_FIELDS * self.group_capacity
         end = start + _TILE_FIELDS * self.tile_capacity
         return self.layout[start:end].view(self.tile_capacity, _TILE_FIELDS)
+
+    def schedule(self) -> torch.Tensor:
+        return self.layout[_tables_size(self.group_capacity, self.tile_capacity) :]
 
 
 def decode_graph_level() -> BeamDecodeGraphLevel:
@@ -91,12 +103,18 @@ def decode_graph_level() -> BeamDecodeGraphLevel:
             "SGLANG_OPT_BEAM_TRIE_TOPK_LOGPROB=true skips; use level 2"
         )
     kernel = envs.SGLANG_BEAM_SHARED_CONTEXT_KERNEL.get()
-    if level != BeamDecodeGraphLevel.FIXED_WIDTH and kernel != "default":
+    if level != BeamDecodeGraphLevel.FIXED_WIDTH and kernel not in _RAGGED_KERNELS:
         raise ValueError(
             f"SGLANG_BEAM_SHARED_CONTEXT_KERNEL={kernel!r} supports only "
-            "SGLANG_BEAM_DECODE_GRAPH_LEVEL=0; levels 2 and 3 run their own kernel"
+            "SGLANG_BEAM_DECODE_GRAPH_LEVEL=0; levels 2 and 3 run "
+            f"{' or '.join(_RAGGED_KERNELS)}"
         )
     return level
+
+
+def stream_k_selected() -> bool:
+    """Levels 2 and 3 run the stream-K kernel instead of the tile-per-CTA one."""
+    return envs.SGLANG_BEAM_SHARED_CONTEXT_KERNEL.get() == "stream_k"
 
 
 def warn_unused_fixed_width_settings() -> None:
@@ -136,11 +154,13 @@ def build_ragged_metadata(
     req_to_token: torch.Tensor,
     *,
     one_row_groups: bool = False,
+    stream_k: bool = False,
 ) -> Optional[RaggedBeamAttentionMetadata]:
     """Group and tile tables of a beam decode step, built on the host from the beam
     tail; None leaves the step to ordinary attention. Every row must belong to a
     beam group, unless one_row_groups lets the other base rows (ordinary requests,
-    finished groups' leaders) run as one-row groups."""
+    finished groups' leaders) run as one-row groups. stream_k adds that kernel's
+    schedule."""
     num_rows = len(batch.seq_lens)
     num_base_rows = batch.beam_tail.num_base_rows
     # Leaders and one-row groups are base rows.
@@ -174,6 +194,7 @@ def build_ragged_metadata(
         for group, (_, _, num_members, _) in enumerate(groups)
         for first_beam in range(0, num_members + 1, RAGGED_BLOCK_M)
     ]
+    schedule = _stream_k_schedule(groups, tiles, base_lens) if stream_k else []
     return RaggedBeamAttentionMetadata(
         layout=_layout_tensor(
             [
@@ -182,6 +203,7 @@ def build_ragged_metadata(
                 num_rows,
                 *itertools.chain.from_iterable(groups),
                 *itertools.chain.from_iterable(tiles),
+                *schedule,
             ],
             batch.device,
         ),
@@ -190,17 +212,48 @@ def build_ragged_metadata(
         block_m=RAGGED_BLOCK_M,
         num_rows=num_rows,
         req_to_token=req_to_token,
+        stream_k=stream_k,
     )
 
 
+def _stream_k_schedule(
+    groups: list[tuple[int, int, int, int]],
+    tiles: list[tuple[int, int]],
+    base_lens: list[int],
+) -> list[int]:
+    """The stream-K kernel's schedule: each tile's work units for one query head, from
+    its group's prompt length and decode depth (0 for a one-row group)."""
+    from sglang.kernels.ops.attention.beam_shared_context_ragged_stream_k import (
+        build_schedule,
+        tile_units,
+    )
+
+    group_units = [
+        tile_units(prompt_len, base_lens[leader] - prompt_len)
+        for leader, _, _, prompt_len in groups
+    ]
+    return build_schedule([group_units[group] for group, _ in tiles])
+
+
 def allocate_capture_layout(
-    max_rows: int, device, req_to_token: torch.Tensor, *, one_row_groups: bool = False
+    max_rows: int,
+    device,
+    req_to_token: torch.Tensor,
+    *,
+    one_row_groups: bool = False,
+    stream_k: bool = False,
 ) -> RaggedBeamAttentionMetadata:
     """One layout for every captured row count: only one graph replays at a time."""
     # Every beam group has at least two rows, unless one-row groups are allowed.
     group_capacity = max_rows if one_row_groups else max(1, max_rows // 2)
     tile_capacity = ragged_tile_capacity(max_rows, group_capacity, RAGGED_BLOCK_M)
-    size = _NUM_COUNTS + _GROUP_FIELDS * group_capacity + _TILE_FIELDS * tile_capacity
+    size = _tables_size(group_capacity, tile_capacity)
+    if stream_k:
+        from sglang.kernels.ops.attention.beam_shared_context_ragged_stream_k import (
+            schedule_size,
+        )
+
+        size += schedule_size(tile_capacity)
     return RaggedBeamAttentionMetadata(
         layout=torch.zeros(size, dtype=torch.int32, device=device),
         group_capacity=group_capacity,
@@ -208,6 +261,7 @@ def allocate_capture_layout(
         block_m=RAGGED_BLOCK_M,
         num_rows=max_rows,
         req_to_token=req_to_token,
+        stream_k=stream_k,
     )
 
 
@@ -230,6 +284,7 @@ def graph_compatible(
         and metadata.block_m == target.block_m
         and metadata.group_capacity <= target.group_capacity
         and metadata.tile_capacity <= target.tile_capacity
+        and metadata.stream_k == target.stream_k
     )
 
 
@@ -242,6 +297,9 @@ def stage_graph_metadata(
     target.counts().copy_(source.counts())
     target.groups()[: source.group_capacity].copy_(source.groups())
     target.tiles()[: source.tile_capacity].copy_(source.tiles())
+    if source.stream_k:
+        schedule = source.schedule()
+        target.schedule()[: len(schedule)].copy_(schedule)
 
 
 def forward(
@@ -252,10 +310,6 @@ def forward(
     k_buffer: torch.Tensor,
     v_buffer: torch.Tensor,
 ) -> torch.Tensor:
-    from sglang.kernels.ops.attention.beam_shared_context_ragged import (
-        shared_context_attention_ragged,
-    )
-
     q_heads = layer.tp_q_head_num
     head_dim = layer.head_dim
     rows_q = q.reshape(-1, q_heads, head_dim)
@@ -263,7 +317,7 @@ def forward(
         raise RuntimeError(
             f"Q has {rows_q.shape[0]} rows, the beam layout {metadata.num_rows}"
         )
-    output = shared_context_attention_ragged(
+    inputs = (
         rows_q,
         k_buffer,
         v_buffer,
@@ -273,7 +327,24 @@ def forward(
         metadata.counts(),
         metadata.groups(),
         metadata.tiles(),
-        block_m=metadata.block_m,
-        softmax_scale=layer.scaling,
     )
+    if metadata.stream_k:
+        from sglang.kernels.ops.attention.beam_shared_context_ragged_stream_k import (
+            shared_context_attention_ragged_stream_k,
+        )
+
+        output = shared_context_attention_ragged_stream_k(
+            *inputs,
+            metadata.schedule(),
+            block_m=metadata.block_m,
+            softmax_scale=layer.scaling,
+        )
+    else:
+        from sglang.kernels.ops.attention.beam_shared_context_ragged import (
+            shared_context_attention_ragged,
+        )
+
+        output = shared_context_attention_ragged(
+            *inputs, block_m=metadata.block_m, softmax_scale=layer.scaling
+        )
     return output.view(-1, q_heads * head_dim)

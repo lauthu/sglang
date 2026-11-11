@@ -52,11 +52,15 @@ its full-vocabulary logits, which the normalizer pass computes anyway, for the
 regular sampler. A step with more requests runs the ordinary decode path and is
 counted in the log. Level 3 needs the full-vocabulary normalizer, so it refuses
 to start with `SGLANG_OPT_BEAM_TRIE_TOPK_LOGPROB=true`. Levels 2 and 3 use their
-own kernel and reject `SGLANG_BEAM_SHARED_CONTEXT_KERNEL` other than `default`.
+own kernels: `SGLANG_BEAM_SHARED_CONTEXT_KERNEL=default` gives each 128-row tile and
+query head one CTA, which reads the whole prompt; `stream_k` spreads the step's
+prompt blocks and decode steps evenly over one CTA per SM, so a few groups still
+fill the GPU. `split_kv` is rejected.
 
 Where levels 2 and 3 live: `shared_context_ragged.py` resolves the level and
-builds each step's group and tile tables, which the kernel in
-`sglang/kernels/ops/attention/beam_shared_context_ragged.py` reads.
+builds each step's group and tile tables, which the kernels in
+`sglang/kernels/ops/attention/beam_shared_context_ragged.py` and
+`beam_shared_context_ragged_stream_k.py` read.
 `trie_cuda_graph.py` captures one layout for every row count and stages a step's
 tables into it. `mixed_requests.py` holds level 3's rule for which steps admit
 ordinary requests, and the kept full-vocabulary rows, which

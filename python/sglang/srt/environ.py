@@ -754,7 +754,8 @@ class Envs:
     SGLANG_BEAM_SHARED_CONTEXT_GRAPH_MAX_CONTEXT = EnvInt(32768)
     SGLANG_BEAM_SHARED_CONTEXT_GRAPH_MAX_DECODE = EnvInt(8)
     # Shared-context attention kernel: "default", "split_kv" (prompt split across
-    # CTAs) or "stream_k" (persistent grid).
+    # CTAs) or "stream_k" (persistent grid); decode graph levels 2 and 3 take
+    # "default" or "stream_k".
     SGLANG_BEAM_SHARED_CONTEXT_KERNEL = EnvStr("default")
     # BeamDecodeGraphLevel; above FIXED_WIDTH, the WIDTH and GRAPH_MAX_* settings are unused.
     SGLANG_BEAM_DECODE_GRAPH_LEVEL = EnvInt(BeamDecodeGraphLevel.FIXED_WIDTH)
