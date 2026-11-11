@@ -35,6 +35,7 @@ from sglang.kernels.ops.activation.softcap import (
 )
 from sglang.kernels.ops.sampling.softcap_row_argmax import softcap_row_argmax
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
+from sglang.srt.beam_search.mixed_requests import BeamDenseRows
 from sglang.srt.beam_search.trie_config import TrieOutputHeadConfig
 from sglang.srt.beam_search.trie_output_head import (
     BeamTrieHeadOutput,
@@ -317,6 +318,9 @@ class LogitsProcessorOutput:
     # selection; see beam_search.logits_capture.
     beam: Optional[BeamLogitsCapture] = None
     beam_normalizer: Optional[torch.Tensor] = None
+    # Full-vocabulary rows the trie head kept for ordinary requests; see
+    # beam_search.mixed_requests.
+    beam_dense_logits: Optional[torch.Tensor] = None
 
     ## Part 5: Customized Info
     customized_info: Optional[Dict[str, List[Any]]] = None
@@ -406,6 +410,7 @@ class LogitsMetadata:
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
     beam_trie_levels: Optional[torch.Tensor] = None
+    beam_dense_rows: Optional[BeamDenseRows] = None
 
     # Carried from ForwardBatch so logits pruning can reconstruct the SP gather.
     attn_tp_sequence_sharded: bool = False
@@ -470,6 +475,7 @@ class LogitsMetadata:
             is_prefill_only=forward_batch.is_prefill_only,
             attn_tp_sequence_sharded=forward_batch.attn_tp_sequence_sharded,
             beam_trie_levels=forward_batch.beam_trie_levels,
+            beam_dense_rows=forward_batch.beam_dense_rows,
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
             dp_local_start_pos=forward_batch.dp_local_start_pos,
             dp_local_num_tokens=forward_batch.dp_local_num_tokens,
@@ -708,9 +714,10 @@ class LogitsProcessor(nn.Module):
                     lm_head,
                     logits_metadata,
                 )
-                beam_normalizer = None
+                beam_normalizer = beam_dense_logits = None
             else:
                 logits, beam_normalizer = beam_output.logits, beam_output.normalizer
+                beam_dense_logits = beam_output.dense_logits
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
             )
@@ -722,6 +729,7 @@ class LogitsProcessor(nn.Module):
                 last_hidden_states=last_hidden_states_to_store,
                 mm_input_embeds=logits_metadata.mm_input_embeds,
                 beam_normalizer=beam_normalizer,
+                beam_dense_logits=beam_dense_logits,
             )
 
         logprobs_result, sampled_logits = self.input_logprob_processor.forward(
@@ -1182,11 +1190,16 @@ class LogitsProcessor(nn.Module):
             self._project_beam_trie_lm_head,
             self._transform_beam_trie_logits,
             use_grouped_projection=not self.use_fp32_lm_head,
+            dense_rows=logits_metadata.beam_dense_rows,
         )
         # Match the dense path: logit_scale runs in the LM-head dtype, then
         # scoring and softcapping consume FP32 logits.
         logits = self._transform_beam_trie_logits(head_output.logits).float()
-        return BeamTrieHeadOutput(logits=logits, normalizer=head_output.normalizer)
+        return BeamTrieHeadOutput(
+            logits=logits,
+            normalizer=head_output.normalizer,
+            dense_logits=head_output.dense_logits,
+        )
 
     def _project_beam_trie_lm_head(
         self,

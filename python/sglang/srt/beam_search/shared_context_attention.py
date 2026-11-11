@@ -21,7 +21,9 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 import torch
 
-from sglang.srt.environ import envs
+from sglang.srt.beam_search import mixed_requests
+from sglang.srt.beam_search import shared_context_ragged as ragged
+from sglang.srt.environ import BeamDecodeGraphLevel, envs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -211,7 +213,7 @@ def stage_graph_metadata(target, source) -> None:
 def build_metadata(
     batch: ScheduleBatch,
     model_runner: ModelRunner,
-) -> Optional[BeamAttentionMetadata]:
+) -> Optional[BeamAttentionMetadata | ragged.RaggedBeamAttentionMetadata]:
     if batch.beam_tail is None or not batch.forward_mode.is_decode() or not enabled():
         return None
     if not supports_shared_context(model_runner):
@@ -219,6 +221,15 @@ def build_metadata(
     entries = batch.beam_tail.entries
     if not entries or batch.seq_lens_cpu is None:
         return None
+    level = ragged.decode_graph_level()
+    if level >= BeamDecodeGraphLevel.MIXED_WIDTHS:
+        return ragged.build_ragged_metadata(
+            batch,
+            model_runner.req_to_token_pool.req_to_token,
+            one_row_groups=level >= BeamDecodeGraphLevel.MIXED_REQUESTS
+            and mixed_requests.admits(batch),
+            stream_k=ragged.stream_k_selected(),
+        )
 
     widths = [entry.end - entry.start + 1 for entry in entries]
     if any(width <= 1 for width in widths):
@@ -332,6 +343,15 @@ def forward(
     k_buffer, v_buffer = kv_layers.read(layer.layer_id).kv()
     if k_buffer.ndim != 3 or v_buffer.ndim != 3:
         raise RuntimeError("Shared-context attention requires 3D MHA K/V cache buffers")
+    if isinstance(metadata, ragged.RaggedBeamAttentionMetadata):
+        return ragged.forward(
+            q=q,
+            layer=layer,
+            forward_batch=forward_batch,
+            metadata=metadata,
+            k_buffer=k_buffer,
+            v_buffer=v_buffer,
+        )
 
     q_heads = layer.tp_q_head_num
     head_dim = layer.head_dim

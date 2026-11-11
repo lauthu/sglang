@@ -250,6 +250,27 @@ class InvariantCheckLevel(IntEnum):
     STRICT = 2
 
 
+class BeamDecodeGraphLevel(IntEnum):
+    """Which trie beam decode steps replay a beam CUDA graph.
+
+    Values are levels of beam-width support: 0 one width per server, 1 one width per
+    step, 2 any widths in a step, 3 beam and ordinary requests in a step. Level 1 has
+    no mode of its own, since MIXED_WIDTHS also replays steps of one width. Without
+    shared-context attention, beam graphs replay any width at every level.
+
+    FIXED_WIDTH: steps whose groups all have SGLANG_BEAM_SHARED_CONTEXT_WIDTH beams and
+        whose row count is a captured size.
+    MIXED_WIDTHS: steps of beam requests with any widths, padded to a captured size.
+    MIXED_REQUESTS: MIXED_WIDTHS plus steps that also hold ordinary requests, up to
+        SGLANG_BEAM_DECODE_GRAPH_MAX_MIXED_REQUESTS requests. An ordinary request
+        runs as a one-row group whose full-vocabulary logits the trie head keeps.
+    """
+
+    FIXED_WIDTH = 0
+    MIXED_WIDTHS = 2
+    MIXED_REQUESTS = 3
+
+
 class Envs:
     # Organization principles for this registry:
     # - Put every field in exactly one topical section. Prefer an existing
@@ -733,8 +754,15 @@ class Envs:
     SGLANG_BEAM_SHARED_CONTEXT_GRAPH_MAX_CONTEXT = EnvInt(32768)
     SGLANG_BEAM_SHARED_CONTEXT_GRAPH_MAX_DECODE = EnvInt(8)
     # Shared-context attention kernel: "default", "split_kv" (prompt split across
-    # CTAs) or "stream_k" (persistent grid).
+    # CTAs) or "stream_k" (persistent grid); decode graph levels 2 and 3 take
+    # "default" or "stream_k".
     SGLANG_BEAM_SHARED_CONTEXT_KERNEL = EnvStr("default")
+    # BeamDecodeGraphLevel; above FIXED_WIDTH, the WIDTH and GRAPH_MAX_* settings are unused.
+    SGLANG_BEAM_DECODE_GRAPH_LEVEL = EnvInt(BeamDecodeGraphLevel.FIXED_WIDTH)
+    # Level 3: most requests in a step with beam and ordinary requests that runs the
+    # beam path; beam graphs keep that many rows of full-vocabulary fp32 logits.
+    # Arbitrary: 64 rows are 39 MB at a 151,936-token vocabulary.
+    SGLANG_BEAM_DECODE_GRAPH_MAX_MIXED_REQUESTS = EnvInt(64)
 
     # ===================================================================
     # Overlap scheduler and pipeline parallelism

@@ -38,6 +38,35 @@ incompatible row layout. Different per-request decode lengths are supported
 within a uniform-width batch: private slot arrays are padded and actual lengths
 are refreshed for each group on every replay.
 
+`SGLANG_BEAM_DECODE_GRAPH_LEVEL` widens which decode steps replay a beam graph
+with shared-context attention, without the width setting above:
+
+| Level | A beam decode step replays a captured beam graph when |
+| --- | --- |
+| 0 (default) | it matches the width and capacities above, as described |
+| 2 | every request in it is a beam request, of any width; rows pad up to a captured size |
+| 3 | as level 2, and ordinary requests may join it, up to `SGLANG_BEAM_DECODE_GRAPH_MAX_MIXED_REQUESTS` (64) requests per step |
+
+At level 3 an ordinary request runs as a one-row group, and the trie head keeps
+its full-vocabulary logits, which the normalizer pass computes anyway, for the
+regular sampler. A step with more requests runs the ordinary decode path and is
+counted in the log. Level 3 needs the full-vocabulary normalizer, so it refuses
+to start with `SGLANG_OPT_BEAM_TRIE_TOPK_LOGPROB=true`. Levels 2 and 3 use their
+own kernels: `SGLANG_BEAM_SHARED_CONTEXT_KERNEL=default` gives each 128-row tile and
+query head one CTA, which reads the whole prompt; `stream_k` spreads the step's
+prompt blocks and decode steps evenly over one CTA per SM, so a few groups still
+fill the GPU. `split_kv` is rejected.
+
+Where levels 2 and 3 live: `shared_context_ragged.py` resolves the level and
+builds each step's group and tile tables, which the kernels in
+`sglang/kernels/ops/attention/beam_shared_context_ragged.py` and
+`beam_shared_context_ragged_stream_k.py` read.
+`trie_cuda_graph.py` captures one layout for every row count and stages a step's
+tables into it. `mixed_requests.py` holds level 3's rule for which steps admit
+ordinary requests, and the kept full-vocabulary rows, which
+`sglang/kernels/ops/sampling/row_logsumexp_keep_rows.py` writes and
+`logits_capture.py` hands to the sampler.
+
 `SGLANG_ENABLE_BEAM_TRIE_SELECTION_GRAPH=true` separately replays the existing
 compact-trie selection tensor operations. It is off by default. Requests with
 other widths, stop-token handling, or unsupported layouts retain the native

@@ -38,8 +38,10 @@ import torch
 from sglang.kernels.ops.attention.clamp_position import clamp_position
 from sglang.kernels.ops.attention.position import compute_position_triton
 from sglang.kernels.ops.memory.small_copy import write_host_ints
-from sglang.srt.beam_search import shared_context_attention
+from sglang.srt.beam_search import mixed_requests, shared_context_attention
+from sglang.srt.beam_search.mixed_requests import BeamDenseRows
 from sglang.srt.beam_search.shared_context_attention import BeamAttentionMetadata
+from sglang.srt.beam_search.shared_context_ragged import RaggedBeamAttentionMetadata
 from sglang.srt.beam_search.trie_output_head import build_trie_row_levels
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.utils import all_gather_single
@@ -490,7 +492,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Per-row SID codebook depths for trie-conditioned decode batches.
     beam_trie_levels: Optional[torch.Tensor] = None
     # Shared-context attention metadata for all-beam decode batches.
-    beam_attention_metadata: Optional[BeamAttentionMetadata] = None
+    beam_attention_metadata: Optional[
+        BeamAttentionMetadata | RaggedBeamAttentionMetadata
+    ] = None
+    # Rows whose full-vocabulary logits the trie head keeps, for ordinary requests
+    # in a beam decode batch.
+    beam_dense_rows: Optional[BeamDenseRows] = None
     spec_algorithm: SpeculativeAlgorithm = None
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
@@ -948,6 +955,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         seq_lens_cpu = batch.seq_lens_cpu
 
         beam_trie_levels = build_trie_row_levels(batch, model_runner)
+        beam_dense_rows = (
+            mixed_requests.build_dense_rows(batch)
+            if beam_trie_levels is not None
+            else None
+        )
         beam_attention_metadata = shared_context_attention.build_metadata(
             batch, model_runner
         )
@@ -1029,6 +1041,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             is_prefill_only=batch.is_prefill_only,
             beam_trie_levels=beam_trie_levels,
             beam_attention_metadata=beam_attention_metadata,
+            beam_dense_rows=beam_dense_rows,
             contains_last_prefill_chunk=contains_last_prefill_chunk,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
