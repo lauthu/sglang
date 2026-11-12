@@ -19,6 +19,7 @@ from sglang.kernels.ops.attention.flash_attention_v4_sm120 import (
     flash_attn_with_kvcache,
     get_flash_attention_v4_sm120_runtime_policy,
 )
+from sglang.kernels.ops.attention.flash_attn.cute.interface import _flash_attn_fwd
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
@@ -1321,16 +1322,16 @@ def test_sm120_low_hd_paged_decode_reuses_cached_host_plan(
     """Low-HD MHA/GQA/MQA decode must reuse its compiled TVM-FFI plan."""
     sm120_forward_host.clear_launch_plans()
     cache_hits = []
-    original_try_paged_decode = sm120_forward_host.try_paged_decode
+    original_try_paged = sm120_forward_host.try_paged
 
     def record_cache_hit(**kwargs):
-        result = original_try_paged_decode(**kwargs)
+        result = original_try_paged(**kwargs)
         cache_hits.append(result is not None)
         return result
 
     monkeypatch.setattr(
         sm120_forward_host,
-        "try_paged_decode",
+        "try_paged",
         record_cache_hit,
     )
     torch.manual_seed(20260731 + head_dim + num_kv_heads)
@@ -1394,6 +1395,172 @@ def test_sm120_low_hd_paged_decode_reuses_cached_host_plan(
     assert not any(cache_hits[:-1])
     assert cache_hits[-1]
     torch.testing.assert_close(first, second, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize("page_size", [1, 64])
+@pytest.mark.parametrize("num_kv_heads", [8, 2])
+def test_sm120_paged_prefill_reuses_cached_host_plan(
+    monkeypatch,
+    page_size,
+    num_kv_heads,
+):
+    """Called the way FlashAttentionBackend calls it, every layer of a paged
+    prefill after the first reuses its TVM-FFI plan, and that launch matches the
+    generic path bit for bit."""
+    sm120_forward_host.clear_launch_plans()
+    cache_hits = []
+    original_try_paged = sm120_forward_host.try_paged
+
+    def record_cache_hit(**kwargs):
+        result = original_try_paged(**kwargs)
+        cache_hits.append(result is not None)
+        return result
+
+    monkeypatch.setattr(sm120_forward_host, "try_paged", record_cache_hit)
+    torch.manual_seed(20261102 + page_size + num_kv_heads)
+    lengths = (192, 128, 77)
+    num_q_heads, head_dim = 16, 128
+    total = sum(lengths)
+    pages = [-(-length // page_size) for length in lengths]
+    page_ids = torch.randperm(sum(pages), device="cuda").to(torch.int32)
+    page_table = torch.zeros(len(lengths), max(pages), device="cuda", dtype=torch.int32)
+    offsets = [0]
+    for i, num_pages in enumerate(pages):
+        page_table[i, :num_pages] = page_ids[offsets[-1] : offsets[-1] + num_pages]
+        offsets.append(offsets[-1] + num_pages)
+    cache_seqlens = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+    q_offsets = [0]
+    for length in lengths:
+        q_offsets.append(q_offsets[-1] + length)
+    cu_seqlens_q = torch.tensor(q_offsets, device="cuda", dtype=torch.int32)
+
+    # FlashAttentionBackend's paged extend passes no max_seqlen_k; the host then
+    # keys the plan on the KV pool's capacity.
+    def run(q, k_cache, v_cache, out, max_seqlen_k=None):
+        return flash_attn_with_kvcache(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max(lengths),
+            max_seqlen_k=max_seqlen_k,
+            causal=True,
+            num_splits=1,
+            pack_gqa=None,
+            out=out,
+        )
+
+    # Layers share the batch metadata and differ in their Q, KV cache and output.
+    layers = []
+    for _ in range(3):
+        q = torch.randn(
+            total, num_q_heads, head_dim, device="cuda", dtype=torch.bfloat16
+        )
+        k_cache = torch.randn(
+            sum(pages),
+            page_size,
+            num_kv_heads,
+            head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        layers.append((q, k_cache, torch.randn_like(k_cache), torch.empty_like(q)))
+    for q, k_cache, v_cache, out in layers:
+        assert run(q, k_cache, v_cache, out).data_ptr() == out.data_ptr()
+    torch.cuda.synchronize()
+    # The first layer misses in the wrapper and in the generic path, then registers.
+    assert cache_hits == [False, False, True, True]
+
+    # A cached launch is the generic path's launch; accuracy is the generic path's
+    # (test_sm120_paged_kv_feature_matrix_matches_reference).
+    for q, k_cache, v_cache, cached in layers:
+        sm120_forward_host.clear_launch_plans()
+        generic = run(q, k_cache, v_cache, torch.empty_like(q))
+        torch.testing.assert_close(generic, cached, atol=0.0, rtol=0.0)
+
+    # Tile selection reads the exact max_seqlen_k, so another value needs its own plan.
+    cache_hits.clear()
+    for _ in range(2):
+        run(q, k_cache, v_cache, torch.empty_like(q), max_seqlen_k=max(lengths) + 64)
+    assert cache_hits == [False, False, True]
+
+
+def test_sm120_paged_prefill_full_and_swa_layers_keep_separate_plans(monkeypatch):
+    """Layers that differ only in causal/window settings must not share a launch
+    plan, and each must still reuse its own."""
+    sm120_forward_host.clear_launch_plans()
+    cache_hits = []
+    original_try_paged = sm120_forward_host.try_paged
+
+    def record_cache_hit(**kwargs):
+        result = original_try_paged(**kwargs)
+        cache_hits.append(result is not None)
+        return result
+
+    monkeypatch.setattr(sm120_forward_host, "try_paged", record_cache_hit)
+    torch.manual_seed(20261105)
+    lengths, page_size = (192, 128, 77), 64
+    num_q_heads, num_kv_heads, head_dim = 16, 2, 128
+    total = sum(lengths)
+    pages = [-(-length // page_size) for length in lengths]
+    page_ids = torch.randperm(sum(pages), device="cuda").to(torch.int32)
+    page_table = torch.zeros(len(lengths), max(pages), device="cuda", dtype=torch.int32)
+    offsets = [0]
+    for i, num_pages in enumerate(pages):
+        page_table[i, :num_pages] = page_ids[offsets[-1] : offsets[-1] + num_pages]
+        offsets.append(offsets[-1] + num_pages)
+    cache_seqlens = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+    q_offsets = [0]
+    for length in lengths:
+        q_offsets.append(q_offsets[-1] + length)
+    cu_seqlens_q = torch.tensor(q_offsets, device="cuda", dtype=torch.int32)
+
+    # Called the way FlashAttentionBackend's paged extend calls it.
+    def run(q, k_cache, v_cache, window_size):
+        return flash_attn_with_kvcache(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max(lengths),
+            causal=True,
+            window_size=window_size,
+            num_splits=1,
+        )
+
+    # The window is well below the sequence lengths, so the two settings differ.
+    full, swa = (-1, -1), (63, 0)
+    layers = []
+    for window_size in (full, swa, full, swa):
+        q = torch.randn(
+            total, num_q_heads, head_dim, device="cuda", dtype=torch.bfloat16
+        )
+        k_cache = torch.randn(
+            sum(pages),
+            page_size,
+            num_kv_heads,
+            head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        layers.append((q, k_cache, torch.randn_like(k_cache), window_size))
+    outputs = [run(*layer) for layer in layers]
+    torch.cuda.synchronize()
+    # First calls miss in the wrapper and in the generic path; the first SWA call
+    # misses although a full-attention plan of identical shapes exists.
+    assert cache_hits == [False, False, False, False, True, True]
+
+    for layer, cached in zip(layers, outputs):
+        sm120_forward_host.clear_launch_plans()
+        torch.testing.assert_close(run(*layer), cached, atol=0.0, rtol=0.0)
+
+    # The bitwise checks catch a shared plan only if the settings' outputs differ.
+    q, k_cache, v_cache, _ = layers[0]
+    assert not torch.equal(run(q, k_cache, v_cache, swa), outputs[0])
 
 
 @pytest.mark.parametrize(
@@ -1752,6 +1919,46 @@ def test_sm120_forward_only_varlen_cache_is_pack_order_independent(monkeypatch):
     _assert_attention_close(alternate_output, alternate_reference)
 
 
+def test_sm120_explicit_tile_varlen_launch_stores_no_plan(monkeypatch):
+    """A varlen launch with an explicit tile_mn must not store a plan; a later
+    default call on the same shapes would replay that tile."""
+    sm120_forward_host.clear_launch_plans()
+    registrations = []
+    original_register_varlen = sm120_forward_host.register_varlen
+
+    def record_registration(**kwargs):
+        registrations.append(kwargs)
+        return original_register_varlen(**kwargs)
+
+    monkeypatch.setattr(sm120_forward_host, "register_varlen", record_registration)
+    torch.manual_seed(20261105)
+    lengths = (128, 111, 97)
+    num_q_heads, num_kv_heads, head_dim = 8, 2, 128
+    q = torch.randn(
+        sum(lengths), num_q_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    k = torch.randn(
+        sum(lengths), num_kv_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    offsets = [0]
+    for length in lengths:
+        offsets.append(offsets[-1] + length)
+    cu_seqlens = torch.tensor(offsets, dtype=torch.int32, device="cuda")
+    _flash_attn_fwd(
+        q,
+        k,
+        torch.randn_like(k),
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max(lengths),
+        max_seqlen_k=max(lengths),
+        causal=True,
+        tile_mn=(64, 64),
+    )
+    torch.cuda.synchronize()
+    assert registrations == []
+
+
 def test_sm120_varlen_padding_ctas_are_inert_across_tile_specializations():
     """Padding CTAs must not consume stale SMEM or write another batch's output."""
     num_sms = torch.cuda.get_device_properties(0).multi_processor_count
@@ -1839,16 +2046,16 @@ def test_sm120_paged_decode_ragged_splits_are_cache_order_independent(
     """Ragged SplitKV must remain correct across uniform/ragged cache reuse."""
     sm120_forward_host.clear_launch_plans()
     cache_hits = []
-    original_try_paged_decode = sm120_forward_host.try_paged_decode
+    original_try_paged = sm120_forward_host.try_paged
 
     def record_cache_hit(**kwargs):
-        result = original_try_paged_decode(**kwargs)
+        result = original_try_paged(**kwargs)
         cache_hits.append(result is not None)
         return result
 
     monkeypatch.setattr(
         sm120_forward_host,
-        "try_paged_decode",
+        "try_paged",
         record_cache_hit,
     )
     torch.manual_seed(1234)
@@ -2133,16 +2340,16 @@ def test_sm120_paged_decode_graph_pdl_is_correct_and_eager_reusable(
     """Every SplitKV dataflow must safely launch its captured combine early."""
     sm120_forward_host.clear_launch_plans()
     cache_hits = []
-    original_try_paged_decode = sm120_forward_host.try_paged_decode
+    original_try_paged = sm120_forward_host.try_paged
 
     def record_cache_hit(**kwargs):
-        result = original_try_paged_decode(**kwargs)
+        result = original_try_paged(**kwargs)
         cache_hits.append(result is not None)
         return result
 
     monkeypatch.setattr(
         sm120_forward_host,
-        "try_paged_decode",
+        "try_paged",
         record_cache_hit,
     )
     torch.manual_seed(20260730)
