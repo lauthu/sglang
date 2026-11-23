@@ -1728,7 +1728,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_BEAM_DECODE_GRAPH_MAX_NEW_TOKENS</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Most tokens a beam request generates inside a shared-context graph when the model bundles no trie; a longer request decodes eagerly from the next token on. Such a model gets shared-context graphs only when this is set. Every replay pays for this many decode steps, so set it to the requests' <code>max_new_tokens</code>. A model with a trie uses its codebook count. Unused at <code>SGLANG_BEAM_DECODE_GRAPH_LEVEL</code> 2 and 3, whose kernels read each row's length.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Most tokens a beam request generates inside a shared-context graph when the model bundles no trie; a longer request decodes eagerly from the next token on. At <code>SGLANG_BEAM_DECODE_GRAPH_LEVEL=0</code> such a model gets shared-context graphs only when this is set. Every replay pays for this many decode steps, so set it to the requests' <code>max_new_tokens</code>. A model with a trie uses its codebook count. Unused at <code>SGLANG_BEAM_DECODE_GRAPH_LEVEL</code> 2 and 3, whose kernels read each row's length.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
     </tr>
     <tr>
@@ -1738,7 +1738,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_BEAM_DECODE_GRAPH_MAX_MIXED_REQUESTS</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>At <code>SGLANG_BEAM_DECODE_GRAPH_LEVEL=3</code>, the most requests in a decode batch with beam and regular requests that runs the beam path. A larger batch runs the regular decode path and is counted in the log. The graphs keep this many rows of full-vocabulary FP32 logits.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>At <code>SGLANG_BEAM_DECODE_GRAPH_LEVEL=3</code>, the most requests in a decode batch with beam and regular requests that runs the beam path. A larger batch runs the regular decode path and is counted in the log. The graphs keep this many rows of full-vocabulary FP32 logits. Without the compact trie output head, level <code>3</code> acts as level <code>2</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>64</code></td>
     </tr>
     <tr>

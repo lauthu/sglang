@@ -21,9 +21,9 @@ metadata staged into the buffers the graph reads.
 
 SGLANG_BEAM_DECODE_GRAPH_LEVEL sets which batches a shared-context beam graph
 takes: at 0 the one configured beam width at exactly a captured size, at 2 any
-mix of widths padded to a captured size (shared_context_ragged), at 3 also
-batches with ordinary requests, whose full-vocabulary logits the graph keeps
-(mixed_requests).
+mix of widths padded to a captured size (shared_context_ragged), at 3 and with
+the compact trie head also batches with ordinary requests, whose full-vocabulary
+logits the graph keeps (mixed_requests).
 """
 
 from __future__ import annotations

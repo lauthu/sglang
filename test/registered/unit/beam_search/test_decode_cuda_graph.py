@@ -266,7 +266,7 @@ def _decode_step(widths, prompt_len=7, decode_len=2):
 
 
 def _width_free_inputs(max_rows, *, level, trie_head=True):
-    keeps_dense_rows = level >= BeamDecodeGraphLevel.MIXED_REQUESTS
+    keeps_dense_rows = trie_head and level >= BeamDecodeGraphLevel.MIXED_REQUESTS
     return BeamGraphInputs(
         max_rows=max_rows,
         device="cpu",

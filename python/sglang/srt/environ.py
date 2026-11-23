@@ -268,7 +268,8 @@ class BeamDecodeGraphLevel(IntEnum):
     FIXED_WIDTH: steps whose requests all have SGLANG_BEAM_DECODE_GRAPH_WIDTH
         beams and whose rows equal a captured size.
     MIXED_WIDTHS: steps of beam requests of any widths, padded to a captured size.
-    MIXED_REQUESTS: MIXED_WIDTHS, plus steps that also hold ordinary requests.
+    MIXED_REQUESTS: MIXED_WIDTHS, plus, with the compact trie head, steps that
+        also hold ordinary requests.
     """
 
     FIXED_WIDTH = 0
