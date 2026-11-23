@@ -31,7 +31,7 @@ from sglang.srt.beam_search.joint_select import FinalSelect, SelectResult
 from sglang.srt.beam_search.trie_constraint import BeamTrieConstraint
 
 # The kernels hold one frontier row's codes in one program.
-MAX_CODEBOOK_SIZE = 4096
+_MAX_CODEBOOK_SIZE = 4096
 
 
 class RadixStep(NamedTuple):
@@ -44,9 +44,8 @@ class RadixStep(NamedTuple):
 
 class RadixGroupResult(NamedTuple):
     selection: Union[SelectResult, FinalSelect]
-    prefix_codes: Optional[
-        torch.Tensor
-    ]  # [beam_width, depth + 1]; None on a final step
+    # [beam_width, depth + 1]; None on a final step.
+    prefix_codes: Optional[torch.Tensor]
     # (old, new) decode slots for the deferred orphan search; None without a remap.
     orphans: Optional[Tuple[torch.Tensor, torch.Tensor]]
 
@@ -69,7 +68,7 @@ class RadixBeamSelector:
         """The launch key when the kernels cover the group's next selection, else None."""
         depth = group.num_generated
         if (
-            self._trie.config.codebook_size > MAX_CODEBOOK_SIZE
+            self._trie.config.codebook_size > _MAX_CODEBOOK_SIZE
             or self._tables[depth] is None
             or num_rows != (1 if depth == 0 else group.beam_width)
         ):
@@ -90,10 +89,10 @@ class RadixBeamSelector:
         # Per row, not per batch: logsumexp on CUDA is not batch-invariant.
         lse = torch.logsumexp(x, dim=-1, keepdim=True)
         start = config.token_start_for_depth(0)
+        codes = x[:, start : start + config.codebook_size]
         # The kernel subtracts the row max, then the log-sum-exp after it: zero keeps the logit.
-        return x[:, start : start + config.codebook_size], torch.nn.functional.pad(
-            lse, (1, 0)
-        )
+        normalizer = torch.nn.functional.pad(lse, (1, 0))
+        return codes, normalizer
 
     def select(
         self,
@@ -153,8 +152,8 @@ class RadixBeamSelector:
                 )
             orphans = None
             if out.old_kv is not None:
-                rows = slice(out.row_offsets[i], out.row_offsets[i + 1])
-                orphans = (out.old_kv[rows], out.new_kv[beams])
+                frontier = slice(out.row_offsets[i], out.row_offsets[i + 1])
+                orphans = (out.old_kv[frontier], out.new_kv[beams])
             results.append(
                 RadixGroupResult(
                     selection=selection,

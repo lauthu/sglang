@@ -126,13 +126,12 @@ class RadixSelection(msgspec.Struct):
     tokens: torch.Tensor  # [sum of widths] int64
     parent_idx: torch.Tensor  # [sum of widths] int64, frontier row within the group
     cum_logprobs: torch.Tensor  # [sum of widths] float32
-    prefix_codes: Optional[
-        torch.Tensor
-    ]  # [sum of widths, depth + 1] int64; None on a final step
-    old_kv: Optional[
-        torch.Tensor
-    ]  # [sum of rows, kv_len] decode slots before the remap
-    new_kv: Optional[torch.Tensor]  # [sum of widths, kv_len] decode slots after it
+    # [sum of widths, depth + 1] int64; None on a final step.
+    prefix_codes: Optional[torch.Tensor]
+    # Decode slots before the remap [sum of rows, kv_len] and after it
+    # [sum of widths, kv_len]; None on a step that does not remap.
+    old_kv: Optional[torch.Tensor]
+    new_kv: Optional[torch.Tensor]
     offsets: list[int]
     row_offsets: list[int]
 
