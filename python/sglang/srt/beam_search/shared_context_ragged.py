@@ -15,7 +15,7 @@
 
 A decode step describes its beam groups in one small int32 layout instead of
 per-width buckets of gathered KV slots. One kernel launch then serves every
-width in the step, and a trie decode graph captured for a row count replays for
+width in the step, and a beam decode graph captured for a row count replays for
 any split of at most that many rows into groups. At level 3, every other row of
 the step (an ordinary request, or a finished group's leader) is a one-row group
 whose whole KV is its prompt. For the stream-K kernel the layout ends with its

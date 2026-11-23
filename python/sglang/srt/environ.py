@@ -261,11 +261,11 @@ def _k31_gb_best(best: Any, default: Any) -> Callable[[], Any]:
 
 
 class BeamDecodeGraphLevel(IntEnum):
-    """Which beam decode steps replay a trie decode graph with shared-context
+    """Which beam decode steps replay a beam decode graph with shared-context
     attention. The values count levels of beam-width support; 1, one width per
     step, has no mode of its own.
 
-    FIXED_WIDTH: steps whose requests all have SGLANG_BEAM_SHARED_CONTEXT_WIDTH
+    FIXED_WIDTH: steps whose requests all have SGLANG_BEAM_DECODE_GRAPH_WIDTH
         beams and whose rows equal a captured size.
     MIXED_WIDTHS: steps of beam requests of any widths, padded to a captured size.
     MIXED_REQUESTS: MIXED_WIDTHS, plus steps that also hold ordinary requests.
@@ -769,12 +769,16 @@ class Envs:
     SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION = EnvBool(False)
     # Replay the trie beam selection step as a CUDA graph.
     SGLANG_ENABLE_BEAM_TRIE_SELECTION_GRAPH = EnvBool(False)
-    # Replay all-beam decode batches of the compact trie head as CUDA graphs.
-    SGLANG_ENABLE_BEAM_TRIE_DECODE_GRAPH = EnvBool(False)
+    # Replay all-beam decode batches that run the compact trie head or
+    # shared-context attention as CUDA graphs.
+    SGLANG_ENABLE_BEAM_DECODE_GRAPH = EnvBool(False)
     # The one beam width those graphs serve under shared-context attention; a
     # decode graph size holds this many rows per request.
-    SGLANG_BEAM_SHARED_CONTEXT_WIDTH = EnvInt(2000)
-    # BeamDecodeGraphLevel; above FIXED_WIDTH the width setting is unused.
+    SGLANG_BEAM_DECODE_GRAPH_WIDTH = EnvInt(2000)
+    # Most tokens a beam request generates inside a shared-context graph when the
+    # model bundles no trie; a trie fixes it at its codebook count.
+    SGLANG_BEAM_DECODE_GRAPH_MAX_NEW_TOKENS = EnvInt(None)
+    # BeamDecodeGraphLevel; above FIXED_WIDTH the two settings above are unused.
     SGLANG_BEAM_DECODE_GRAPH_LEVEL = EnvInt(BeamDecodeGraphLevel.FIXED_WIDTH)
     # MIXED_REQUESTS: most requests in a step with beam and ordinary requests that
     # runs the beam path. Arbitrary: 64 kept fp32 rows are 39 MB at 151,936 tokens.

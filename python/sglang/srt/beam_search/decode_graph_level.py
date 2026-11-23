@@ -14,7 +14,7 @@
 """SGLANG_BEAM_DECODE_GRAPH_LEVEL and the settings that go with a level.
 
 The level selects the shared-context attention layout and whether ordinary
-requests join beam decode steps; those are what let a trie decode graph replay
+requests join beam decode steps; those are what let a beam decode graph replay
 a step. A step that replays no graph runs the same kernels eagerly.
 """
 
@@ -79,16 +79,21 @@ def check_decode_graph_settings(*, deterministic_inference: bool) -> None:
                 "step, so they vary with the batch: not with "
                 "--enable-deterministic-inference; use level 2"
             )
-    if not envs.SGLANG_ENABLE_BEAM_TRIE_DECODE_GRAPH.get():
+    if not envs.SGLANG_ENABLE_BEAM_DECODE_GRAPH.get():
         logger.warning(
             "SGLANG_BEAM_DECODE_GRAPH_LEVEL=%d is set without "
-            "SGLANG_ENABLE_BEAM_TRIE_DECODE_GRAPH: beam decode steps run its "
+            "SGLANG_ENABLE_BEAM_DECODE_GRAPH: beam decode steps run its "
             "kernels eagerly and replay no graph.",
             level,
         )
-    if envs.SGLANG_BEAM_SHARED_CONTEXT_WIDTH.is_set():
-        logger.warning(
-            "SGLANG_BEAM_SHARED_CONTEXT_WIDTH has no effect with "
-            "SGLANG_BEAM_DECODE_GRAPH_LEVEL=%d: trie decode graphs serve any width.",
-            level,
-        )
+    for unused in (
+        envs.SGLANG_BEAM_DECODE_GRAPH_WIDTH,
+        envs.SGLANG_BEAM_DECODE_GRAPH_MAX_NEW_TOKENS,
+    ):
+        if unused.is_set():
+            logger.warning(
+                "%s has no effect with SGLANG_BEAM_DECODE_GRAPH_LEVEL=%d: its beam "
+                "decode graphs serve any beam width and decode length.",
+                unused.name,
+                level,
+            )

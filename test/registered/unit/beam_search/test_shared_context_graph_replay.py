@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Shared-context trie graphs replay the batch staged into their shared buffers,
+"""Shared-context beam graphs replay the batch staged into their shared buffers,
 and the trie head keeps ordinary requests' full-vocabulary rows on the way."""
 
 import unittest
@@ -20,6 +20,10 @@ from types import SimpleNamespace
 import torch
 
 from sglang.kernels.ops.attention.beam_shared_context import shared_context_attention
+from sglang.srt.beam_search.decode_cuda_graph import (
+    BeamGraphInputs,
+    SharedContextCapacity,
+)
 from sglang.srt.beam_search.forward_inputs import BeamForwardInputs
 from sglang.srt.beam_search.mixed_requests import BeamDenseRows
 from sglang.srt.beam_search.shared_context_attention import (
@@ -32,10 +36,6 @@ from sglang.srt.beam_search.shared_context_ragged import (
     build_ragged_metadata,
 )
 from sglang.srt.beam_search.trie_config import TrieOutputHeadConfig
-from sglang.srt.beam_search.trie_cuda_graph import (
-    SharedContextCapacity,
-    TrieGraphInputs,
-)
 from sglang.srt.beam_search.trie_output_head import BeamTrieOutputHead
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.beam_shared_context import ragged_case, run_ragged
@@ -94,8 +94,11 @@ class TestSharedContextGraphReplay(CustomTestCase):
         q = torch.randn((2 * WIDTH, 4, 64), dtype=torch.bfloat16, device="cuda")
         k = torch.randn((64, 2, 64), dtype=torch.bfloat16, device="cuda")
         v = torch.randn_like(k)
-        inputs = TrieGraphInputs(
-            max_rows=2 * WIDTH, device="cuda", shared_context=CAPACITY
+        inputs = BeamGraphInputs(
+            max_rows=2 * WIDTH,
+            device="cuda",
+            trie_head=False,
+            shared_context=CAPACITY,
         )
 
         graphs = {}
@@ -118,8 +121,7 @@ class TestSharedContextGraphReplay(CustomTestCase):
             static.context_slots.fill_(STALE_SLOT)
             static.decode_slots.fill_(STALE_SLOT)
             rows = metadata.num_rows
-            levels = torch.zeros(rows, dtype=torch.int64, device="cuda")
-            inputs.stage(BeamForwardInputs(levels, metadata))
+            inputs.stage(BeamForwardInputs(None, metadata))
             graph, output = graphs[rows]
             graph.replay()
             torch.testing.assert_close(
@@ -134,7 +136,7 @@ class TestSharedContextGraphReplay(CustomTestCase):
 class TestWidthFreeGraphReplay(CustomTestCase):
     def test_graph_captured_once_replays_any_split(self):
         """Nothing about widths, group count or lengths is recorded at capture: one
-        trie graph replays every split staged into its layout, ordinary requests as
+        beam graph replays every split staged into its layout, ordinary requests as
         one-row groups included, and padded rows read 0. With stream-K, the steps
         alternate between splitting the units and whole tiles per CTA (40 tiles)."""
         cases = tuple(
@@ -170,9 +172,10 @@ class TestWidthFreeGraphReplay(CustomTestCase):
                 (len(first.req_to_token) * 2, first.req_to_token.shape[1]),
                 dtype=torch.int32,
             )
-        inputs = TrieGraphInputs(
+        inputs = BeamGraphInputs(
             max_rows=captured_rows,
             device=req_to_token.device,
+            trie_head=True,
             shared_context=None,
             ragged_layout=allocate_capture_layout(
                 max_rows=captured_rows,

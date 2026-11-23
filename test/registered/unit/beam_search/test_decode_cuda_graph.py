@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""What a trie decode graph replays: the staged batch, and only a batch it holds.
+"""What a beam decode graph replays: the staged batch, and only a batch it holds.
 
 At decode graph levels 2 and 3 that is any split of a batch's rows into beam
 groups and, at level 3, ordinary requests next to them.
@@ -32,6 +32,10 @@ from sglang.srt.beam_search import (
     trie_output_head,
 )
 from sglang.srt.beam_search.batch_tail import BeamTailEntry
+from sglang.srt.beam_search.decode_cuda_graph import (
+    BeamGraphInputs,
+    SharedContextCapacity,
+)
 from sglang.srt.beam_search.decode_graph_level import (
     check_decode_graph_settings,
     decode_graph_level,
@@ -51,10 +55,6 @@ from sglang.srt.beam_search.shared_context_ragged import (
     allocate_capture_layout,
 )
 from sglang.srt.beam_search.trie_config import TrieOutputHeadConfig
-from sglang.srt.beam_search.trie_cuda_graph import (
-    SharedContextCapacity,
-    TrieGraphInputs,
-)
 from sglang.srt.beam_search.trie_output_head import BeamTrieOutputHead
 from sglang.srt.environ import BeamDecodeGraphLevel, envs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -90,34 +90,48 @@ def _metadata(prompt_lens, decode_lens, width=2) -> BeamAttentionMetadata:
     )
 
 
-class TestTrieGraphInputs(CustomTestCase):
+class TestBeamGraphInputs(CustomTestCase):
     def test_staging_refreshes_every_tensor_the_graph_reads(self):
         """A graph reads its inputs by address: a batch tensor that staging
-        skips leaves the previous batch's values in the replay."""
-        inputs = TrieGraphInputs(max_rows=8, device="cpu", shared_context=CAPACITY)
-        captured = inputs.for_capture(4).attention_metadata.buckets[0]
-        batch = BeamForwardInputs(
-            torch.tensor([1, 2, 1, 2]),
-            _metadata(prompt_lens=[1, 2], decode_lens=[1, 2]),
-        )
-        inputs.stage(batch)
+        skips leaves the previous batch's values in the replay. Under the dense
+        LM head a batch carries no trie levels and replays all the same."""
+        for trie_head in (True, False):
+            with self.subTest(trie_head=trie_head):
+                inputs = BeamGraphInputs(
+                    max_rows=8,
+                    device="cpu",
+                    trie_head=trie_head,
+                    shared_context=CAPACITY,
+                )
+                captured = inputs.for_capture(4).attention_metadata.buckets[0]
+                batch = BeamForwardInputs(
+                    torch.tensor([1, 2, 1, 2]) if trie_head else None,
+                    _metadata(prompt_lens=[1, 2], decode_lens=[1, 2]),
+                )
+                self.assertTrue(inputs.can_replay(batch, captured_rows=4))
+                inputs.stage(batch)
 
-        self.assertEqual(inputs.levels[:4].tolist(), [1, 2, 1, 2])
-        source = batch.attention_metadata.buckets[0]
-        tensors = 0
-        for field in msgspec.structs.fields(BeamAttentionBucket):
-            value = getattr(source, field.name)
-            if not isinstance(value, torch.Tensor):
-                continue
-            tensors += 1
-            staged = getattr(captured, field.name)[tuple(map(slice, value.shape))]
-            self.assertEqual(staged.tolist(), value.tolist(), field.name)
-        self.assertEqual(tensors, 5)
+                if trie_head:
+                    self.assertEqual(inputs.levels[:4].tolist(), [1, 2, 1, 2])
+                source = batch.attention_metadata.buckets[0]
+                tensors = 0
+                for field in msgspec.structs.fields(BeamAttentionBucket):
+                    value = getattr(source, field.name)
+                    if not isinstance(value, torch.Tensor):
+                        continue
+                    tensors += 1
+                    staged = getattr(captured, field.name)[
+                        tuple(map(slice, value.shape))
+                    ]
+                    self.assertEqual(staged.tolist(), value.tolist(), field.name)
+                self.assertEqual(tensors, 5)
 
     def test_only_a_batch_the_graph_holds_replays(self):
-        """Replaying a trie graph for a batch that does not fit its buffers
+        """Replaying a beam graph for a batch that does not fit its buffers
         returns the attention of other slots; such a batch runs eagerly."""
-        inputs = TrieGraphInputs(max_rows=8, device="cpu", shared_context=CAPACITY)
+        inputs = BeamGraphInputs(
+            max_rows=8, device="cpu", trie_head=True, shared_context=CAPACITY
+        )
         inputs.for_capture(4)
         levels = torch.zeros(4, dtype=torch.int64)
         at_capacity = _metadata(
@@ -153,7 +167,6 @@ class TestTrieGraphInputs(CustomTestCase):
             ),
             "two widths in the batch": (levels, two_widths, 4),
             "ordinary attention": (levels, None, 4),
-            "dense head": (None, at_capacity, 4),
         }
         for name, (trie_levels, metadata, captured_rows) in rejected.items():
             with self.subTest(name):
@@ -165,9 +178,11 @@ class TestTrieGraphInputs(CustomTestCase):
                 )
 
     def test_ordinary_attention_graph_takes_no_shared_context_batch(self):
-        """Without shared-context attention a trie graph holds FlashInfer
+        """Without shared-context attention a beam graph holds FlashInfer
         attention, which a batch with shared-context metadata does not run."""
-        inputs = TrieGraphInputs(max_rows=4, device="cpu", shared_context=None)
+        inputs = BeamGraphInputs(
+            max_rows=4, device="cpu", trie_head=True, shared_context=None
+        )
         inputs.for_capture(4)
         levels = torch.zeros(3, dtype=torch.int64)
         self.assertTrue(
@@ -250,11 +265,12 @@ def _decode_step(widths, prompt_len=7, decode_len=2):
     )
 
 
-def _width_free_inputs(max_rows, *, level):
+def _width_free_inputs(max_rows, *, level, trie_head=True):
     keeps_dense_rows = level >= BeamDecodeGraphLevel.MIXED_REQUESTS
-    return TrieGraphInputs(
+    return BeamGraphInputs(
         max_rows=max_rows,
         device="cpu",
+        trie_head=trie_head,
         shared_context=None,
         ragged_layout=allocate_capture_layout(
             max_rows=max_rows,
@@ -291,7 +307,7 @@ def _rows_in_tiles(layout):
     return rows
 
 
-class TestWidthFreeTrieGraphInputs(CustomTestCase):
+class TestWidthFreeBeamGraphInputs(CustomTestCase):
     def test_any_split_stages_into_a_larger_graph(self):
         """Level 2 graphs take a batch of any widths and fewer rows than they
         hold: over a larger earlier batch's tables, the staged tiles must cover
@@ -312,6 +328,22 @@ class TestWidthFreeTrieGraphInputs(CustomTestCase):
             num_rows, groups, _ = _tables(layout)
             self.assertEqual((num_rows, len(groups)), (431, 3))
             self.assertEqual(sorted(_rows_in_tiles(layout)), list(range(431)))
+
+    def test_dense_head_batch_replays_without_trie_levels(self):
+        """With the compact trie head off a beam batch carries its width-free
+        layout and no trie levels; a graph captured without levels replays it."""
+        with _decode_graph_level(2):
+            inputs = _width_free_inputs(max_rows=600, level=2, trie_head=False)
+            self.assertIsNone(inputs.for_capture(512).trie_levels)
+            beam = build_beam_forward_inputs(
+                _decode_step((2, 129, 300)), _model_runner(compact_head=False)
+            )
+            self.assertIsNone(beam.trie_levels)
+            self.assertTrue(inputs.can_replay(beam, captured_rows=512))
+            inputs.stage(beam)
+            self.assertEqual(
+                sorted(_rows_in_tiles(inputs.ragged_layout.layout)), list(range(431))
+            )
 
     def test_width_free_graph_takes_no_ordinary_attention_batch(self):
         """A batch the layout builder turned away (here a finished group's leader

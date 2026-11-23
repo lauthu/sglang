@@ -83,7 +83,7 @@ def capture_pre_sample_logits(
         # in-place sampling writes, but the leader rows do not, hence the clone.
         n = batch.beam_tail.num_base_rows
         logits = logits_output.next_token_logits
-        # A trie graph returns its kept-row buffer on every replay, so the batch
+        # A beam graph returns its kept-row buffer on every replay, so the batch
         # says whether this step filled it; the dense head fallback keeps none.
         kept_logits = logits_output.beam_dense_logits
         keeps_dense_rows = (
