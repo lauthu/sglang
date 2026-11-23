@@ -17,6 +17,12 @@ A trie batch runs the compact trie head, and with shared-context attention its o
 attention path, so it cannot replay an ordinary decode graph. The runner here
 captures a second graph per size for it and replays that graph with the batch's
 trie levels and shared-context metadata staged into the buffers the graph reads.
+
+SGLANG_BEAM_DECODE_GRAPH_LEVEL sets which batches a shared-context trie graph
+takes: at 0 the one configured beam width at exactly a captured size, at 2 any
+mix of widths padded to a captured size (shared_context_ragged), at 3 also
+batches with ordinary requests, whose full-vocabulary logits the graph keeps
+(mixed_requests).
 """
 
 from __future__ import annotations
@@ -28,14 +34,21 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 import torch
 
-from sglang.srt.beam_search import shared_context_attention
+from sglang.srt.beam_search import mixed_requests, shared_context_attention
+from sglang.srt.beam_search import shared_context_ragged as ragged
+from sglang.srt.beam_search.decode_graph_level import (
+    decode_graph_level,
+    stream_k_selected,
+)
 from sglang.srt.beam_search.forward_inputs import BeamForwardInputs
+from sglang.srt.beam_search.mixed_requests import BeamDenseRows
 from sglang.srt.beam_search.shared_context_attention import (
     BeamAttentionBucket,
     BeamAttentionMetadata,
 )
+from sglang.srt.beam_search.shared_context_ragged import RaggedBeamAttentionMetadata
 from sglang.srt.beam_search.trie_config import get_beam_trie_config
-from sglang.srt.environ import envs
+from sglang.srt.environ import BeamDecodeGraphLevel, envs
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
@@ -62,14 +75,7 @@ class SharedContextCapacity(msgspec.Struct, frozen=True):
     max_decode: int
 
 
-def _shared_context_capacity(
-    model_runner: ModelRunner,
-) -> Optional[SharedContextCapacity]:
-    if not (
-        shared_context_attention.enabled()
-        and shared_context_attention.supports_shared_context(model_runner)
-    ):
-        return None
+def _shared_context_capacity(model_runner: ModelRunner) -> SharedContextCapacity:
     model_config = model_runner.model_config
     return SharedContextCapacity(
         beam_width=envs.SGLANG_BEAM_SHARED_CONTEXT_WIDTH.get(),
@@ -78,9 +84,52 @@ def _shared_context_capacity(
     )
 
 
+def _trie_graph_inputs(
+    model_runner: ModelRunner, *, max_rows: int, device
+) -> TrieGraphInputs:
+    """The static inputs of this runner's trie graphs, for its decode graph level."""
+    level = decode_graph_level()
+    shared = (
+        shared_context_attention.enabled()
+        and shared_context_attention.supports_shared_context(model_runner)
+    )
+    width_free = shared and level >= BeamDecodeGraphLevel.MIXED_WIDTHS
+    keeps_dense_rows = level >= BeamDecodeGraphLevel.MIXED_REQUESTS
+    return TrieGraphInputs(
+        max_rows=max_rows,
+        device=device,
+        shared_context=(
+            _shared_context_capacity(model_runner)
+            if shared and not width_free
+            else None
+        ),
+        ragged_layout=(
+            ragged.allocate_capture_layout(
+                max_rows=max_rows,
+                device=device,
+                req_to_token=model_runner.req_to_token_pool.req_to_token,
+                one_row_groups=keeps_dense_rows,
+                stream_k=stream_k_selected(),
+            )
+            if width_free
+            else None
+        ),
+        dense_rows=(
+            mixed_requests.allocate_capture_dense_rows(
+                max_rows=max_rows,
+                vocab_size=model_runner.model_config.vocab_size,
+                device=device,
+            )
+            if keeps_dense_rows
+            else None
+        ),
+    )
+
+
 class TrieGraphInputs:
     """The buffers every trie graph reads, sized for the largest one; a graph of
-    fewer rows reads their leading part."""
+    fewer rows reads their leading part. Built anew for every capture, so the
+    graphs record the buffers' initial values."""
 
     def __init__(
         self,
@@ -88,10 +137,17 @@ class TrieGraphInputs:
         max_rows: int,
         device,
         shared_context: Optional[SharedContextCapacity],
+        ragged_layout: Optional[RaggedBeamAttentionMetadata] = None,
+        dense_rows: Optional[BeamDenseRows] = None,
     ):
         # [max_rows] int64 SID codebook depth per row.
         self.levels = torch.zeros(max_rows, dtype=torch.int64, device=device)
+        # Shared-context attention: this one-width capacity, or the width-free
+        # layout below; neither with ordinary attention.
         self.shared_context = shared_context
+        self.ragged_layout = ragged_layout
+        # Full-vocabulary rows every graph keeps for a batch's ordinary requests.
+        self.dense_rows = dense_rows
         # Rows of the graphs captured so far.
         self.captured_rows: set[int] = set()
         self._bucket: Optional[BeamAttentionBucket] = None
@@ -113,15 +169,24 @@ class TrieGraphInputs:
             )
 
     def supports_rows(self, rows: int) -> bool:
-        """With shared-context attention a graph holds whole groups of one width."""
+        """A graph of the one-width capacity holds whole groups of that width."""
         return self.shared_context is None or rows % self.shared_context.beam_width == 0
 
     def for_capture(self, rows: int) -> BeamForwardInputs:
         self.captured_rows.add(rows)
+        return BeamForwardInputs(
+            trie_levels=self.levels[:rows],
+            attention_metadata=self._attention_for_capture(rows),
+            dense_rows=self.dense_rows,
+        )
+
+    def _attention_for_capture(
+        self, rows: int
+    ) -> Optional[BeamAttentionMetadata | RaggedBeamAttentionMetadata]:
+        if self.ragged_layout is not None:
+            return self.ragged_layout
         if self._bucket is None:
-            return BeamForwardInputs(
-                trie_levels=self.levels[:rows], attention_metadata=None
-            )
+            return None
         groups = rows // self._bucket.beam_width
         bucket = BeamAttentionBucket(
             row_indices=self._bucket.row_indices[:groups],
@@ -131,15 +196,15 @@ class TrieGraphInputs:
             beam_width=self._bucket.beam_width,
             decode_lens=self._bucket.decode_lens[:groups],
         )
-        return BeamForwardInputs(
-            trie_levels=self.levels[:rows],
-            attention_metadata=BeamAttentionMetadata(buckets=[bucket], num_rows=rows),
-        )
+        return BeamAttentionMetadata(buckets=[bucket], num_rows=rows)
 
     def can_replay(self, beam: BeamForwardInputs, *, captured_rows: int) -> bool:
         if beam.trie_levels is None or captured_rows not in self.captured_rows:
             return False
         metadata, capacity = beam.attention_metadata, self.shared_context
+        if self.ragged_layout is not None:
+            # Any split pads like any decode batch; None is ordinary attention.
+            return isinstance(metadata, RaggedBeamAttentionMetadata)
         if metadata is None or capacity is None:
             # Ordinary attention pads like any decode batch.
             return metadata is None and capacity is None
@@ -153,10 +218,19 @@ class TrieGraphInputs:
 
     def stage(self, beam: BeamForwardInputs) -> None:
         """Copy a batch that can_replay accepted. Slots past the staged lengths
-        and padding rows keep an earlier batch's values: the kernel reads no slot
-        past a length, and a stale level is a valid depth."""
+        or counts and padding rows keep an earlier batch's values: the kernels
+        read no slot past them, and a stale level is a valid depth."""
         self.levels[: beam.trie_levels.shape[0]].copy_(beam.trie_levels)
+        if self.dense_rows is not None:
+            mixed_requests.stage_dense_rows(
+                target=self.dense_rows, step=beam.dense_rows
+            )
         if beam.attention_metadata is None:
+            return
+        if self.ragged_layout is not None:
+            ragged.stage_graph_metadata(
+                target=self.ragged_layout, source=beam.attention_metadata
+            )
             return
         source, static = beam.attention_metadata.buckets[0], self._bucket
         groups = source.row_indices.shape[0]
@@ -174,15 +248,12 @@ class BeamTrieDecodeCudaGraphRunner(DecodeCudaGraphRunner):
     ordinary graph and, where the size holds whole beam groups, a trie graph."""
 
     def __init__(self, model_runner: ModelRunner, **kwargs):
-        self._shared_context = _shared_context_capacity(model_runner)
         self._capturing_trie_graph = False
         super().__init__(model_runner, **kwargs)
 
     def capture(self) -> None:
-        self._trie_inputs = TrieGraphInputs(
-            max_rows=self.max_num_token,
-            device=self.device,
-            shared_context=self._shared_context,
+        self._trie_inputs = _trie_graph_inputs(
+            self.model_runner, max_rows=self.max_num_token, device=self.device
         )
         super().capture()
         if self._trie_inputs.captured_rows:
@@ -196,7 +267,7 @@ class BeamTrieDecodeCudaGraphRunner(DecodeCudaGraphRunner):
                 "size in %s is a multiple of SGLANG_BEAM_SHARED_CONTEXT_WIDTH=%d; "
                 "trie batches run eagerly.",
                 self.capture_bs,
-                self._shared_context.beam_width,
+                self._trie_inputs.shared_context.beam_width,
             )
 
     def capture_one_shape(

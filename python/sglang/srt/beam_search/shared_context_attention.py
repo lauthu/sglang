@@ -23,7 +23,13 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 import torch
 
-from sglang.srt.environ import envs
+from sglang.srt.beam_search import mixed_requests
+from sglang.srt.beam_search import shared_context_ragged as ragged
+from sglang.srt.beam_search.decode_graph_level import (
+    decode_graph_level,
+    stream_k_selected,
+)
+from sglang.srt.environ import BeamDecodeGraphLevel, envs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -110,7 +116,7 @@ def _metadata_tensor(values, dtype, device):
 def build_metadata(
     batch: ScheduleBatch,
     model_runner: ModelRunner,
-) -> Optional[BeamAttentionMetadata]:
+) -> Optional[BeamAttentionMetadata | ragged.RaggedBeamAttentionMetadata]:
     if batch.beam_tail is None or not batch.forward_mode.is_decode() or not enabled():
         return None
     if not supports_shared_context(model_runner):
@@ -118,7 +124,25 @@ def build_metadata(
     entries = batch.beam_tail.entries
     if not entries or batch.seq_lens_cpu is None:
         return None
+    level = decode_graph_level()
+    if level >= BeamDecodeGraphLevel.MIXED_WIDTHS:
+        return ragged.build_ragged_metadata(
+            batch=batch,
+            req_to_token=model_runner.req_to_token_pool.req_to_token,
+            # Without the compact head no row keeps full-vocabulary logits, and a
+            # step with other rows runs the ordinary decode path, as at level 0.
+            one_row_groups=level >= BeamDecodeGraphLevel.MIXED_REQUESTS
+            and model_runner.beam_trie_compact_enabled
+            and mixed_requests.admits(batch),
+            stream_k=stream_k_selected(),
+        )
+    return _build_width_buckets(batch=batch, model_runner=model_runner)
 
+
+def _build_width_buckets(
+    batch: ScheduleBatch, model_runner: ModelRunner
+) -> Optional[BeamAttentionMetadata]:
+    entries = batch.beam_tail.entries
     widths = [entry.end - entry.start + 1 for entry in entries]
     if any(width <= 1 for width in widths):
         return None
@@ -229,6 +253,17 @@ def forward(
     k_buffer, v_buffer = kv_layers.read(layer.layer_id).kv()
     if k_buffer.ndim != 3 or v_buffer.ndim != 3:
         raise RuntimeError("Shared-context attention requires 3D MHA K/V cache buffers")
+    # The width-free kernels cover the fixed-width one's steps too; that one stays
+    # as the default path, unchanged, while they are opt-in.
+    if isinstance(metadata, ragged.RaggedBeamAttentionMetadata):
+        return ragged.forward(
+            q=q,
+            layer=layer,
+            forward_batch=forward_batch,
+            metadata=metadata,
+            k_buffer=k_buffer,
+            v_buffer=v_buffer,
+        )
 
     q_heads = layer.tp_q_head_num
     head_dim = layer.head_dim

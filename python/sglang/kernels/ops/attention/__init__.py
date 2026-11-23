@@ -64,6 +64,13 @@ _TRITON_KERNELS = [
     ("fused_qk_rope_reshape_and_cache", "fused_qk_rope_reshape_and_cache"),
     ("mla_qk_prep", "concat_and_cast_mha_k_triton"),
     ("beam_shared_context", "shared_context_attention"),
+    # One contract, shared-context attention for any beam widths in a launch;
+    # two ops because the registry holds one spec per (op, backend).
+    ("beam_shared_context_ragged", "shared_context_attention_ragged"),
+    (
+        "beam_shared_context_ragged_stream_k",
+        "shared_context_attention_ragged_stream_k",
+    ),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(

@@ -11,27 +11,56 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""What a trie decode graph replays: the staged batch, and only a batch it holds."""
+"""What a trie decode graph replays: the staged batch, and only a batch it holds.
 
+At decode graph levels 2 and 3 that is any split of a batch's rows into beam
+groups and, at level 3, ordinary requests next to them.
+"""
+
+import contextlib
 import itertools
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import msgspec
 import torch
 
-from sglang.srt.beam_search.forward_inputs import BeamForwardInputs
+from sglang.srt.beam_search import (
+    mixed_requests,
+    shared_context_attention,
+    trie_output_head,
+)
+from sglang.srt.beam_search.batch_tail import BeamTailEntry
+from sglang.srt.beam_search.decode_graph_level import (
+    check_decode_graph_settings,
+    decode_graph_level,
+)
+from sglang.srt.beam_search.forward_inputs import (
+    BeamForwardInputs,
+    build_beam_forward_inputs,
+)
+from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
+from sglang.srt.beam_search.mixed_requests import BeamDenseRows
 from sglang.srt.beam_search.shared_context_attention import (
     BeamAttentionBucket,
     BeamAttentionMetadata,
 )
+from sglang.srt.beam_search.shared_context_ragged import (
+    RAGGED_BLOCK_M,
+    allocate_capture_layout,
+)
+from sglang.srt.beam_search.trie_config import TrieOutputHeadConfig
 from sglang.srt.beam_search.trie_cuda_graph import (
     SharedContextCapacity,
     TrieGraphInputs,
 )
+from sglang.srt.beam_search.trie_output_head import BeamTrieOutputHead
+from sglang.srt.environ import BeamDecodeGraphLevel, envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 CAPACITY = SharedContextCapacity(beam_width=2, max_context=4, max_decode=3)
 
@@ -148,6 +177,327 @@ class TestTrieGraphInputs(CustomTestCase):
         self.assertFalse(
             inputs.can_replay(BeamForwardInputs(levels, shared), captured_rows=4)
         )
+
+
+_TRIE_CONFIG = TrieOutputHeadConfig(
+    tensor_path="/unused/trie_output_head.safetensors",
+    token_start=8,
+    codebook_size=4,
+    num_codebooks=2,
+)
+
+
+def _model_runner(compact_head=True):
+    """The model runner fields the forward-input builders read."""
+    return SimpleNamespace(
+        beam_trie_compact_enabled=compact_head,
+        model_config=SimpleNamespace(),
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=torch.zeros(4, 8, dtype=torch.int32)
+        ),
+    )
+
+
+@contextlib.contextmanager
+def _decode_graph_level(level, **env):
+    """A server at this level with shared-context attention on and supported."""
+    with contextlib.ExitStack() as stack:
+        overrides = {
+            "SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION": True,
+            "SGLANG_BEAM_DECODE_GRAPH_LEVEL": level,
+            **env,
+        }
+        for name, value in overrides.items():
+            stack.enter_context(getattr(envs, name).override(value))
+        stack.enter_context(
+            mock.patch.object(
+                shared_context_attention, "supports_shared_context", return_value=True
+            )
+        )
+        stack.enter_context(
+            mock.patch.object(
+                trie_output_head, "get_beam_trie_config", return_value=_TRIE_CONFIG
+            )
+        )
+        yield
+
+
+def _decode_step(widths, prompt_len=7, decode_len=2):
+    """A decode step with one base row per request, in order, then each live beam
+    group's member rows. A width of 1 is an ordinary request with its own KV; 0 is
+    a finished group's leader, which has no member rows left."""
+    reqs, entries, base_lens, member_lens = [], [], [], []
+    for row, width in enumerate(widths):
+        if width == 1:
+            reqs.append(SimpleNamespace(beam_group=None))
+            base_lens.append(40 + row)
+            continue
+        group = SimpleNamespace(prompt_len=prompt_len, num_generated=decode_len - 1)
+        reqs.append(SimpleNamespace(beam_group=group))
+        base_lens.append(prompt_len + decode_len)
+        if width > 1:
+            start = len(member_lens)
+            entries.append(BeamTailEntry(group, row, start, start + width - 1))
+            member_lens.extend([prompt_len + decode_len] * (width - 1))
+    seq_lens = torch.tensor(base_lens + member_lens, dtype=torch.int64)
+    return SimpleNamespace(
+        reqs=reqs,
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens,
+        beam_tail=SimpleNamespace(num_base_rows=len(reqs), entries=entries),
+        forward_mode=SimpleNamespace(is_decode=lambda: True),
+        device=torch.device("cpu"),
+    )
+
+
+def _width_free_inputs(max_rows, *, level):
+    keeps_dense_rows = level >= BeamDecodeGraphLevel.MIXED_REQUESTS
+    return TrieGraphInputs(
+        max_rows=max_rows,
+        device="cpu",
+        shared_context=None,
+        ragged_layout=allocate_capture_layout(
+            max_rows=max_rows,
+            device="cpu",
+            req_to_token=torch.zeros(4, 8, dtype=torch.int32),
+            one_row_groups=keeps_dense_rows,
+        ),
+        dense_rows=(
+            mixed_requests.allocate_capture_dense_rows(
+                max_rows=max_rows, vocab_size=16, device="cpu"
+            )
+            if keeps_dense_rows
+            else None
+        ),
+    )
+
+
+def _tables(layout):
+    """A layout buffer's counts and its staged group and tile tables."""
+    num_groups, num_tiles, num_rows = layout[:3].tolist()
+    groups = layout[3 : 3 + 4 * num_groups].view(-1, 4).tolist()
+    tiles = layout[3 + 4 * num_groups :][: 2 * num_tiles].view(-1, 2).tolist()
+    return num_rows, groups, tiles
+
+
+def _rows_in_tiles(layout):
+    """Every row the staged tiles cover, tile by tile."""
+    _, groups, tiles = _tables(layout)
+    rows = []
+    for group, first_beam in tiles:
+        leader, first_member, members, _ = groups[group]
+        for beam in range(first_beam, min(first_beam + RAGGED_BLOCK_M, members + 1)):
+            rows.append(leader if beam == 0 else first_member + beam - 1)
+    return rows
+
+
+class TestWidthFreeTrieGraphInputs(CustomTestCase):
+    def test_any_split_stages_into_a_larger_graph(self):
+        """Level 2 graphs take a batch of any widths and fewer rows than they
+        hold: over a larger earlier batch's tables, the staged tiles must cover
+        each of its rows exactly once."""
+        with _decode_graph_level(2):
+            inputs = _width_free_inputs(max_rows=600, level=2)
+            self.assertTrue(inputs.supports_rows(431))
+            inputs.for_capture(512)
+            runner = _model_runner()
+            inputs.stage(build_beam_forward_inputs(_decode_step((300, 300)), runner))
+            beam = build_beam_forward_inputs(_decode_step((2, 129, 300)), runner)
+            self.assertEqual(beam.trie_levels.shape[0], 431)
+            self.assertIsNone(beam.dense_rows)
+            self.assertTrue(inputs.can_replay(beam, captured_rows=512))
+            inputs.stage(beam)
+
+            layout = inputs.ragged_layout.layout
+            num_rows, groups, _ = _tables(layout)
+            self.assertEqual((num_rows, len(groups)), (431, 3))
+            self.assertEqual(sorted(_rows_in_tiles(layout)), list(range(431)))
+
+    def test_width_free_graph_takes_no_ordinary_attention_batch(self):
+        """A batch the layout builder turned away (here a finished group's leader
+        still in it) carries no tables; replaying it would attend the previous
+        batch's groups."""
+        with _decode_graph_level(2):
+            inputs = _width_free_inputs(max_rows=600, level=2)
+            inputs.for_capture(512)
+            beam = build_beam_forward_inputs(
+                _decode_step((129, 0, 300)), _model_runner()
+            )
+            self.assertIsNotNone(beam.trie_levels)
+            self.assertIsNone(beam.attention_metadata)
+            self.assertFalse(inputs.can_replay(beam, captured_rows=512))
+
+    def test_level_rejects_what_it_cannot_run(self):
+        """Level 1 has no mode of its own, level 0 has only its own kernel, and
+        level 3 cannot keep deterministic inference: none may silently run
+        something else."""
+        with envs.SGLANG_BEAM_DECODE_GRAPH_LEVEL.override(1):
+            with self.assertRaisesRegex(ValueError, "use 2"):
+                decode_graph_level()
+        with envs.SGLANG_BEAM_SHARED_CONTEXT_KERNEL.override("stream_k"):
+            with self.assertRaisesRegex(ValueError, "LEVEL 2 or 3"):
+                decode_graph_level()
+            for level in (2, 3):
+                with envs.SGLANG_BEAM_DECODE_GRAPH_LEVEL.override(level):
+                    self.assertEqual(decode_graph_level(), level)
+        with envs.SGLANG_BEAM_SHARED_CONTEXT_KERNEL.override("split_kv"):
+            with self.assertRaisesRegex(ValueError, "not one of"):
+                decode_graph_level()
+        # Level 3 moves an ordinary request's logits with the batch it decodes in.
+        with envs.SGLANG_BEAM_DECODE_GRAPH_LEVEL.override(2):
+            check_decode_graph_settings(deterministic_inference=True)
+        with envs.SGLANG_BEAM_DECODE_GRAPH_LEVEL.override(3):
+            with self.assertRaisesRegex(ValueError, "use level 2"):
+                check_decode_graph_settings(deterministic_inference=True)
+
+
+class TestMixedRequestBeamSteps(CustomTestCase):
+    """SGLANG_BEAM_DECODE_GRAPH_LEVEL=3: ordinary requests join beam decode steps."""
+
+    def test_ordinary_requests_join_only_at_level_3(self):
+        """Below level 3, or without the compact head that keeps its logits, a
+        step with an ordinary request gets no beam inputs, so it runs the ordinary
+        decode path, uncounted. At level 3 its ordinary rows and a finished
+        group's leader are one-row groups reading their whole KV as the prompt,
+        the tiles cover every row once, and the graph keeps one full-vocabulary
+        row per request, and none in a following beam-only step."""
+        runner = _model_runner()
+        step = _decode_step((1, 129, 0, 1, 300))
+        rows = len(step.seq_lens)
+        with _decode_graph_level(2):
+            overflow = mixed_requests.overflow_steps()
+            self.assertIsNone(build_beam_forward_inputs(step, runner))
+            self.assertEqual(mixed_requests.overflow_steps(), overflow)
+        with _decode_graph_level(3):
+            self.assertIsNone(
+                build_beam_forward_inputs(step, _model_runner(compact_head=False))
+            )
+            inputs = _width_free_inputs(max_rows=600, level=3)
+            self.assertIs(inputs.for_capture(512).dense_rows, inputs.dense_rows)
+
+            beam = build_beam_forward_inputs(step, runner)
+            self.assertEqual(beam.trie_levels[:5].tolist(), [0, 1, 1, 0, 1])
+            self.assertTrue(inputs.can_replay(beam, captured_rows=512))
+            inputs.stage(beam)
+
+            layout = inputs.ragged_layout.layout
+            num_rows, groups, _ = _tables(layout)
+            self.assertEqual((num_rows, len(groups)), (rows, 5))
+            for leader, _, members, prompt_len in groups:
+                if members == 0:
+                    self.assertEqual(prompt_len, int(step.seq_lens[leader]))
+            self.assertEqual(sorted(_rows_in_tiles(layout)), list(range(rows)))
+            self.assertEqual(int(inputs.dense_rows.count), 5)
+
+            inputs.stage(build_beam_forward_inputs(_decode_step((129, 300)), runner))
+            self.assertEqual(int(inputs.dense_rows.count), 0)
+
+    def test_too_many_requests_take_the_ordinary_path(self):
+        """Above SGLANG_BEAM_DECODE_GRAPH_MAX_MIXED_REQUESTS requests, a step with
+        an ordinary request gets no beam inputs, so it runs the ordinary decode
+        path, and is counted. At the cap it runs the beam path; beam-only steps
+        never count against the cap."""
+        runner = _model_runner()
+        with _decode_graph_level(3, SGLANG_BEAM_DECODE_GRAPH_MAX_MIXED_REQUESTS=3):
+            at_cap = build_beam_forward_inputs(_decode_step((1, 4, 1)), runner)
+            self.assertEqual(at_cap.trie_levels[:3].tolist(), [0, 1, 0])
+            self.assertEqual(len(_tables(at_cap.attention_metadata.layout)[1]), 3)
+            self.assertEqual(at_cap.dense_rows.num_rows, 3)
+
+            overflow = mixed_requests.overflow_steps()
+            self.assertIsNone(
+                build_beam_forward_inputs(_decode_step((1, 4, 1, 4)), runner)
+            )
+            self.assertEqual(mixed_requests.overflow_steps(), overflow + 1)
+
+            beam_only = build_beam_forward_inputs(_decode_step((4, 4, 4, 4)), runner)
+            self.assertEqual(len(_tables(beam_only.attention_metadata.layout)[1]), 4)
+            self.assertIsNone(beam_only.dense_rows)
+            self.assertEqual(mixed_requests.overflow_steps(), overflow + 1)
+
+    def test_sampler_reads_kept_rows_and_selection_reads_compact_rows(self):
+        """With ordinary requests in a beam step, the sampler must get the kept
+        full-vocabulary rows, one per request, while beam selection keeps the
+        leaders' and members' compact rows. A beam-only step replays the same
+        graph and must not sample from the kept-row buffer it returns, and a head
+        that fell back to the dense LM head keeps no rows to sample from."""
+        step = _decode_step((1, 3, 1))
+        compact = torch.randn(5, 4)
+        dense = torch.randn(64, 16)
+
+        def capture(dense_rows, kept_logits=dense):
+            output = SimpleNamespace(
+                next_token_logits=compact,
+                beam_dense_logits=kept_logits,
+                beam_normalizer=torch.randn(5, 2),
+                hidden_states=None,
+                beam=None,
+            )
+            forward = SimpleNamespace(
+                beam=BeamForwardInputs(torch.zeros(5), None, dense_rows),
+                positions=torch.arange(5),
+            )
+            capture_pre_sample_logits(step, forward, output)
+            return output
+
+        output = capture(BeamDenseRows(num_rows=3))
+        self.assertTrue(torch.equal(output.next_token_logits, dense[:3]))
+        self.assertTrue(torch.equal(output.beam.leader_logits, compact[1:2]))
+        self.assertTrue(torch.equal(output.beam.tail_logits, compact[3:]))
+        self.assertTrue(torch.equal(capture(None).next_token_logits, compact[:3]))
+        fallback = capture(BeamDenseRows(num_rows=3), kept_logits=None)
+        self.assertTrue(torch.equal(fallback.next_token_logits, compact[:3]))
+
+    def test_kept_rows_are_the_transformed_full_vocabulary_logits(self):
+        """Ordinary requests in a beam step sample from the rows the normalizer
+        pass keeps: they must equal the dense LM head after the head's transform,
+        across chunk edges, while compact logits and normalizers stay as without
+        keeping. A captured buffer keeps only the rows its count names."""
+        torch.manual_seed(0)
+        hidden_states = torch.randn(4, 5)
+        weight = torch.randn(18, 5)
+        depths = torch.tensor([0, 1, 0, 1])
+
+        def project(states, selected_weight):
+            return torch.matmul(states, selected_weight.T)
+
+        def transform(logits):
+            return logits * 0.5
+
+        head = BeamTrieOutputHead(_TRIE_CONFIG, vocab_size=16, chunk_size=3)
+        plain = head.project_mixed(hidden_states, weight, depths, project, transform)
+        kept = head.project_mixed(
+            hidden_states,
+            weight,
+            depths,
+            project,
+            transform,
+            dense_rows=BeamDenseRows(num_rows=3),
+        )
+
+        # Chunk by chunk, as the head projects: one GEMM over all 16 columns
+        # rounds differently on CPU.
+        dense = torch.cat(
+            [
+                transform(project(hidden_states, weight[start : min(start + 3, 16)]))
+                for start in range(0, 16, 3)
+            ],
+            dim=1,
+        )
+        self.assertTrue(torch.equal(kept.dense_logits, dense[:3]))
+        self.assertTrue(torch.equal(kept.logits, plain.logits))
+        self.assertTrue(torch.equal(kept.normalizer, plain.normalizer))
+
+        captured = BeamDenseRows(
+            num_rows=3,
+            count=torch.tensor([1], dtype=torch.int32),
+            logits=torch.full((3, 16), -7.0),
+        )
+        head.project_mixed(
+            hidden_states, weight, depths, project, transform, dense_rows=captured
+        )
+        self.assertTrue(torch.equal(captured.logits[:1], dense[:1]))
+        self.assertTrue(bool((captured.logits[1:] == -7.0).all()))
 
 
 if __name__ == "__main__":

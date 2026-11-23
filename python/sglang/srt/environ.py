@@ -260,6 +260,22 @@ def _k31_gb_best(best: Any, default: Any) -> Callable[[], Any]:
     )
 
 
+class BeamDecodeGraphLevel(IntEnum):
+    """Which beam decode steps replay a trie decode graph with shared-context
+    attention. The values count levels of beam-width support; 1, one width per
+    step, has no mode of its own.
+
+    FIXED_WIDTH: steps whose requests all have SGLANG_BEAM_SHARED_CONTEXT_WIDTH
+        beams and whose rows equal a captured size.
+    MIXED_WIDTHS: steps of beam requests of any widths, padded to a captured size.
+    MIXED_REQUESTS: MIXED_WIDTHS, plus steps that also hold ordinary requests.
+    """
+
+    FIXED_WIDTH = 0
+    MIXED_WIDTHS = 2
+    MIXED_REQUESTS = 3
+
+
 class Envs:
     # Organization principles for this registry:
     # - Put every field in exactly one topical section. Prefer an existing
@@ -758,6 +774,14 @@ class Envs:
     # The one beam width those graphs serve under shared-context attention; a
     # decode graph size holds this many rows per request.
     SGLANG_BEAM_SHARED_CONTEXT_WIDTH = EnvInt(2000)
+    # BeamDecodeGraphLevel; above FIXED_WIDTH the width setting is unused.
+    SGLANG_BEAM_DECODE_GRAPH_LEVEL = EnvInt(BeamDecodeGraphLevel.FIXED_WIDTH)
+    # MIXED_REQUESTS: most requests in a step with beam and ordinary requests that
+    # runs the beam path. Arbitrary: 64 kept fp32 rows are 39 MB at 151,936 tokens.
+    SGLANG_BEAM_DECODE_GRAPH_MAX_MIXED_REQUESTS = EnvInt(64)
+    # Shared-context attention kernel at MIXED_WIDTHS and above: "default" (one
+    # CTA per tile and query head) or "stream_k" (prompts split across CTAs).
+    SGLANG_BEAM_SHARED_CONTEXT_KERNEL = EnvStr("default")
 
     # ===================================================================
     # Overlap scheduler and pipeline parallelism
