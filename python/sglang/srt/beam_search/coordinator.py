@@ -74,6 +74,10 @@ from sglang.srt.runtime_context import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.beam_search.radix_selection import (
+        RadixBeamSelector,
+        RadixGroupResult,
+    )
     from sglang.srt.beam_search.selection_cuda_graph import TrieSelectionGraphCache
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -116,6 +120,8 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
     # Live (non-retired) groups; the O(1) gate for the per-forward relay hook.
     _num_live_groups: int = 0
     _trie_selection_graph_cache: Optional[TrieSelectionGraphCache] = None
+    # Set by SGLANG_ENABLE_BEAM_TRIE_RADIX_SELECTION on a model with a trie head.
+    _radix_selector: Optional[RadixBeamSelector] = None
 
     def __post_init__(self) -> None:
         config = get_beam_trie_config(self.model_config)
@@ -129,6 +135,10 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 )
 
                 self._trie_selection_graph_cache = TrieSelectionGraphCache()
+            if envs.SGLANG_ENABLE_BEAM_TRIE_RADIX_SELECTION.get():
+                from sglang.srt.beam_search.radix_selection import RadixBeamSelector
+
+                self._radix_selector = RadixBeamSelector(self.trie_constraint)
 
     def _storage(self):
         """Where member rows and their token ids are taken and given back."""
@@ -374,16 +384,18 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         """Launch half of the leader's prefill tick: first selection, member-row
         spawn, and the relay overwrite (the sampled token is void)."""
         group: BeamGroup = req.beam_group
-        top_logprobs, top_tokens = self.group_topk_logprobs(
-            group,
-            [logits_output.beam.leader_logits[pos : pos + 1]],
-            self._capture_normalizers(
-                logits_output.beam,
-                leader_slice=slice(pos, pos + 1),
-            ),
-        )
         final = group.next_step_is_final()
-        next_tokens, _ = self.select_group(group, top_logprobs, top_tokens, tick)
+        next_tokens = self._radix_select_prefill(group, pos, logits_output.beam, tick)
+        if next_tokens is None:
+            top_logprobs, top_tokens = self.group_topk_logprobs(
+                group,
+                [logits_output.beam.leader_logits[pos : pos + 1]],
+                self._capture_normalizers(
+                    logits_output.beam,
+                    leader_slice=slice(pos, pos + 1),
+                ),
+            )
+            next_tokens, _ = self.select_group(group, top_logprobs, top_tokens, tick)
         if final:
             # Prefill-terminated (max_new_tokens == 1): no spawn, but the relay
             # slot still needs a token so an overshoot step has a valid input.
@@ -440,9 +452,14 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         if tail is None:
             return
         capture = logits_output.beam
+        radix_done = self._radix_select_decode(tail, capture, batch.forward_iter)
         for gi, entry in enumerate(tail.entries):
             group = entry.group
-            if group.retired or group.state != BeamGroupState.DECODING:
+            if (
+                gi in radix_done
+                or group.retired
+                or group.state != BeamGroupState.DECODING
+            ):
                 continue
             pieces = [
                 capture.leader_logits[gi : gi + 1],
@@ -486,6 +503,90 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 continue
             if group.commit_pending(forward_iter):
                 self._finish_group(group)
+
+    def _radix_select_prefill(
+        self, group: BeamGroup, pos: int, capture, tick: int
+    ) -> Optional[torch.Tensor]:
+        """First selection with the radix kernels; None when they do not cover it."""
+        selector = self._radix_selector
+        # A prefill forward returns full-vocabulary rows without a normalizer.
+        if selector is None or capture.leader_normalizer is not None:
+            return None
+        step = selector.step_of(group, num_rows=1)
+        if step is None:
+            return None
+        logits, normalizer = selector.first_step_inputs(
+            capture.leader_logits[pos : pos + 1]
+        )
+        (result,), next_tokens = selector.select(
+            step,
+            [group],
+            leader_logits=logits,
+            leader_normalizer=normalizer,
+            leader_rows=[0],
+        )
+        self._advance_radix(group, result, tick)
+        return next_tokens
+
+    def _radix_select_decode(self, tail, capture, tick: int) -> set:
+        """Selects, remaps and relays every group the radix kernels cover, one
+        launch set per RadixStep. Returns the tail entry indices it handled."""
+        selector = self._radix_selector
+        if (
+            selector is None
+            # Rows of the dense LM head carry no normalizer.
+            or capture.leader_normalizer is None
+            or capture.tail_normalizer is None
+        ):
+            return set()
+        buckets = {}
+        for gi, entry in enumerate(tail.entries):
+            group = entry.group
+            if group.retired or group.state != BeamGroupState.DECODING:
+                continue
+            step = selector.step_of(group, num_rows=1 + entry.end - entry.start)
+            if step is not None:
+                buckets.setdefault(step, []).append(gi)
+        for step, members in buckets.items():
+            groups = [tail.entries[gi].group for gi in members]
+            # Every group's rows, leader first: where its beams' KV and next tokens go.
+            rows = (
+                groups[0].all_rows
+                if len(groups) == 1
+                else torch.cat([group.all_rows for group in groups])
+            )
+            results, next_tokens = selector.select(
+                step,
+                groups,
+                leader_logits=capture.leader_logits,
+                leader_normalizer=capture.leader_normalizer,
+                leader_rows=members,
+                tail_logits=capture.tail_logits,
+                tail_normalizer=capture.tail_normalizer,
+                tail_starts=[tail.entries[gi].start for gi in members],
+                req_to_token=self.req_to_token_pool.req_to_token,
+                rows=rows,
+            )
+            for group, result in zip(groups, results):
+                self._advance_radix(group, result, tick)
+                if result.prefix_codes is not None:
+                    # As _apply_survivors, with the remap already applied in-kernel.
+                    if result.orphans is not None:
+                        group.pending_orphans.append(
+                            StagedOrphans(tick, *result.orphans)
+                        )
+                    group.leader.output_ids.append(0)
+            self._stash_next_tokens(rows, next_tokens)
+        return {gi for members in buckets.values() for gi in members}
+
+    def _advance_radix(
+        self, group: BeamGroup, result: RadixGroupResult, tick: int
+    ) -> None:
+        if result.prefix_codes is None:
+            group.advance_final_frontier(result.selection, tick)
+            return
+        group.advance_frontier(result.selection, tick)
+        group.trie_prefix_codes = result.prefix_codes
 
     def select_group(
         self,

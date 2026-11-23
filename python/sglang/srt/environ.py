@@ -753,6 +753,9 @@ class Envs:
     SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION = EnvBool(False)
     # Replay the trie beam selection step as a CUDA graph.
     SGLANG_ENABLE_BEAM_TRIE_SELECTION_GRAPH = EnvBool(False)
+    # Select trie beams with the fused radix-select kernels: one launch set per step for the
+    # groups they cover, of any beam widths; other groups keep the selection above.
+    SGLANG_ENABLE_BEAM_TRIE_RADIX_SELECTION = EnvBool(False)
 
     # ===================================================================
     # Overlap scheduler and pipeline parallelism
