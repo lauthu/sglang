@@ -193,10 +193,13 @@ class TestBeamParityDecodeGraph(TestBeamParity):
 
 
 class TestBeamParityWidthFreeDecodeGraph(TestBeamParity):
-    """The same acceptance at SGLANG_BEAM_DECODE_GRAPH_LEVEL=2: requests of both
-    beam widths replay graphs of the default decode graph sizes, with no width
+    """The same acceptance at SGLANG_BEAM_DECODE_GRAPH_LEVEL=2: requests of any
+    beam width replay graphs of the default decode graph sizes, with no width
     and no token budget set."""
 
+    # At 2 beams this prompt's search sits on a near-tie between two prefixes, which
+    # attention implementations resolve differently by rounding; see the class above.
+    parity_beam_widths = (GRAPH_BEAM_WIDTH,)
     server_env = {
         "SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION": "1",
         "SGLANG_ENABLE_BEAM_DECODE_GRAPH": "1",
@@ -212,7 +215,7 @@ class TestBeamParityWidthFreeDecodeGraph(TestBeamParity):
             "(compact trie head off, shared-context attention on)",
             self.server_log.getvalue(),
         )
-        for beam_width in self.parity_beam_widths:
+        for beam_width in (2, GRAPH_BEAM_WIDTH):
             before = _decode_passes(self.base_url)
             self._generate_beams(beam_width)
             after = _decode_passes(self.base_url)
