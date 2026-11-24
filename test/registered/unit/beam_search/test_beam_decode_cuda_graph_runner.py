@@ -514,7 +514,11 @@ class TestMixedRequestBeamSteps(CustomTestCase):
             self.assertEqual(sorted(_rows_in_tiles(layout)), list(range(rows)))
             self.assertEqual(int(captured.dense_rows.count), 5)
 
-            inputs.stage(build_beam_forward_inputs(_decode_step((129, 300)), runner))
+            # The kept-rows part exists, the batch carries no rows to keep: it replays.
+            beam_only = build_beam_forward_inputs(_decode_step((129, 300)), runner)
+            self.assertIsNone(beam_only.dense_rows)
+            self.assertTrue(inputs.can_replay(beam_only, graph_size=512))
+            inputs.stage(beam_only)
             self.assertEqual(int(captured.dense_rows.count), 0)
 
     def test_too_many_requests_take_the_ordinary_path(self):
