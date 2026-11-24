@@ -87,8 +87,8 @@ def check_decode_graph_settings(*, deterministic_inference: bool) -> None:
             level,
         )
     for unused in (
-        envs.SGLANG_BEAM_DECODE_GRAPH_WIDTH,
-        envs.SGLANG_BEAM_DECODE_GRAPH_MAX_NEW_TOKENS,
+        envs.SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH,
+        envs.SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH_MAX_NEW_TOKENS,
     ):
         if unused.is_set():
             logger.warning(

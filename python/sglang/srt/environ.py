@@ -265,8 +265,9 @@ class BeamDecodeGraphLevel(IntEnum):
     attention. The values count levels of beam-width support; 1, one width per
     step, has no mode of its own.
 
-    FIXED_WIDTH: steps whose requests all have SGLANG_BEAM_DECODE_GRAPH_WIDTH
-        beams and whose rows equal a captured size.
+    FIXED_WIDTH: steps whose requests all have
+        SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH beams and whose rows equal a captured
+        size.
     MIXED_WIDTHS: steps of beam requests of any widths, padded to a captured size.
     MIXED_REQUESTS: MIXED_WIDTHS, plus, with the compact trie head, steps that
         also hold ordinary requests.
@@ -773,12 +774,12 @@ class Envs:
     # Replay all-beam decode batches that run the compact trie head or
     # shared-context attention as CUDA graphs.
     SGLANG_ENABLE_BEAM_DECODE_GRAPH = EnvBool(False)
-    # The one beam width those graphs serve under shared-context attention; a
-    # decode graph size holds this many rows per request.
-    SGLANG_BEAM_DECODE_GRAPH_WIDTH = EnvInt(2000)
-    # Most tokens a beam request generates inside a shared-context graph when the
-    # model bundles no trie; a trie fixes it at its codebook count.
-    SGLANG_BEAM_DECODE_GRAPH_MAX_NEW_TOKENS = EnvInt(None)
+    # The requests' beam width for those graphs under shared-context attention;
+    # unset captures none. A decode graph size holds this many rows per request.
+    SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH = EnvInt(None)
+    # Tokens such a graph holds per request when the model bundles no trie; a
+    # trie fixes it at its codebook count. A longer request decodes eagerly.
+    SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH_MAX_NEW_TOKENS = EnvInt(None)
     # BeamDecodeGraphLevel; above FIXED_WIDTH the two settings above are unused.
     SGLANG_BEAM_DECODE_GRAPH_LEVEL = EnvInt(BeamDecodeGraphLevel.FIXED_WIDTH)
     # MIXED_REQUESTS: most requests in a step with beam and ordinary requests that
