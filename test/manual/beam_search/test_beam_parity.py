@@ -6,6 +6,8 @@
 - Acceptance: sequence-set overlap vs HF transformers >= 0.8 for k in {2, 10}.
 - TestBeamParityDecodeGraph: the same acceptance on a server that replays
   all-beam decode batches as CUDA graphs.
+- TestBeamParityWidthFreeDecodeGraph: the same on graphs that take any beam
+  width (SGLANG_BEAM_DECODE_GRAPH_LEVEL=2).
 
 Manual test (GPU host): python3 test_beam_parity.py
 """
@@ -188,6 +190,34 @@ class TestBeamParityDecodeGraph(TestBeamParity):
         after = _decode_passes(self.base_url)
         self.assertGreater(after["decode_cuda_graph"], before["decode_cuda_graph"])
         self.assertEqual(after["decode_none"], before["decode_none"])
+
+
+class TestBeamParityWidthFreeDecodeGraph(TestBeamParity):
+    """The same acceptance at SGLANG_BEAM_DECODE_GRAPH_LEVEL=2: requests of both
+    beam widths replay graphs of the default decode graph sizes, with no width
+    and no token budget set."""
+
+    server_env = {
+        "SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION": "1",
+        "SGLANG_ENABLE_BEAM_DECODE_GRAPH": "1",
+        "SGLANG_BEAM_DECODE_GRAPH_LEVEL": "2",
+    }
+    # Shared-context attention needs FlashInfer decode attention.
+    server_args = ("--decode-attention-backend", "flashinfer", "--enable-metrics")
+
+    def test_every_beam_width_replays_a_beam_graph(self):
+        """Parity alone also passes when every beam batch falls back to eager
+        decode, or to the ordinary decode graph without shared-context attention."""
+        self.assertIn(
+            "(compact trie head off, shared-context attention on)",
+            self.server_log.getvalue(),
+        )
+        for beam_width in self.parity_beam_widths:
+            before = _decode_passes(self.base_url)
+            self._generate_beams(beam_width)
+            after = _decode_passes(self.base_url)
+            self.assertGreater(after["decode_cuda_graph"], before["decode_cuda_graph"])
+            self.assertEqual(after["decode_none"], before["decode_none"])
 
 
 if __name__ == "__main__":
