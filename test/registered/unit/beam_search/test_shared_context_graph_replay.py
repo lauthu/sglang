@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.kernels.ops.attention.beam_shared_context import shared_context_attention
-from sglang.srt.beam_search.decode_cuda_graph import (
+from sglang.srt.beam_search.beam_decode_cuda_graph_runner import (
     BeamGraphInputs,
     SharedContextCapacity,
 )
@@ -156,16 +156,16 @@ class TestWidthFreeGraphReplay(CustomTestCase):
                 self._replay_splits_in_one_graph(cases, stream_k=stream_k)
 
     def _replay_splits_in_one_graph(self, cases, *, stream_k):
-        captured_rows = 512
+        graph_size = 512
         first = cases[0]
         # The graph's own inputs; each replay stages a case into them.
         with torch.device("cuda"):
             graph_inputs = SimpleNamespace(
-                q=torch.zeros(captured_rows, *first.q.shape[1:], dtype=torch.bfloat16),
+                q=torch.zeros(graph_size, *first.q.shape[1:], dtype=torch.bfloat16),
                 k_buffer=torch.zeros_like(first.k_buffer),
                 v_buffer=torch.zeros_like(first.v_buffer),
-                req_pool_indices=torch.zeros(captured_rows, dtype=torch.int64),
-                seq_lens=torch.ones(captured_rows, dtype=torch.int64),
+                req_pool_indices=torch.zeros(graph_size, dtype=torch.int64),
+                seq_lens=torch.ones(graph_size, dtype=torch.int64),
                 softmax_scale=first.softmax_scale,
             )
             req_to_token = torch.zeros(
@@ -173,19 +173,19 @@ class TestWidthFreeGraphReplay(CustomTestCase):
                 dtype=torch.int32,
             )
         inputs = BeamGraphInputs(
-            max_rows=captured_rows,
+            max_rows=graph_size,
             device=req_to_token.device,
             trie_head=True,
             shared_context=None,
             ragged_layout=allocate_capture_layout(
-                max_rows=captured_rows,
+                max_rows=graph_size,
                 device=req_to_token.device,
                 req_to_token=req_to_token,
                 one_row_groups=True,
                 stream_k=stream_k,
             ),
         )
-        captured = inputs.for_capture(captured_rows).attention_metadata
+        captured = inputs.for_capture(graph_size).attention_metadata
         run_ragged(graph_inputs, captured, block_m=RAGGED_BLOCK_M)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -208,7 +208,7 @@ class TestWidthFreeGraphReplay(CustomTestCase):
                         stream_k=stream_k,
                     ),
                 )
-                self.assertTrue(inputs.can_replay(step, captured_rows=captured_rows))
+                self.assertTrue(inputs.can_replay(step, graph_size=graph_size))
                 inputs.stage(step)
                 graph.replay()
                 torch.cuda.synchronize()

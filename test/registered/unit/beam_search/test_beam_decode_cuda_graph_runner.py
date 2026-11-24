@@ -32,7 +32,7 @@ from sglang.srt.beam_search import (
     trie_output_head,
 )
 from sglang.srt.beam_search.batch_tail import BeamTailEntry
-from sglang.srt.beam_search.decode_cuda_graph import (
+from sglang.srt.beam_search.beam_decode_cuda_graph_runner import (
     BeamGraphInputs,
     SharedContextCapacity,
 )
@@ -108,7 +108,7 @@ class TestBeamGraphInputs(CustomTestCase):
                     torch.tensor([1, 2, 1, 2]) if trie_head else None,
                     _metadata(prompt_lens=[1, 2], decode_lens=[1, 2]),
                 )
-                self.assertTrue(inputs.can_replay(batch, captured_rows=4))
+                self.assertTrue(inputs.can_replay(batch, graph_size=4))
                 inputs.stage(batch)
 
                 if trie_head:
@@ -139,7 +139,7 @@ class TestBeamGraphInputs(CustomTestCase):
             decode_lens=[CAPACITY.max_decode, 1],
         )
         self.assertTrue(
-            inputs.can_replay(BeamForwardInputs(levels, at_capacity), captured_rows=4)
+            inputs.can_replay(BeamForwardInputs(levels, at_capacity), graph_size=4)
         )
 
         two_widths = _metadata(prompt_lens=[1, 1], decode_lens=[1, 1])
@@ -168,12 +168,12 @@ class TestBeamGraphInputs(CustomTestCase):
             "two widths in the batch": (levels, two_widths, 4),
             "ordinary attention": (levels, None, 4),
         }
-        for name, (trie_levels, metadata, captured_rows) in rejected.items():
+        for name, (trie_levels, metadata, graph_size) in rejected.items():
             with self.subTest(name):
                 self.assertFalse(
                     inputs.can_replay(
                         BeamForwardInputs(trie_levels, metadata),
-                        captured_rows=captured_rows,
+                        graph_size=graph_size,
                     )
                 )
 
@@ -186,11 +186,11 @@ class TestBeamGraphInputs(CustomTestCase):
         inputs.for_capture(4)
         levels = torch.zeros(3, dtype=torch.int64)
         self.assertTrue(
-            inputs.can_replay(BeamForwardInputs(levels, None), captured_rows=4)
+            inputs.can_replay(BeamForwardInputs(levels, None), graph_size=4)
         )
         shared = _metadata(prompt_lens=[1, 1], decode_lens=[1, 1])
         self.assertFalse(
-            inputs.can_replay(BeamForwardInputs(levels, shared), captured_rows=4)
+            inputs.can_replay(BeamForwardInputs(levels, shared), graph_size=4)
         )
 
 
@@ -321,7 +321,7 @@ class TestWidthFreeBeamGraphInputs(CustomTestCase):
             beam = build_beam_forward_inputs(_decode_step((2, 129, 300)), runner)
             self.assertEqual(beam.trie_levels.shape[0], 431)
             self.assertIsNone(beam.dense_rows)
-            self.assertTrue(inputs.can_replay(beam, captured_rows=512))
+            self.assertTrue(inputs.can_replay(beam, graph_size=512))
             inputs.stage(beam)
 
             layout = inputs.ragged_layout.layout
@@ -339,7 +339,7 @@ class TestWidthFreeBeamGraphInputs(CustomTestCase):
                 _decode_step((2, 129, 300)), _model_runner(compact_head=False)
             )
             self.assertIsNone(beam.trie_levels)
-            self.assertTrue(inputs.can_replay(beam, captured_rows=512))
+            self.assertTrue(inputs.can_replay(beam, graph_size=512))
             inputs.stage(beam)
             self.assertEqual(
                 sorted(_rows_in_tiles(inputs.ragged_layout.layout)), list(range(431))
@@ -357,7 +357,7 @@ class TestWidthFreeBeamGraphInputs(CustomTestCase):
             )
             self.assertIsNotNone(beam.trie_levels)
             self.assertIsNone(beam.attention_metadata)
-            self.assertFalse(inputs.can_replay(beam, captured_rows=512))
+            self.assertFalse(inputs.can_replay(beam, graph_size=512))
 
     def test_level_rejects_what_it_cannot_run(self):
         """Level 1 has no mode of its own, level 0 has only its own kernel, and
@@ -409,7 +409,7 @@ class TestMixedRequestBeamSteps(CustomTestCase):
 
             beam = build_beam_forward_inputs(step, runner)
             self.assertEqual(beam.trie_levels[:5].tolist(), [0, 1, 1, 0, 1])
-            self.assertTrue(inputs.can_replay(beam, captured_rows=512))
+            self.assertTrue(inputs.can_replay(beam, graph_size=512))
             inputs.stage(beam)
 
             layout = inputs.ragged_layout.layout
