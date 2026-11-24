@@ -172,14 +172,6 @@ def allocate_capture_layout(
     )
 
 
-def stage_graph_metadata(
-    target: RaggedBeamAttentionMetadata, source: RaggedBeamAttentionMetadata
-) -> None:
-    """Copy a step's layout into a captured buffer, which holds any step of at most
-    its graphs' rows; the counts bound what the kernels read of older steps."""
-    target.layout[: len(source.layout)].copy_(source.layout)
-
-
 def forward(
     q: torch.Tensor,
     layer: RadixAttention,

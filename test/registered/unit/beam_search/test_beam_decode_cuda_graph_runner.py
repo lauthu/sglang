@@ -11,7 +11,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""What a beam decode graph replays: the staged batch, and only a batch it holds."""
+"""What a beam decode graph replays: the batch loaded into its buffers, and only
+a batch that fits them."""
 
 import contextlib
 import itertools
@@ -36,7 +37,7 @@ from sglang.srt.beam_search.beam_decode_cuda_graph_runner import (
     FixedWidthCapacity,
     TrieLevelsInput,
     WidthFreeAttentionInput,
-    _beam_graph_inputs,
+    _create_beam_graph_inputs,
 )
 from sglang.srt.beam_search.decode_graph_level import (
     check_decode_graph_settings,
@@ -61,15 +62,15 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-CAPACITY = FixedWidthCapacity(beam_width=2, max_context=4, max_decode=3)
+CAPACITY = FixedWidthCapacity(beam_width=2, max_context_len=4, max_decode_len=3)
 
 
 def _inputs(max_rows, *, trie_head=True, shared_context=True) -> BeamGraphInputs:
     return BeamGraphInputs(
-        trie_levels=(
+        trie_levels_input=(
             TrieLevelsInput(max_rows=max_rows, device="cpu") if trie_head else None
         ),
-        attention=(
+        attention_input=(
             FixedWidthAttentionInput(max_rows=max_rows, device="cpu", capacity=CAPACITY)
             if shared_context
             else None
@@ -103,46 +104,46 @@ def _metadata(prompt_lens, decode_lens, width=2) -> BeamAttentionMetadata:
 
 
 class TestBeamGraphInputs(CustomTestCase):
-    def test_staging_refreshes_every_tensor_the_graph_reads(self):
-        """A graph reads its inputs by address: a batch tensor that staging
+    def test_loading_refreshes_every_tensor_the_graph_reads(self):
+        """A graph reads its inputs by address: a batch tensor that loading
         skips leaves the previous batch's values in the replay. Under the dense
         LM head a batch carries no trie levels and replays all the same."""
         for trie_head in (True, False):
             with self.subTest(trie_head=trie_head):
                 inputs = _inputs(8, trie_head=trie_head)
-                captured = inputs.for_capture(4)
+                captured = inputs.prepare_capture_inputs(4)
                 batch = BeamForwardInputs(
                     torch.tensor([1, 2, 1, 2]) if trie_head else None,
                     _metadata(prompt_lens=[1, 2], decode_lens=[1, 2]),
                 )
                 self.assertTrue(inputs.can_replay(batch, graph_size=4))
-                inputs.stage(batch)
+                inputs.load_replay_inputs(batch)
 
                 if trie_head:
                     self.assertEqual(captured.trie_levels.tolist(), [1, 2, 1, 2])
                 captured_bucket = captured.attention_metadata.buckets[0]
-                source = batch.attention_metadata.buckets[0]
+                batch_bucket = batch.attention_metadata.buckets[0]
                 tensors = 0
                 for field in msgspec.structs.fields(BeamAttentionBucket):
-                    value = getattr(source, field.name)
+                    value = getattr(batch_bucket, field.name)
                     if not isinstance(value, torch.Tensor):
                         continue
                     tensors += 1
-                    staged = getattr(captured_bucket, field.name)[
+                    loaded = getattr(captured_bucket, field.name)[
                         tuple(map(slice, value.shape))
                     ]
-                    self.assertEqual(staged.tolist(), value.tolist(), field.name)
+                    self.assertEqual(loaded.tolist(), value.tolist(), field.name)
                 self.assertEqual(tensors, 5)
 
-    def test_only_a_batch_the_graph_holds_replays(self):
+    def test_only_a_batch_that_fits_the_graph_replays(self):
         """Replaying a beam graph for a batch that does not fit its buffers
         returns the attention of other slots; such a batch runs eagerly."""
         inputs = _inputs(8)
-        inputs.for_capture(4)
+        inputs.prepare_capture_inputs(4)
         levels = torch.zeros(4, dtype=torch.int64)
         at_capacity = _metadata(
-            prompt_lens=[CAPACITY.max_context] * 2,
-            decode_lens=[CAPACITY.max_decode, 1],
+            prompt_lens=[CAPACITY.max_context_len] * 2,
+            decode_lens=[CAPACITY.max_decode_len, 1],
         )
         self.assertTrue(
             inputs.can_replay(BeamForwardInputs(levels, at_capacity), graph_size=4)
@@ -163,7 +164,9 @@ class TestBeamGraphInputs(CustomTestCase):
             ),
             "decode steps past the capacity": (
                 levels,
-                _metadata(prompt_lens=[1, 1], decode_lens=[CAPACITY.max_decode + 1, 1]),
+                _metadata(
+                    prompt_lens=[1, 1], decode_lens=[CAPACITY.max_decode_len + 1, 1]
+                ),
                 4,
             ),
             "another beam width": (
@@ -187,7 +190,7 @@ class TestBeamGraphInputs(CustomTestCase):
         """Without shared-context attention a beam graph holds FlashInfer
         attention, which a batch with shared-context metadata does not run."""
         inputs = _inputs(4, shared_context=False)
-        inputs.for_capture(4)
+        inputs.prepare_capture_inputs(4)
         levels = torch.zeros(3, dtype=torch.int64)
         self.assertTrue(
             inputs.can_replay(BeamForwardInputs(levels, None), graph_size=4)
@@ -210,14 +213,14 @@ class TestFixedWidthAttentionInput(CustomTestCase):
             model_config=SimpleNamespace(context_len=16),
         )
         cases = (
-            # (width, max new tokens, trie codebooks) -> max_decode, or None for no graph
+            # (width, max new tokens, trie codebooks) -> max_decode_len, or None for no graph
             ((None, 4, None), None),
             ((2, None, None), None),
             ((2, 4, None), 3),
             ((2, None, 3), 2),
             ((2, 8, 3), 2),
         )
-        for (width, max_new_tokens, codebooks), max_decode in cases:
+        for (width, max_new_tokens, codebooks), max_decode_len in cases:
             trie_config = (
                 None if codebooks is None else SimpleNamespace(num_codebooks=codebooks)
             )
@@ -236,13 +239,15 @@ class TestFixedWidthAttentionInput(CustomTestCase):
                 ),
             ):
                 attention = FixedWidthAttentionInput.create(runner, max_rows=8)
-                if max_decode is None:
+                if max_decode_len is None:
                     self.assertIsNone(attention)
                 else:
                     self.assertEqual(
                         attention.capacity,
                         FixedWidthCapacity(
-                            beam_width=2, max_context=16, max_decode=max_decode
+                            beam_width=2,
+                            max_context_len=16,
+                            max_decode_len=max_decode_len,
                         ),
                     )
 
@@ -325,17 +330,17 @@ def _decode_step(widths, prompt_len=7, decode_len=2):
 def _width_free_inputs(max_rows, *, level, trie_head=True):
     keeps_dense_rows = trie_head and level >= BeamDecodeGraphLevel.MIXED_REQUESTS
     return BeamGraphInputs(
-        trie_levels=(
+        trie_levels_input=(
             TrieLevelsInput(max_rows=max_rows, device="cpu") if trie_head else None
         ),
-        attention=WidthFreeAttentionInput(
+        attention_input=WidthFreeAttentionInput(
             max_rows=max_rows,
             device="cpu",
             req_to_token=torch.zeros(4, 8, dtype=torch.int32),
             one_row_groups=keeps_dense_rows,
             stream_k=False,
         ),
-        dense_rows=(
+        dense_rows_input=(
             DenseRowsInput(max_rows=max_rows, vocab_size=16, device="cpu")
             if keeps_dense_rows
             else None
@@ -344,7 +349,7 @@ def _width_free_inputs(max_rows, *, level, trie_head=True):
 
 
 def _tables(layout):
-    """A layout buffer's counts and its staged group and tile tables."""
+    """A layout buffer's counts and its loaded group and tile tables."""
     num_groups, num_tiles, num_rows = layout[:3].tolist()
     groups = layout[3 : 3 + 4 * num_groups].view(-1, 4).tolist()
     tiles = layout[3 + 4 * num_groups :][: 2 * num_tiles].view(-1, 2).tolist()
@@ -352,7 +357,7 @@ def _tables(layout):
 
 
 def _rows_in_tiles(layout):
-    """Every row the staged tiles cover, tile by tile."""
+    """Every row the loaded tiles cover, tile by tile."""
     _, groups, tiles = _tables(layout)
     rows = []
     for group, first_beam in tiles:
@@ -387,33 +392,35 @@ class TestWidthFreeBeamGraphInputs(CustomTestCase):
                         return_value=_TRIE_CONFIG,
                     ),
                 ):
-                    inputs = _beam_graph_inputs(
+                    inputs = _create_beam_graph_inputs(
                         _model_runner(compact_head=compact_head, lora=lora)
                     )
                 if holds is None:
                     self.assertIsNone(inputs)
                     continue
                 attention, keeps_rows = holds
-                self.assertIs(type(inputs.attention), attention)
-                self.assertEqual(inputs.dense_rows is not None, keeps_rows)
-                self.assertEqual(inputs.trie_levels is not None, compact_head)
-                self.assertEqual(inputs.supports_rows(3), level != 0)
+                self.assertIs(type(inputs.attention_input), attention)
+                self.assertEqual(inputs.dense_rows_input is not None, keeps_rows)
+                self.assertEqual(inputs.trie_levels_input is not None, compact_head)
+                self.assertEqual(inputs.can_capture(3), level != 0)
 
-    def test_any_split_stages_into_a_larger_graph(self):
+    def test_any_split_loads_into_a_larger_graph(self):
         """Level 2 graphs take a batch of any widths and fewer rows than they
-        hold: over a larger earlier batch's tables, the staged tiles must cover
+        hold: over a larger earlier batch's tables, the loaded tiles must cover
         each of its rows exactly once."""
         with _decode_graph_level(2):
             inputs = _width_free_inputs(max_rows=600, level=2)
-            self.assertTrue(inputs.supports_rows(431))
-            captured = inputs.for_capture(512)
+            self.assertTrue(inputs.can_capture(431))
+            captured = inputs.prepare_capture_inputs(512)
             runner = _model_runner()
-            inputs.stage(build_beam_forward_inputs(_decode_step((300, 300)), runner))
+            inputs.load_replay_inputs(
+                build_beam_forward_inputs(_decode_step((300, 300)), runner)
+            )
             beam = build_beam_forward_inputs(_decode_step((2, 129, 300)), runner)
             self.assertEqual(beam.trie_levels.shape[0], 431)
             self.assertIsNone(beam.dense_rows)
             self.assertTrue(inputs.can_replay(beam, graph_size=512))
-            inputs.stage(beam)
+            inputs.load_replay_inputs(beam)
 
             layout = captured.attention_metadata.layout
             num_rows, groups, _ = _tables(layout)
@@ -425,14 +432,14 @@ class TestWidthFreeBeamGraphInputs(CustomTestCase):
         layout and no trie levels; a graph captured without levels replays it."""
         with _decode_graph_level(2):
             inputs = _width_free_inputs(max_rows=600, level=2, trie_head=False)
-            captured = inputs.for_capture(512)
+            captured = inputs.prepare_capture_inputs(512)
             self.assertIsNone(captured.trie_levels)
             beam = build_beam_forward_inputs(
                 _decode_step((2, 129, 300)), _model_runner(compact_head=False)
             )
             self.assertIsNone(beam.trie_levels)
             self.assertTrue(inputs.can_replay(beam, graph_size=512))
-            inputs.stage(beam)
+            inputs.load_replay_inputs(beam)
             self.assertEqual(
                 sorted(_rows_in_tiles(captured.attention_metadata.layout)),
                 list(range(431)),
@@ -444,7 +451,7 @@ class TestWidthFreeBeamGraphInputs(CustomTestCase):
         batch's groups."""
         with _decode_graph_level(2):
             inputs = _width_free_inputs(max_rows=600, level=2)
-            inputs.for_capture(512)
+            inputs.prepare_capture_inputs(512)
             beam = build_beam_forward_inputs(
                 _decode_step((129, 0, 300)), _model_runner()
             )
@@ -498,12 +505,12 @@ class TestMixedRequestBeamSteps(CustomTestCase):
                 build_beam_forward_inputs(step, _model_runner(compact_head=False))
             )
             inputs = _width_free_inputs(max_rows=600, level=3)
-            captured = inputs.for_capture(512)
+            captured = inputs.prepare_capture_inputs(512)
 
             beam = build_beam_forward_inputs(step, runner)
             self.assertEqual(beam.trie_levels[:5].tolist(), [0, 1, 1, 0, 1])
             self.assertTrue(inputs.can_replay(beam, graph_size=512))
-            inputs.stage(beam)
+            inputs.load_replay_inputs(beam)
 
             layout = captured.attention_metadata.layout
             num_rows, groups, _ = _tables(layout)
@@ -518,7 +525,7 @@ class TestMixedRequestBeamSteps(CustomTestCase):
             beam_only = build_beam_forward_inputs(_decode_step((129, 300)), runner)
             self.assertIsNone(beam_only.dense_rows)
             self.assertTrue(inputs.can_replay(beam_only, graph_size=512))
-            inputs.stage(beam_only)
+            inputs.load_replay_inputs(beam_only)
             self.assertEqual(int(captured.dense_rows.count), 0)
 
     def test_too_many_requests_take_the_ordinary_path(self):

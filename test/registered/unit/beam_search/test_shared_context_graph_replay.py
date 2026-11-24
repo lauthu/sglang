@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Shared-context beam graphs replay the batch staged into their shared buffers,
+"""Shared-context beam graphs replay the batch loaded into their shared buffers,
 and the trie head keeps ordinary requests' full-vocabulary rows on the way."""
 
 import unittest
@@ -46,8 +46,8 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=40, stage="base-b", runner_config="1-gpu-small")
 
 WIDTH = 8
-CAPACITY = FixedWidthCapacity(beam_width=WIDTH, max_context=8, max_decode=3)
-# A KV slot no staged batch uses: reading it changes the result.
+CAPACITY = FixedWidthCapacity(beam_width=WIDTH, max_context_len=8, max_decode_len=3)
+# A KV slot no loaded batch uses: reading it changes the result.
 STALE_SLOT = 63
 
 
@@ -88,28 +88,29 @@ def _batch(groups, context, prompt_offsets, decode_lens, *, flip):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestSharedContextGraphReplay(CustomTestCase):
-    def test_graphs_of_two_sizes_replay_the_staged_batch(self):
+    def test_graphs_of_two_sizes_replay_the_loaded_batch(self):
         """Graphs of every size read one set of buffers. Each replay must follow
-        the staged lengths, slots and row mapping of its own batch, and read no
-        slot past them, where another batch's values remain."""
+        the lengths, slots and row mapping of the batch loaded for it, and read
+        no slot past them, where another batch's values remain."""
         torch.manual_seed(17)
         q = torch.randn((2 * WIDTH, 4, 64), dtype=torch.bfloat16, device="cuda")
         k = torch.randn((64, 2, 64), dtype=torch.bfloat16, device="cuda")
         v = torch.randn_like(k)
         inputs = BeamGraphInputs(
-            trie_levels=None,
-            attention=FixedWidthAttentionInput(
+            trie_levels_input=None,
+            attention_input=FixedWidthAttentionInput(
                 max_rows=2 * WIDTH, device="cuda", capacity=CAPACITY
             ),
         )
 
         graphs = {}
         for rows in (2 * WIDTH, WIDTH):
-            static = inputs.for_capture(rows).attention_metadata.buckets[0]
-            _attention(q[:rows], k, v, static)
+            captured = inputs.prepare_capture_inputs(rows)
+            graph_bucket = captured.attention_metadata.buckets[0]
+            _attention(q[:rows], k, v, graph_bucket)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                output = _attention(q[:rows], k, v, static)
+                output = _attention(q[:rows], k, v, graph_bucket)
             graphs[rows] = (graph, output)
 
         batches = (
@@ -118,12 +119,13 @@ class TestSharedContextGraphReplay(CustomTestCase):
             _batch(2, [7, 6, 5], [0, 2, 3], [2, 1], flip=True),
             _batch(1, [1, 2], [0, 2], [1], flip=False),
         )
-        static = inputs.for_capture(2 * WIDTH).attention_metadata.buckets[0]
+        largest = inputs.prepare_capture_inputs(2 * WIDTH)
+        graph_bucket = largest.attention_metadata.buckets[0]
         for metadata in batches:
-            static.context_slots.fill_(STALE_SLOT)
-            static.decode_slots.fill_(STALE_SLOT)
+            graph_bucket.context_slots.fill_(STALE_SLOT)
+            graph_bucket.decode_slots.fill_(STALE_SLOT)
             rows = metadata.num_rows
-            inputs.stage(BeamForwardInputs(None, metadata))
+            inputs.load_replay_inputs(BeamForwardInputs(None, metadata))
             graph, output = graphs[rows]
             graph.replay()
             torch.testing.assert_close(
@@ -138,7 +140,7 @@ class TestSharedContextGraphReplay(CustomTestCase):
 class TestWidthFreeGraphReplay(CustomTestCase):
     def test_graph_captured_once_replays_any_split(self):
         """Nothing about widths, group count or lengths is recorded at capture: one
-        beam graph replays every split staged into its layout, ordinary requests as
+        beam graph replays every split loaded into its layout, ordinary requests as
         one-row groups included, and padded rows read 0. With stream-K, the steps
         alternate between splitting the units and whole tiles per CTA (40 tiles)."""
         cases = tuple(
@@ -175,8 +177,8 @@ class TestWidthFreeGraphReplay(CustomTestCase):
                 dtype=torch.int32,
             )
         inputs = BeamGraphInputs(
-            trie_levels=TrieLevelsInput(max_rows=graph_size, device="cuda"),
-            attention=WidthFreeAttentionInput(
+            trie_levels_input=TrieLevelsInput(max_rows=graph_size, device="cuda"),
+            attention_input=WidthFreeAttentionInput(
                 max_rows=graph_size,
                 device=req_to_token.device,
                 req_to_token=req_to_token,
@@ -184,7 +186,7 @@ class TestWidthFreeGraphReplay(CustomTestCase):
                 stream_k=stream_k,
             ),
         )
-        captured = inputs.for_capture(graph_size).attention_metadata
+        captured = inputs.prepare_capture_inputs(graph_size).attention_metadata
         run_ragged(graph_inputs, captured, block_m=RAGGED_BLOCK_M)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -208,7 +210,7 @@ class TestWidthFreeGraphReplay(CustomTestCase):
                     ),
                 )
                 self.assertTrue(inputs.can_replay(step, graph_size=graph_size))
-                inputs.stage(step)
+                inputs.load_replay_inputs(step)
                 graph.replay()
                 torch.cuda.synchronize()
                 torch.testing.assert_close(

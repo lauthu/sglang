@@ -127,9 +127,3 @@ def allocate_capture_dense_rows(
         count=torch.zeros(1, dtype=torch.int32, device=device),
         logits=torch.empty((num_rows, vocab_size), dtype=torch.float32, device=device),
     )
-
-
-def stage_dense_rows(target: BeamDenseRows, step: Optional[BeamDenseRows]) -> None:
-    """Set a captured graph's kept-row count to this step's, 0 for a beam-only
-    step. A step that replays has at most the request cap's rows to keep."""
-    target.count.fill_(0 if step is None else step.num_rows)
