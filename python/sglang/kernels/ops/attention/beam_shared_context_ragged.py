@@ -11,20 +11,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Shared-context beam attention for any split of a step's rows into groups.
+"""Shared-context beam attention for any split of a batch's rows into groups.
 
 A group is one request: a leader row plus member rows that share its prompt KV.
-Groups may have any width, so one launch serves every width in a step and a
+Groups may have any width, so one launch serves every width in a batch and a
 CUDA graph captured for a row count replays for any split of those rows.
 
-The per-step layout is one int32 tensor, read on the GPU, its parts back to back:
+The per-batch layout is one int32 tensor, read on the GPU, its parts back to back:
 - counts: [groups, tiles, real rows]
 - groups: 4 per group, (leader row, first member row, members, prompt length);
   member rows are contiguous
 - tiles: 2 per tile, (group, first beam); beam 0 is the leader and a tile covers
   block_m beams of one group
 - for the stream-K kernel, its schedule (beam_shared_context_ragged_stream_k.py)
-A buffer may be longer than its step's layout: the counts bound what is read.
+A buffer may be longer than its batch's layout: the counts bound what is read.
 
 KV slots come from req_to_token: the prompt through the leader's pool row and
 each beam's decode tokens through its own pool row, up to its sequence length.

@@ -32,21 +32,22 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 import torch
 
-from sglang.srt.beam_search import mixed_requests, shared_context_attention
+from sglang.srt.beam_search import mixed_batch, shared_context_attention
 from sglang.srt.beam_search import shared_context_ragged as ragged
-from sglang.srt.beam_search.decode_graph_level import (
-    decode_graph_level,
+from sglang.srt.beam_search.decode_graph_settings import (
+    mixed_batch_enabled,
     stream_k_selected,
+    width_free_graphs_enabled,
 )
 from sglang.srt.beam_search.forward_inputs import BeamForwardInputs
-from sglang.srt.beam_search.mixed_requests import BeamDenseRows
+from sglang.srt.beam_search.mixed_batch import BeamDenseRows
 from sglang.srt.beam_search.shared_context_attention import (
     BeamAttentionBucket,
     BeamAttentionMetadata,
 )
 from sglang.srt.beam_search.shared_context_ragged import RaggedBeamAttentionMetadata
 from sglang.srt.beam_search.trie_config import get_beam_trie_config
-from sglang.srt.environ import BeamDecodeGraphLevel, envs
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
@@ -281,8 +282,8 @@ class FixedWidthAttentionInput:
 
 
 class WidthFreeAttentionInput:
-    """Graph buffer for shared-context attention with any beam widths, at
-    SGLANG_BEAM_DECODE_GRAPH_LEVEL 2 and 3.
+    """Graph buffer for shared-context attention with any beam widths, used when
+    SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH is unset.
 
     A batch describes its beam groups in one layout that the kernels read at run
     time (shared_context_ragged):
@@ -301,7 +302,7 @@ class WidthFreeAttentionInput:
         max_rows: int,
         device,
         req_to_token: torch.Tensor,
-        one_row_groups: bool,
+        allow_one_row_groups: bool,
         stream_k: bool,
     ):
         # Capture-time value: all zeros, which is a launch that does no work.
@@ -309,13 +310,13 @@ class WidthFreeAttentionInput:
             max_rows=max_rows,
             device=device,
             req_to_token=req_to_token,
-            one_row_groups=one_row_groups,
+            allow_one_row_groups=allow_one_row_groups,
             stream_k=stream_k,
         )
 
     @classmethod
     def create(
-        cls, model_runner: ModelRunner, *, max_rows: int, one_row_groups: bool
+        cls, model_runner: ModelRunner, *, max_rows: int, allow_one_row_groups: bool
     ) -> Optional[WidthFreeAttentionInput]:
         """Returns None, and logs why, when shared-context batches get no graph."""
         if model_runner.lora_manager is not None:
@@ -328,7 +329,7 @@ class WidthFreeAttentionInput:
             max_rows=max_rows,
             device=model_runner.device,
             req_to_token=model_runner.req_to_token_pool.req_to_token,
-            one_row_groups=one_row_groups,
+            allow_one_row_groups=allow_one_row_groups,
             stream_k=stream_k_selected(),
         )
 
@@ -351,17 +352,17 @@ class WidthFreeAttentionInput:
 
 
 class DenseRowsInput:
-    """Graph buffer for the full-vocabulary rows kept for ordinary requests, at
-    SGLANG_BEAM_DECODE_GRAPH_LEVEL 3 with the compact trie head.
+    """Graph buffer for the full-vocabulary rows kept for regular requests, with
+    SGLANG_ENABLE_BEAM_DECODE_GRAPH_MIXED_BATCH and the compact trie head.
 
     - Every graph writes the rows it is told to keep into one buffer of
-      SGLANG_BEAM_DECODE_GRAPH_MAX_MIXED_REQUESTS rows.
+      SGLANG_BEAM_DECODE_GRAPH_MIXED_BATCH_MAX_REQUESTS rows.
     - A batch of beam requests alone carries no rows to keep; it replays with a
       count of 0.
     """
 
     def __init__(self, *, max_rows: int, vocab_size: int, device):
-        self._graph_dense_rows = mixed_requests.allocate_capture_dense_rows(
+        self._graph_dense_rows = mixed_batch.allocate_capture_dense_rows(
             max_rows=max_rows, vocab_size=vocab_size, device=device
         )
 
@@ -374,7 +375,7 @@ class DenseRowsInput:
     def can_replay(
         self, dense_rows: Optional[BeamDenseRows], *, graph_size: int
     ) -> bool:
-        # Admission keeps a batch with ordinary requests within the buffer's rows.
+        # A mixed batch on the beam path is within the request cap, so its rows fit.
         return True
 
     def load_replay_inputs(self, dense_rows: Optional[BeamDenseRows]) -> None:
@@ -469,23 +470,25 @@ def _create_beam_graph_inputs(model_runner: ModelRunner) -> Optional[BeamGraphIn
     """Returns None, and logs why, when no all-beam batch could replay a beam graph."""
     # Rows of the largest decode graph; the shared logits buffer holds as many.
     max_rows = model_runner.max_decode_logits_rows()
-    level = decode_graph_level()
-    # Level 3 keeps ordinary requests' rows where the compact head streams them.
-    keeps_dense_rows = (
-        model_runner.beam_trie_compact_enabled
-        and level >= BeamDecodeGraphLevel.MIXED_REQUESTS
-    )
+    # A mixed batch keeps regular requests' rows where the compact head streams
+    # them.
+    keeps_dense_rows = model_runner.beam_trie_compact_enabled and mixed_batch_enabled()
+    if mixed_batch_enabled() and not keeps_dense_rows:
+        logger.warning(
+            "SGLANG_ENABLE_BEAM_DECODE_GRAPH_MIXED_BATCH is set, but the compact "
+            "trie output head is off; batches that mix beam and regular requests "
+            "run the ordinary decode path."
+        )
     attention_input = None
     if shared_context_attention.enabled() and (
         shared_context_attention.supports_shared_context(model_runner)
     ):
-        # One beam width per graph at level 0; any widths above it.
         attention_input = (
-            FixedWidthAttentionInput.create(model_runner, max_rows=max_rows)
-            if level < BeamDecodeGraphLevel.MIXED_WIDTHS
-            else WidthFreeAttentionInput.create(
-                model_runner, max_rows=max_rows, one_row_groups=keeps_dense_rows
+            WidthFreeAttentionInput.create(
+                model_runner, max_rows=max_rows, allow_one_row_groups=keeps_dense_rows
             )
+            if width_free_graphs_enabled()
+            else FixedWidthAttentionInput.create(model_runner, max_rows=max_rows)
         )
         if attention_input is None:
             # Every all-beam batch carries shared-context metadata on this server,
@@ -527,24 +530,23 @@ class BeamDecodeCudaGraphRunner(DecodeCudaGraphRunner):
     attention, or both. A beam graph replays a decode batch made only of beam
     requests:
 
-    - With shared-context attention at SGLANG_BEAM_DECODE_GRAPH_LEVEL 0:
-        - Only sizes that are a multiple of SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH
-          get a beam graph.
+    - With shared-context attention and SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH set:
+        - Only sizes that are a multiple of that width get a beam graph.
         - Every request has that beam width.
         - The batch's rows (requests x width) equal a captured size.
         - Every request is within the graphs' token budget: the trie's codebook
           count, or SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH_MAX_NEW_TOKENS on a
           model without a trie.
-    - With shared-context attention at levels 2 and 3, or with the compact trie
+    - With shared-context attention and no fixed width, or with the compact trie
       head on ordinary attention:
         - Every size gets a beam graph.
         - Requests may differ in beam width.
         - The batch pads to the next captured size like any decode batch.
 
-    At level 3 with the compact trie head, a beam graph also replays a batch that
-    mixes beam and regular requests, up to
-    SGLANG_BEAM_DECODE_GRAPH_MAX_MIXED_REQUESTS requests, and keeps the regular
-    requests' full-vocabulary logits.
+    With SGLANG_ENABLE_BEAM_DECODE_GRAPH_MIXED_BATCH and the compact trie head, a
+    beam graph also replays a batch that mixes beam and regular requests, up to
+    SGLANG_BEAM_DECODE_GRAPH_MIXED_BATCH_MAX_REQUESTS requests, and keeps the
+    regular requests' full-vocabulary logits.
 
     Every other batch runs as it does on the parent:
 

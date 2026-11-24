@@ -7,7 +7,7 @@
 - TestBeamParityDecodeGraph: the same acceptance on a server that replays
   all-beam decode batches as CUDA graphs.
 - TestBeamParityWidthFreeDecodeGraph: the same on graphs that take any beam
-  width (SGLANG_BEAM_DECODE_GRAPH_LEVEL=2).
+  width (no SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH).
 
 Manual test (GPU host): python3 test_beam_parity.py
 """
@@ -193,9 +193,9 @@ class TestBeamParityDecodeGraph(TestBeamParity):
 
 
 class TestBeamParityWidthFreeDecodeGraph(TestBeamParity):
-    """The same acceptance at SGLANG_BEAM_DECODE_GRAPH_LEVEL=2: requests of any
-    beam width replay graphs of the default decode graph sizes, with no width
-    and no token budget set."""
+    """The same acceptance on the width-free graphs: requests of any beam width
+    replay graphs of the default decode graph sizes, with no width and no token
+    budget set."""
 
     # At 2 beams this prompt's search sits on a near-tie between two prefixes, which
     # attention implementations resolve differently by rounding; see the class above.
@@ -203,7 +203,6 @@ class TestBeamParityWidthFreeDecodeGraph(TestBeamParity):
     server_env = {
         "SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION": "1",
         "SGLANG_ENABLE_BEAM_DECODE_GRAPH": "1",
-        "SGLANG_BEAM_DECODE_GRAPH_LEVEL": "2",
     }
     # Shared-context attention needs FlashInfer decode attention.
     server_args = ("--decode-attention-backend", "flashinfer", "--enable-metrics")

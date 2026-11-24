@@ -23,13 +23,14 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 import torch
 
-from sglang.srt.beam_search import mixed_requests
+from sglang.srt.beam_search import mixed_batch
 from sglang.srt.beam_search import shared_context_ragged as ragged
-from sglang.srt.beam_search.decode_graph_level import (
-    decode_graph_level,
+from sglang.srt.beam_search.decode_graph_settings import (
+    mixed_batch_enabled,
     stream_k_selected,
+    width_free_graphs_enabled,
 )
-from sglang.srt.environ import BeamDecodeGraphLevel, envs
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -124,16 +125,15 @@ def build_metadata(
     entries = batch.beam_tail.entries
     if not entries or batch.seq_lens_cpu is None:
         return None
-    level = decode_graph_level()
-    if level >= BeamDecodeGraphLevel.MIXED_WIDTHS:
+    if width_free_graphs_enabled():
         return ragged.build_ragged_metadata(
             batch=batch,
             req_to_token=model_runner.req_to_token_pool.req_to_token,
             # Without the compact head no row keeps full-vocabulary logits, and a
-            # step with other rows runs the ordinary decode path, as at level 0.
-            one_row_groups=level >= BeamDecodeGraphLevel.MIXED_REQUESTS
+            # batch with regular requests runs the ordinary decode path.
+            allow_one_row_groups=mixed_batch_enabled()
             and model_runner.beam_trie_compact_enabled
-            and mixed_requests.admits(batch),
+            and mixed_batch.runs_beam_path(batch),
             stream_k=stream_k_selected(),
         )
     return _build_width_buckets(batch=batch, model_runner=model_runner)

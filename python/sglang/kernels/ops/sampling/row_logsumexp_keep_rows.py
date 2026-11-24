@@ -1,10 +1,10 @@
 """Row logsumexp that also keeps the leading input rows, counted on the GPU.
 
 The trie output head streams the full vocabulary through ``row_logsumexp`` for
-its normalizer. Ordinary requests decoding next to beam requests need those
+its normalizer. Regular requests decoding next to beam requests need those
 full-vocabulary logits for sampling, so this variant also writes the first
 ``kept_count[0]`` rows out as fp32 in the same pass. The count is read on the
-GPU, so one CUDA graph keeps any number of rows, and none in a beam-only step.
+GPU, so one CUDA graph keeps any number of rows, and none in a beam-only batch.
 
 The ``(max, log_sum)`` outputs are those of ``row_logsumexp``: same block size,
 same per-block accumulation.

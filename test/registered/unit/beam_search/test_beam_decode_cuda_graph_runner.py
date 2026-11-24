@@ -25,7 +25,8 @@ import torch
 
 from sglang.srt.beam_search import (
     beam_decode_cuda_graph_runner,
-    mixed_requests,
+    decode_graph_settings,
+    mixed_batch,
     shared_context_attention,
     trie_output_head,
 )
@@ -39,16 +40,12 @@ from sglang.srt.beam_search.beam_decode_cuda_graph_runner import (
     WidthFreeAttentionInput,
     _create_beam_graph_inputs,
 )
-from sglang.srt.beam_search.decode_graph_level import (
-    check_decode_graph_settings,
-    decode_graph_level,
-)
 from sglang.srt.beam_search.forward_inputs import (
     BeamForwardInputs,
     build_beam_forward_inputs,
 )
 from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
-from sglang.srt.beam_search.mixed_requests import BeamDenseRows
+from sglang.srt.beam_search.mixed_batch import BeamDenseRows
 from sglang.srt.beam_search.shared_context_attention import (
     BeamAttentionBucket,
     BeamAttentionMetadata,
@@ -56,7 +53,7 @@ from sglang.srt.beam_search.shared_context_attention import (
 from sglang.srt.beam_search.shared_context_ragged import RAGGED_BLOCK_M
 from sglang.srt.beam_search.trie_config import TrieOutputHeadConfig
 from sglang.srt.beam_search.trie_output_head import BeamTrieOutputHead
-from sglang.srt.environ import BeamDecodeGraphLevel, envs
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -299,12 +296,15 @@ def _model_runner(compact_head=True, lora=False):
 
 
 @contextlib.contextmanager
-def _decode_graph_level(level, **env):
-    """A server at this level with shared-context attention on and supported."""
+def _beam_decode_graphs(*, fixed_width=None, mixed_batches=False, **env):
+    """A server with the beam decode graphs on, and shared-context attention on
+    and supported. Without a fixed width its graphs are the width-free ones."""
     with contextlib.ExitStack() as stack:
         overrides = {
             "SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION": True,
-            "SGLANG_BEAM_DECODE_GRAPH_LEVEL": level,
+            "SGLANG_ENABLE_BEAM_DECODE_GRAPH": True,
+            "SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH": fixed_width,
+            "SGLANG_ENABLE_BEAM_DECODE_GRAPH_MIXED_BATCH": mixed_batches,
             **env,
         }
         for name, value in overrides.items():
@@ -322,9 +322,9 @@ def _decode_graph_level(level, **env):
         yield
 
 
-def _decode_step(widths, prompt_len=7, decode_len=2):
-    """A decode step with one base row per request, in order, then each live beam
-    group's member rows. A width of 1 is an ordinary request with its own KV; 0 is
+def _decode_batch(widths, prompt_len=7, decode_len=2):
+    """A decode batch with one base row per request, in order, then each live beam
+    group's member rows. A width of 1 is a regular request with its own KV; 0 is
     a finished group's leader, which has no member rows left."""
     reqs, entries, base_lens, member_lens = [], [], [], []
     for row, width in enumerate(widths):
@@ -350,8 +350,8 @@ def _decode_step(widths, prompt_len=7, decode_len=2):
     )
 
 
-def _width_free_inputs(max_rows, *, level, trie_head=True):
-    keeps_dense_rows = trie_head and level >= BeamDecodeGraphLevel.MIXED_REQUESTS
+def _width_free_inputs(max_rows, *, mixed_batches=False, trie_head=True):
+    keeps_dense_rows = trie_head and mixed_batches
     return BeamGraphInputs(
         trie_levels_input=(
             TrieLevelsInput(max_rows=max_rows, device="cpu") if trie_head else None
@@ -360,7 +360,7 @@ def _width_free_inputs(max_rows, *, level, trie_head=True):
             max_rows=max_rows,
             device="cpu",
             req_to_token=torch.zeros(4, 8, dtype=torch.int32),
-            one_row_groups=keeps_dense_rows,
+            allow_one_row_groups=keeps_dense_rows,
             stream_k=False,
         ),
         dense_rows_input=(
@@ -391,24 +391,30 @@ def _rows_in_tiles(layout):
 
 
 class TestWidthFreeBeamGraphInputs(CustomTestCase):
-    def test_level_decides_what_the_graphs_hold(self):
-        """Only level 0 graphs hold the fixed-width attention input, which limits
-        them to whole groups of that width; above it they hold the width-free one
-        and take every size. Rows are kept only where the compact head fills them,
-        and LoRA, whose graph key slot the beam label takes, leaves a
-        shared-context server without beam graphs."""
-        # (level, compact head, LoRA): (attention input, kept rows), None for no graphs
+    def test_settings_decide_what_the_graphs_hold(self):
+        """Graphs hold the fixed-width attention input, which limits them to whole
+        groups of that width, only when a width is set; otherwise they hold the
+        width-free one and take every size. Rows are kept only for mixed batches
+        and where the compact head fills them, and LoRA, whose graph key slot the
+        beam label takes, leaves a shared-context server without beam graphs."""
+        # (fixed width, mixed batches, compact head, LoRA):
+        # (attention input, kept rows), None for no graphs
         cases = {
-            (0, True, False): (FixedWidthAttentionInput, False),
-            (2, True, False): (WidthFreeAttentionInput, False),
-            (3, True, False): (WidthFreeAttentionInput, True),
-            (3, False, False): (WidthFreeAttentionInput, False),
-            (2, True, True): None,
+            (2, False, True, False): (FixedWidthAttentionInput, False),
+            (None, False, True, False): (WidthFreeAttentionInput, False),
+            (None, True, True, False): (WidthFreeAttentionInput, True),
+            (None, True, False, False): (WidthFreeAttentionInput, False),
+            (None, False, True, True): None,
         }
-        for (level, compact_head, lora), holds in cases.items():
-            with self.subTest(level=level, compact_head=compact_head, lora=lora):
+        for (fixed_width, mixed, compact_head, lora), holds in cases.items():
+            with self.subTest(
+                fixed_width=fixed_width,
+                mixed_batches=mixed,
+                compact_head=compact_head,
+                lora=lora,
+            ):
                 with (
-                    _decode_graph_level(level, SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH=2),
+                    _beam_decode_graphs(fixed_width=fixed_width, mixed_batches=mixed),
                     patch.object(
                         beam_decode_cuda_graph_runner,
                         "get_beam_trie_config",
@@ -425,21 +431,45 @@ class TestWidthFreeBeamGraphInputs(CustomTestCase):
                 self.assertIs(type(inputs.attention_input), attention)
                 self.assertEqual(inputs.dense_rows_input is not None, keeps_rows)
                 self.assertEqual(inputs.trie_levels_input is not None, compact_head)
-                self.assertEqual(inputs.can_capture(3), level != 0)
+                self.assertEqual(inputs.can_capture(3), fixed_width is None)
+
+    def test_only_graphs_without_a_fixed_width_run_the_width_free_layout(self):
+        """A server keeps the per-width buckets, and with them its kernel, unless
+        its beam decode graphs take any width: with the graphs off, or with a
+        fixed width, a batch must not get the width-free layout."""
+        batch, runner = _decode_batch((4, 4)), _model_runner()
+        buckets = object()
+        cases = (
+            ({"SGLANG_ENABLE_BEAM_DECODE_GRAPH": False}, False),
+            ({"fixed_width": 4}, False),
+            ({}, True),
+        )
+        for settings, width_free in cases:
+            with (
+                self.subTest(settings=settings),
+                _beam_decode_graphs(**settings),
+                patch.object(
+                    shared_context_attention,
+                    "_build_width_buckets",
+                    return_value=buckets,
+                ),
+            ):
+                metadata = shared_context_attention.build_metadata(batch, runner)
+                self.assertEqual(metadata is not buckets, width_free)
 
     def test_any_split_loads_into_a_larger_graph(self):
-        """Level 2 graphs take a batch of any widths and fewer rows than they
+        """Width-free graphs take a batch of any widths and fewer rows than they
         hold: over a larger earlier batch's tables, the loaded tiles must cover
         each of its rows exactly once."""
-        with _decode_graph_level(2):
-            inputs = _width_free_inputs(max_rows=600, level=2)
+        with _beam_decode_graphs():
+            inputs = _width_free_inputs(max_rows=600)
             self.assertTrue(inputs.can_capture(431))
             captured = inputs.prepare_capture_inputs(512)
             runner = _model_runner()
             inputs.load_replay_inputs(
-                build_beam_forward_inputs(_decode_step((300, 300)), runner)
+                build_beam_forward_inputs(_decode_batch((300, 300)), runner)
             )
-            beam = build_beam_forward_inputs(_decode_step((2, 129, 300)), runner)
+            beam = build_beam_forward_inputs(_decode_batch((2, 129, 300)), runner)
             self.assertEqual(beam.trie_levels.shape[0], 431)
             self.assertIsNone(beam.dense_rows)
             self.assertTrue(inputs.can_replay(beam, graph_size=512))
@@ -453,12 +483,12 @@ class TestWidthFreeBeamGraphInputs(CustomTestCase):
     def test_dense_head_batch_replays_without_trie_levels(self):
         """With the compact trie head off a beam batch carries its width-free
         layout and no trie levels; a graph captured without levels replays it."""
-        with _decode_graph_level(2):
-            inputs = _width_free_inputs(max_rows=600, level=2, trie_head=False)
+        with _beam_decode_graphs():
+            inputs = _width_free_inputs(max_rows=600, trie_head=False)
             captured = inputs.prepare_capture_inputs(512)
             self.assertIsNone(captured.trie_levels)
             beam = build_beam_forward_inputs(
-                _decode_step((2, 129, 300)), _model_runner(compact_head=False)
+                _decode_batch((2, 129, 300)), _model_runner(compact_head=False)
             )
             self.assertIsNone(beam.trie_levels)
             self.assertTrue(inputs.can_replay(beam, graph_size=512))
@@ -472,65 +502,72 @@ class TestWidthFreeBeamGraphInputs(CustomTestCase):
         """A batch the layout builder turned away (here a finished group's leader
         still in it) carries no tables; replaying it would attend the previous
         batch's groups."""
-        with _decode_graph_level(2):
-            inputs = _width_free_inputs(max_rows=600, level=2)
+        with _beam_decode_graphs():
+            inputs = _width_free_inputs(max_rows=600)
             inputs.prepare_capture_inputs(512)
             beam = build_beam_forward_inputs(
-                _decode_step((129, 0, 300)), _model_runner()
+                _decode_batch((129, 0, 300)), _model_runner()
             )
             self.assertIsNotNone(beam.trie_levels)
             self.assertIsNone(beam.attention_metadata)
             self.assertFalse(inputs.can_replay(beam, graph_size=512))
 
-    def test_level_rejects_what_it_cannot_run(self):
-        """Level 1 has no mode of its own, level 0 has only its own kernel, and
-        level 3 cannot keep deterministic inference: none may silently run
-        something else."""
-        with envs.SGLANG_BEAM_DECODE_GRAPH_LEVEL.override(1):
-            with self.assertRaisesRegex(ValueError, "use 2"):
-                decode_graph_level()
-        with envs.SGLANG_BEAM_SHARED_CONTEXT_KERNEL.override("stream_k"):
-            with self.assertRaisesRegex(ValueError, "LEVEL 2 or 3"):
-                decode_graph_level()
-            for level in (2, 3):
-                with envs.SGLANG_BEAM_DECODE_GRAPH_LEVEL.override(level):
-                    self.assertEqual(decode_graph_level(), level)
-        with envs.SGLANG_BEAM_SHARED_CONTEXT_KERNEL.override("split_kv"):
+    def test_startup_rejects_settings_that_cannot_run_together(self):
+        """The stream-K kernel and mixed batches exist only on the width-free
+        graphs, and a mixed batch cannot keep deterministic inference: none may
+        silently run something else."""
+        check = decode_graph_settings.check_settings
+        with _beam_decode_graphs(SGLANG_BEAM_SHARED_CONTEXT_KERNEL="stream_k"):
+            check(deterministic_inference=True)
+        for without_width_free_graphs in (
+            {"fixed_width": 2},
+            {"SGLANG_ENABLE_BEAM_DECODE_GRAPH": False},
+        ):
+            with _beam_decode_graphs(
+                SGLANG_BEAM_SHARED_CONTEXT_KERNEL="stream_k",
+                **without_width_free_graphs,
+            ):
+                with self.assertRaisesRegex(ValueError, "FIXED_WIDTH unset"):
+                    check(deterministic_inference=False)
+            with _beam_decode_graphs(mixed_batches=True, **without_width_free_graphs):
+                with self.assertRaisesRegex(ValueError, "FIXED_WIDTH unset"):
+                    check(deterministic_inference=False)
+        with _beam_decode_graphs(SGLANG_BEAM_SHARED_CONTEXT_KERNEL="split_kv"):
             with self.assertRaisesRegex(ValueError, "not one of"):
-                decode_graph_level()
-        # Level 3 moves an ordinary request's logits with the batch it decodes in.
-        with envs.SGLANG_BEAM_DECODE_GRAPH_LEVEL.override(2):
-            check_decode_graph_settings(deterministic_inference=True)
-        with envs.SGLANG_BEAM_DECODE_GRAPH_LEVEL.override(3):
-            with self.assertRaisesRegex(ValueError, "use level 2"):
-                check_decode_graph_settings(deterministic_inference=True)
+                check(deterministic_inference=False)
+        # A mixed batch moves a regular request's logits with the batch it decodes in.
+        with _beam_decode_graphs(mixed_batches=True):
+            check(deterministic_inference=False)
+            with self.assertRaisesRegex(ValueError, "deterministic"):
+                check(deterministic_inference=True)
 
 
-class TestMixedRequestBeamSteps(CustomTestCase):
-    """SGLANG_BEAM_DECODE_GRAPH_LEVEL=3: ordinary requests join beam decode steps."""
+class TestMixedBatches(CustomTestCase):
+    """SGLANG_ENABLE_BEAM_DECODE_GRAPH_MIXED_BATCH: regular requests join beam
+    decode batches."""
 
-    def test_ordinary_requests_join_only_at_level_3(self):
-        """Below level 3, or without the compact head that keeps its logits, a
-        step with an ordinary request gets no beam inputs, so it runs the ordinary
-        decode path, uncounted. At level 3 its ordinary rows and a finished
-        group's leader are one-row groups reading their whole KV as the prompt,
-        the tiles cover every row once, and the graph keeps one full-vocabulary
-        row per request, and none in a following beam-only step."""
+    def test_regular_requests_join_only_with_mixed_batches_on(self):
+        """With the switch off, or without the compact head that keeps its logits,
+        a batch with a regular request gets no beam inputs, so it runs the
+        ordinary decode path, uncounted. With it on, its regular rows and a
+        finished group's leader are one-row groups reading their whole KV as the
+        prompt, the tiles cover every row once, and the graph keeps one
+        full-vocabulary row per request, and none in a following beam-only batch."""
         runner = _model_runner()
-        step = _decode_step((1, 129, 0, 1, 300))
-        rows = len(step.seq_lens)
-        with _decode_graph_level(2):
-            overflow = mixed_requests.overflow_steps()
-            self.assertIsNone(build_beam_forward_inputs(step, runner))
-            self.assertEqual(mixed_requests.overflow_steps(), overflow)
-        with _decode_graph_level(3):
+        batch = _decode_batch((1, 129, 0, 1, 300))
+        rows = len(batch.seq_lens)
+        with _beam_decode_graphs():
+            oversized = mixed_batch.num_oversized_batches()
+            self.assertIsNone(build_beam_forward_inputs(batch, runner))
+            self.assertEqual(mixed_batch.num_oversized_batches(), oversized)
+        with _beam_decode_graphs(mixed_batches=True):
             self.assertIsNone(
-                build_beam_forward_inputs(step, _model_runner(compact_head=False))
+                build_beam_forward_inputs(batch, _model_runner(compact_head=False))
             )
-            inputs = _width_free_inputs(max_rows=600, level=3)
+            inputs = _width_free_inputs(max_rows=600, mixed_batches=True)
             captured = inputs.prepare_capture_inputs(512)
 
-            beam = build_beam_forward_inputs(step, runner)
+            beam = build_beam_forward_inputs(batch, runner)
             self.assertEqual(beam.trie_levels[:5].tolist(), [0, 1, 1, 0, 1])
             self.assertTrue(inputs.can_replay(beam, graph_size=512))
             inputs.load_replay_inputs(beam)
@@ -540,47 +577,49 @@ class TestMixedRequestBeamSteps(CustomTestCase):
             self.assertEqual((num_rows, len(groups)), (rows, 5))
             for leader, _, members, prompt_len in groups:
                 if members == 0:
-                    self.assertEqual(prompt_len, int(step.seq_lens[leader]))
+                    self.assertEqual(prompt_len, int(batch.seq_lens[leader]))
             self.assertEqual(sorted(_rows_in_tiles(layout)), list(range(rows)))
             self.assertEqual(int(captured.dense_rows.count), 5)
 
             # The kept-rows part exists, the batch carries no rows to keep: it replays.
-            beam_only = build_beam_forward_inputs(_decode_step((129, 300)), runner)
+            beam_only = build_beam_forward_inputs(_decode_batch((129, 300)), runner)
             self.assertIsNone(beam_only.dense_rows)
             self.assertTrue(inputs.can_replay(beam_only, graph_size=512))
             inputs.load_replay_inputs(beam_only)
             self.assertEqual(int(captured.dense_rows.count), 0)
 
     def test_too_many_requests_take_the_ordinary_path(self):
-        """Above SGLANG_BEAM_DECODE_GRAPH_MAX_MIXED_REQUESTS requests, a step with
-        an ordinary request gets no beam inputs, so it runs the ordinary decode
-        path, and is counted. At the cap it runs the beam path; beam-only steps
+        """Above SGLANG_BEAM_DECODE_GRAPH_MIXED_BATCH_MAX_REQUESTS requests, a batch
+        with a regular request gets no beam inputs, so it runs the ordinary decode
+        path, and is counted. At the cap it runs the beam path; beam-only batches
         never count against the cap."""
         runner = _model_runner()
-        with _decode_graph_level(3, SGLANG_BEAM_DECODE_GRAPH_MAX_MIXED_REQUESTS=3):
-            at_cap = build_beam_forward_inputs(_decode_step((1, 4, 1)), runner)
+        with _beam_decode_graphs(
+            mixed_batches=True, SGLANG_BEAM_DECODE_GRAPH_MIXED_BATCH_MAX_REQUESTS=3
+        ):
+            at_cap = build_beam_forward_inputs(_decode_batch((1, 4, 1)), runner)
             self.assertEqual(at_cap.trie_levels[:3].tolist(), [0, 1, 0])
             self.assertEqual(len(_tables(at_cap.attention_metadata.layout)[1]), 3)
             self.assertEqual(at_cap.dense_rows.num_rows, 3)
 
-            overflow = mixed_requests.overflow_steps()
+            oversized = mixed_batch.num_oversized_batches()
             self.assertIsNone(
-                build_beam_forward_inputs(_decode_step((1, 4, 1, 4)), runner)
+                build_beam_forward_inputs(_decode_batch((1, 4, 1, 4)), runner)
             )
-            self.assertEqual(mixed_requests.overflow_steps(), overflow + 1)
+            self.assertEqual(mixed_batch.num_oversized_batches(), oversized + 1)
 
-            beam_only = build_beam_forward_inputs(_decode_step((4, 4, 4, 4)), runner)
+            beam_only = build_beam_forward_inputs(_decode_batch((4, 4, 4, 4)), runner)
             self.assertEqual(len(_tables(beam_only.attention_metadata.layout)[1]), 4)
             self.assertIsNone(beam_only.dense_rows)
-            self.assertEqual(mixed_requests.overflow_steps(), overflow + 1)
+            self.assertEqual(mixed_batch.num_oversized_batches(), oversized + 1)
 
     def test_sampler_reads_kept_rows_and_selection_reads_compact_rows(self):
-        """With ordinary requests in a beam step, the sampler must get the kept
+        """With regular requests in a beam batch, the sampler must get the kept
         full-vocabulary rows, one per request, while beam selection keeps the
-        leaders' and members' compact rows. A beam-only step replays the same
+        leaders' and members' compact rows. A beam-only batch replays the same
         graph and must not sample from the kept-row buffer it returns, and a head
         that fell back to the dense LM head keeps no rows to sample from."""
-        step = _decode_step((1, 3, 1))
+        batch = _decode_batch((1, 3, 1))
         compact = torch.randn(5, 4)
         dense = torch.randn(64, 16)
 
@@ -596,7 +635,7 @@ class TestMixedRequestBeamSteps(CustomTestCase):
                 beam=BeamForwardInputs(torch.zeros(5), None, dense_rows),
                 positions=torch.arange(5),
             )
-            capture_pre_sample_logits(step, forward, output)
+            capture_pre_sample_logits(batch, forward, output)
             return output
 
         output = capture(BeamDenseRows(num_rows=3))
@@ -608,7 +647,7 @@ class TestMixedRequestBeamSteps(CustomTestCase):
         self.assertTrue(torch.equal(fallback.next_token_logits, compact[:3]))
 
     def test_kept_rows_are_the_transformed_full_vocabulary_logits(self):
-        """Ordinary requests in a beam step sample from the rows the normalizer
+        """Regular requests in a beam batch sample from the rows the normalizer
         pass keeps: they must equal the dense LM head after the head's transform,
         across chunk edges, while compact logits and normalizers stay as without
         keeping. A captured buffer keeps only the rows its count names."""

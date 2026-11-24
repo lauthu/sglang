@@ -1,4 +1,4 @@
-"""A decode step for the width-free shared-context attention kernels, with its
+"""A decode batch for the width-free shared-context attention kernels, with its
 FP32 reference: per row, plain softmax attention over the row's own KV slots."""
 
 import math
@@ -21,10 +21,10 @@ def ragged_case(
     max_context=1024,
     seed=0,
 ):
-    """A decode step's rows as the scheduler lays them out: one leader row per
+    """A decode batch's rows as the scheduler lays them out: one leader row per
     group, then each group's member rows. Members alias the leader's prompt slots
     in their own req_to_token rows and own their decode slots; every row of a
-    group has the leader's length. A width of 1 is an ordinary request: one base
+    group has the leader's length. A width of 1 is a regular request: one base
     row, outside the beam tail. Returns the batch view the metadata builder reads,
     the kernel inputs and the FP32 reference."""
     torch.manual_seed(seed)

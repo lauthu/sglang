@@ -22,9 +22,8 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.activation.softcap import softcap_inplace_logits
-from sglang.srt.beam_search import mixed_requests
-from sglang.srt.beam_search.decode_graph_level import check_decode_graph_settings
-from sglang.srt.beam_search.mixed_requests import BeamDenseRows
+from sglang.srt.beam_search import decode_graph_settings, mixed_batch
+from sglang.srt.beam_search.mixed_batch import BeamDenseRows
 from sglang.srt.beam_search.trie_config import (
     TrieOutputHeadConfig,
     get_beam_trie_config,
@@ -45,7 +44,7 @@ logger = logging.getLogger(__name__)
 class BeamTrieHeadOutput(msgspec.Struct, frozen=True):
     logits: torch.Tensor
     normalizer: torch.Tensor
-    # fp32 [kept rows, vocab]: full-vocabulary logits of the step's first rows.
+    # fp32 [kept rows, vocab]: full-vocabulary logits of the batch's first rows.
     dense_logits: Optional[torch.Tensor] = None
 
 
@@ -61,8 +60,9 @@ def configure_model_trie_output_heads(
     from sglang.srt.layers.logits_processor import LogitsProcessor
     from sglang.srt.runtime_context import get_exec, get_parallel
 
-    # Reject a decode graph level at startup, not at the first beam decode step.
-    check_decode_graph_settings(
+    # Reject beam decode graph settings that cannot run together at startup, not
+    # at the first beam decode batch.
+    decode_graph_settings.check_settings(
         deterministic_inference=get_exec().deterministic.enable_deterministic_inference
     )
     config = get_beam_trie_config(model_config)
@@ -203,11 +203,11 @@ def _transform_logits(processor: LogitsProcessor, logits: torch.Tensor) -> torch
 
 
 def _runs_compact_head(batch: ScheduleBatch) -> bool:
-    if mixed_requests.admits(batch):
+    if mixed_batch.runs_beam_path(batch):
         return True
-    # At level 3 only the request cap turns a step away.
-    if mixed_requests.ordinary_requests_enabled():
-        mixed_requests.note_overflow(len(batch.reqs))
+    # With mixed batches on, only the request cap turns a batch away.
+    if decode_graph_settings.mixed_batch_enabled():
+        mixed_batch.count_oversized_batch(len(batch.reqs))
     return False
 
 
@@ -215,9 +215,9 @@ def build_trie_row_levels(
     batch: ScheduleBatch, model_runner: ModelRunner
 ) -> Optional[torch.Tensor]:
     """Per-row SID codebook depths of a beam decode batch on the compact head; None
-    runs the dense LM head. Every request must be a beam request, except at decode
-    graph level 3, where an ordinary request's row gets depth 0 and keeps its
-    full-vocabulary logits."""
+    runs the dense LM head. Every request must be a beam request, except with
+    SGLANG_ENABLE_BEAM_DECODE_GRAPH_MIXED_BATCH, where a regular request's row
+    gets depth 0 and keeps its full-vocabulary logits."""
     if (
         batch.forward_mode.is_decode()
         and batch.beam_tail is not None

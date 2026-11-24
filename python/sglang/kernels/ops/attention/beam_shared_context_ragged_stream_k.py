@@ -11,10 +11,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Stream-K shared-context attention for any split of a step's rows into groups.
+"""Stream-K shared-context attention for any split of a batch's rows into groups.
 
-Opt-in with SGLANG_BEAM_SHARED_CONTEXT_KERNEL=stream_k at
-SGLANG_BEAM_DECODE_GRAPH_LEVEL 2 or 3. It reads the layout of
+Opt-in with SGLANG_BEAM_SHARED_CONTEXT_KERNEL=stream_k, for the width-free beam
+decode graphs. It reads the layout of
 beam_shared_context_ragged.py, which ends with a schedule that build_schedule
 writes after the tile table:
 - schedule: [most units of a tile, units of all tiles, unit_starts[0], ...,
@@ -22,13 +22,13 @@ writes after the tile table:
 
 A tile and query head has one setup unit, then one unit per BLOCK_N prompt tokens
 and one per decode step of its group; units run tile by tile, head by head. The
-grid is persistent, one CTA per SM, and each CTA takes an equal run of the step's
+grid is persistent, one CTA per SM, and each CTA takes an equal run of the batch's
 units, which may end inside a tile and head. When whole tiles and heads per CTA
 cost no more (the tiles already fill the SMs), the runs end at their bounds
 instead. A tile and head covered by one CTA is written directly. One split across
 CTAs leaves a partial output and log-sum-exp per CTA, and the CTA holding its first
 work unit lists it for the merge kernel. Only a run's first and last segments can
-be partial, so the workspace holds two slots per CTA for any step.
+be partial, so the workspace holds two slots per CTA for any batch.
 
 Against the tile-per-CTA kernel of beam_shared_context_ragged.py, per launch on
 SM120 with 2,048-token prompts: 2.7x to 3.8x faster for one request of 16 to 256
@@ -59,7 +59,7 @@ _NUM_WARPS = 8
 _NUM_STAGES = 2
 _SETUP_UNITS = 1
 # Units a split adds to its share (a second Q load, partial stores, the merge).
-# Measured: of 0-16, 2 picks the faster of split and whole tiles at 39 step shapes.
+# Measured: of 0-16, 2 picks the faster of split and whole tiles at 39 batch shapes.
 _SPLIT_COST_UNITS = 2
 # Measured: 8-row merge programs are fastest at 1-4 groups (8-64 tried).
 _MERGE_ROWS = 8
@@ -79,7 +79,7 @@ def tile_units(prompt_len: int, decode_len: int) -> int:
 
 
 def build_schedule(units_per_tile: Sequence[int]) -> list[int]:
-    """The schedule of a step whose tiles, in order, have these `tile_units`."""
+    """The schedule of a batch whose tiles, in order, have these `tile_units`."""
     unit_starts = [0, *itertools.accumulate(units_per_tile)]
     return [max(units_per_tile), unit_starts[-1], *unit_starts]
 

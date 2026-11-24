@@ -260,24 +260,6 @@ def _k31_gb_best(best: Any, default: Any) -> Callable[[], Any]:
     )
 
 
-class BeamDecodeGraphLevel(IntEnum):
-    """Which beam decode steps replay a beam decode graph with shared-context
-    attention. The values count levels of beam-width support; 1, one width per
-    step, has no mode of its own.
-
-    FIXED_WIDTH: steps whose requests all have
-        SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH beams and whose rows equal a captured
-        size.
-    MIXED_WIDTHS: steps of beam requests of any widths, padded to a captured size.
-    MIXED_REQUESTS: MIXED_WIDTHS, plus, with the compact trie head, steps that
-        also hold ordinary requests.
-    """
-
-    FIXED_WIDTH = 0
-    MIXED_WIDTHS = 2
-    MIXED_REQUESTS = 3
-
-
 class Envs:
     # Organization principles for this registry:
     # - Put every field in exactly one topical section. Prefer an existing
@@ -773,17 +755,19 @@ class Envs:
     SGLANG_ENABLE_BEAM_TRIE_SELECTION_GRAPH = EnvBool(False)
     # Replay decode batches made only of beam requests as CUDA graphs.
     SGLANG_ENABLE_BEAM_DECODE_GRAPH = EnvBool(False)
-    # The requests' beam width for those graphs under shared-context attention;
-    # required there.
+    # The one beam width of those graphs under shared-context attention. Unset:
+    # width-free graphs, for beam requests of any widths.
     SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH = EnvInt(None)
-    # Tokens such a graph holds per request; required when the model has no trie.
+    # Tokens a fixed-width graph holds per request; required when the model has
+    # no trie.
     SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH_MAX_NEW_TOKENS = EnvInt(None)
-    # BeamDecodeGraphLevel; above FIXED_WIDTH the two settings above are unused.
-    SGLANG_BEAM_DECODE_GRAPH_LEVEL = EnvInt(BeamDecodeGraphLevel.FIXED_WIDTH)
-    # MIXED_REQUESTS: most requests in a step with beam and ordinary requests that
-    # runs the beam path. Arbitrary: 64 kept fp32 rows are 39 MB at 151,936 tokens.
-    SGLANG_BEAM_DECODE_GRAPH_MAX_MIXED_REQUESTS = EnvInt(64)
-    # Shared-context attention kernel at MIXED_WIDTHS and above: "default" (one
+    # Also replay decode batches that mix beam and regular requests. Needs the
+    # compact trie head and the width-free graphs.
+    SGLANG_ENABLE_BEAM_DECODE_GRAPH_MIXED_BATCH = EnvBool(False)
+    # Most requests in such a batch; a larger one runs the ordinary decode path.
+    # Arbitrary: 64 kept fp32 rows are 39 MB at 151,936 tokens.
+    SGLANG_BEAM_DECODE_GRAPH_MIXED_BATCH_MAX_REQUESTS = EnvInt(64)
+    # Shared-context attention kernel of the width-free graphs: "default" (one
     # CTA per tile and query head) or "stream_k" (prompts split across CTAs).
     SGLANG_BEAM_SHARED_CONTEXT_KERNEL = EnvStr("default")
 

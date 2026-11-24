@@ -11,13 +11,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Width-free shared-context attention metadata (SGLANG_BEAM_DECODE_GRAPH_LEVEL >= 2).
+"""Width-free shared-context attention metadata, for the beam decode graphs that
+take any beam width (decode_graph_settings).
 
-A decode step describes its beam groups in one small int32 layout instead of
+A decode batch describes its beam groups in one small int32 layout instead of
 per-width buckets of gathered KV slots. One kernel launch then serves every
-width in the step, and a beam decode graph captured for a row count replays for
-any split of at most that many rows into groups. At level 3 with the compact trie
-head, every other row of the step (an ordinary request, or a finished group's
+width in the batch, and a beam decode graph captured for a row count replays for
+any split of at most that many rows into groups. In a mixed batch on the beam
+path (mixed_batch), every other row (a regular request, or a finished group's
 leader) is a one-row group whose whole KV is its prompt. For the stream-K kernel
 the layout ends with its schedule: each tile's work units.
 """
@@ -41,7 +42,7 @@ RAGGED_BLOCK_M = 128
 
 
 class RaggedBeamAttentionMetadata(msgspec.Struct):
-    # int32 layout of kernels/ops/attention/beam_shared_context_ragged.py: a step's
+    # int32 layout of kernels/ops/attention/beam_shared_context_ragged.py: a batch's
     # own, or a captured buffer sized for the most a graph holds.
     layout: torch.Tensor
     req_to_token: torch.Tensor
@@ -61,12 +62,12 @@ def build_ragged_metadata(
     batch: ScheduleBatch,
     req_to_token: torch.Tensor,
     *,
-    one_row_groups: bool = False,
+    allow_one_row_groups: bool = False,
     stream_k: bool = False,
 ) -> Optional[RaggedBeamAttentionMetadata]:
-    """The layout of a beam decode step, built on the host from the beam tail; None
-    leaves the step to ordinary attention. Every row must belong to a beam group,
-    unless one_row_groups lets the other base rows run as one-row groups."""
+    """The layout of a beam decode batch, built on the host from the beam tail; None
+    leaves the batch to ordinary attention. Every row must belong to a beam group,
+    unless allow_one_row_groups lets the other base rows run as one-row groups."""
     num_rows = len(batch.seq_lens)
     num_base_rows = batch.beam_tail.num_base_rows
     # Leaders and one-row groups are base rows.
@@ -82,7 +83,7 @@ def build_ragged_metadata(
             (entry.leader_idx, num_base_rows + entry.start, num_members, prompt_len)
         )
     covered_rows = sum(num_members + 1 for _, _, num_members, _ in groups)
-    if covered_rows < num_rows and one_row_groups:
+    if covered_rows < num_rows and allow_one_row_groups:
         # The row's whole KV is its prompt, so the kernel's decode loop is empty.
         leaders = {leader for leader, _, _, _ in groups}
         groups += [
@@ -146,10 +147,10 @@ def allocate_capture_layout(
     device,
     req_to_token: torch.Tensor,
     *,
-    one_row_groups: bool = False,
+    allow_one_row_groups: bool = False,
     stream_k: bool = False,
 ) -> RaggedBeamAttentionMetadata:
-    """One layout buffer for every captured row count, sized for any step of
+    """One layout buffer for every captured row count, sized for any batch of
     max_rows rows. All zeros, it records a launch with its fixed grid and no work."""
     from sglang.kernels.ops.attention.beam_shared_context_ragged import (
         layout_tables_size,
@@ -159,7 +160,7 @@ def allocate_capture_layout(
     )
 
     # Every beam group has at least two rows, unless one-row groups are allowed.
-    max_groups = max_rows if one_row_groups else max(1, max_rows // 2)
+    max_groups = max_rows if allow_one_row_groups else max(1, max_rows // 2)
     # Each group adds at most one partial tile to the rows' full tiles.
     max_tiles = -(-max_rows // RAGGED_BLOCK_M) + max_groups
     size = layout_tables_size(num_groups=max_groups, num_tiles=max_tiles)

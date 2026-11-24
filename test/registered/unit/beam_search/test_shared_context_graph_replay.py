@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """Shared-context beam graphs replay the batch loaded into their shared buffers,
-and the trie head keeps ordinary requests' full-vocabulary rows on the way."""
+and the trie head keeps regular requests' full-vocabulary rows on the way."""
 
 import unittest
 from types import SimpleNamespace
@@ -28,7 +28,7 @@ from sglang.srt.beam_search.beam_decode_cuda_graph_runner import (
     WidthFreeAttentionInput,
 )
 from sglang.srt.beam_search.forward_inputs import BeamForwardInputs
-from sglang.srt.beam_search.mixed_requests import BeamDenseRows
+from sglang.srt.beam_search.mixed_batch import BeamDenseRows
 from sglang.srt.beam_search.shared_context_attention import (
     BeamAttentionBucket,
     BeamAttentionMetadata,
@@ -138,8 +138,8 @@ class TestSharedContextGraphReplay(CustomTestCase):
 class TestWidthFreeGraphReplay(CustomTestCase):
     def test_graph_captured_once_replays_any_split(self):
         """Nothing about widths, group count or lengths is recorded at capture: one
-        beam graph replays every split loaded into its layout, ordinary requests as
-        one-row groups included, and padded rows read 0. With stream-K, the steps
+        beam graph replays every split loaded into its layout, regular requests as
+        one-row groups included, and padded rows read 0. With stream-K, the batches
         alternate between splitting the units and whole tiles per CTA (40 tiles)."""
         cases = tuple(
             ragged_case(*split, max_context=4096, seed=seed)
@@ -180,7 +180,7 @@ class TestWidthFreeGraphReplay(CustomTestCase):
                 max_rows=graph_size,
                 device=req_to_token.device,
                 req_to_token=req_to_token,
-                one_row_groups=True,
+                allow_one_row_groups=True,
                 stream_k=stream_k,
             ),
         )
@@ -198,17 +198,17 @@ class TestWidthFreeGraphReplay(CustomTestCase):
                 graph_inputs.req_pool_indices[:rows].copy_(case.req_pool_indices)
                 graph_inputs.seq_lens[:rows].copy_(case.seq_lens)
                 req_to_token[: len(case.req_to_token)].copy_(case.req_to_token)
-                step = BeamForwardInputs(
+                batch_inputs = BeamForwardInputs(
                     trie_levels=torch.zeros(rows, dtype=torch.int64, device="cuda"),
                     attention_metadata=build_ragged_metadata(
                         batch=case.batch,
                         req_to_token=case.req_to_token,
-                        one_row_groups=True,
+                        allow_one_row_groups=True,
                         stream_k=stream_k,
                     ),
                 )
-                self.assertTrue(inputs.can_replay(step, graph_size=graph_size))
-                inputs.load_replay_inputs(step)
+                self.assertTrue(inputs.can_replay(batch_inputs, graph_size=graph_size))
+                inputs.load_replay_inputs(batch_inputs)
                 graph.replay()
                 torch.cuda.synchronize()
                 torch.testing.assert_close(

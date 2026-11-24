@@ -1,7 +1,7 @@
 """row_logsumexp_keep_rows.
 
-The trie output head swaps it in for row_logsumexp when ordinary requests share a
-beam decode step, so beam scores must not move by a bit, and a CUDA graph must
+The trie output head swaps it in for row_logsumexp when regular requests share a
+beam decode batch, so beam scores must not move by a bit, and a CUDA graph must
 keep exactly the rows its device-side count names on each replay.
 """
 

@@ -11,9 +11,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Shared-context attention for any split of a decode step's rows into groups.
+"""Shared-context attention for any split of a decode batch's rows into groups.
 
-The kernels read the layout the host builds each step, so every case goes
+The kernels read the layout the host builds for each batch, so every case goes
 through the real builder: a layout the two sides read differently fails against
 the FP32 reference.
 """
@@ -35,11 +35,13 @@ register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-s
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestRaggedSharedContextAttention(CustomTestCase):
-    def _assert_matches_reference(self, case, *, one_row_groups, stream_k, **forced):
+    def _assert_matches_reference(
+        self, case, *, allow_one_row_groups, stream_k, **forced
+    ):
         metadata = build_ragged_metadata(
             batch=case.batch,
             req_to_token=case.req_to_token,
-            one_row_groups=one_row_groups,
+            allow_one_row_groups=allow_one_row_groups,
             stream_k=stream_k,
         )
         output = run_ragged(case, metadata, block_m=RAGGED_BLOCK_M, **forced)
@@ -56,11 +58,11 @@ class TestRaggedSharedContextAttention(CustomTestCase):
         for stream_k in (False, True):
             with self.subTest(stream_k=stream_k):
                 self._assert_matches_reference(
-                    case, one_row_groups=False, stream_k=stream_k
+                    case, allow_one_row_groups=False, stream_k=stream_k
                 )
 
-    def test_ordinary_rows_as_one_row_groups_match_fp32_reference(self):
-        """Ordinary requests among beam groups attend over their whole KV as one-row
+    def test_regular_rows_as_one_row_groups_match_fp32_reference(self):
+        """Regular requests among beam groups attend over their whole KV as one-row
         groups, up to 5,000 tokens, in the same launch as the beams."""
         case = ragged_case(
             widths=(1, 129, 1, 2, 1, 300),
@@ -71,7 +73,7 @@ class TestRaggedSharedContextAttention(CustomTestCase):
         for stream_k in (False, True):
             with self.subTest(stream_k=stream_k):
                 self._assert_matches_reference(
-                    case, one_row_groups=True, stream_k=stream_k
+                    case, allow_one_row_groups=True, stream_k=stream_k
                 )
 
     def test_stream_k_any_cut_of_the_units_matches_fp32_reference(self):
@@ -98,7 +100,7 @@ class TestRaggedSharedContextAttention(CustomTestCase):
             with self.subTest(run=index, num_ctas=num_ctas, whole=split_cost_units > 0):
                 self._assert_matches_reference(
                     case,
-                    one_row_groups=True,
+                    allow_one_row_groups=True,
                     stream_k=True,
                     num_ctas=num_ctas,
                     split_cost_units=split_cost_units,

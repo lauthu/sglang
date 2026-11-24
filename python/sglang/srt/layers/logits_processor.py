@@ -38,7 +38,7 @@ from sglang.kernels.ops.sampling.softcap_row_argmax import (
     softcap_row_argmax,
 )
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
-from sglang.srt.beam_search.mixed_requests import BeamDenseRows
+from sglang.srt.beam_search.mixed_batch import BeamDenseRows
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
@@ -268,8 +268,8 @@ class LogitsProcessorOutput:
     # selection; see beam_search.logits_capture.
     beam: Optional[BeamLogitsCapture] = None
     beam_normalizer: Optional[torch.Tensor] = None
-    # Full-vocabulary rows the trie head kept for ordinary requests; see
-    # beam_search.mixed_requests.
+    # Full-vocabulary rows the trie head kept for regular requests; see
+    # beam_search.mixed_batch.
     beam_dense_logits: Optional[torch.Tensor] = None
 
     ## Part 5: Customized Info
