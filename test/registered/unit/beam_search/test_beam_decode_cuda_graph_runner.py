@@ -27,6 +27,7 @@ import msgspec
 import torch
 
 from sglang.srt.beam_search import (
+    beam_decode_cuda_graph_runner,
     mixed_requests,
     shared_context_attention,
     trie_output_head,
@@ -35,6 +36,7 @@ from sglang.srt.beam_search.batch_tail import BeamTailEntry
 from sglang.srt.beam_search.beam_decode_cuda_graph_runner import (
     BeamGraphInputs,
     SharedContextCapacity,
+    _beam_graph_inputs,
 )
 from sglang.srt.beam_search.decode_graph_level import (
     check_decode_graph_settings,
@@ -202,14 +204,18 @@ _TRIE_CONFIG = TrieOutputHeadConfig(
 )
 
 
-def _model_runner(compact_head=True):
-    """The model runner fields the forward-input builders read."""
+def _model_runner(compact_head=True, lora=False):
+    """The model runner fields the forward-input builders and the beam graph
+    inputs read."""
     return SimpleNamespace(
         beam_trie_compact_enabled=compact_head,
-        model_config=SimpleNamespace(),
+        lora_manager=object() if lora else None,
+        model_config=SimpleNamespace(context_len=8, vocab_size=16),
         req_to_token_pool=SimpleNamespace(
             req_to_token=torch.zeros(4, 8, dtype=torch.int32)
         ),
+        device=torch.device("cpu"),
+        max_decode_logits_rows=lambda: 600,
     )
 
 
@@ -308,6 +314,44 @@ def _rows_in_tiles(layout):
 
 
 class TestWidthFreeBeamGraphInputs(CustomTestCase):
+    def test_level_decides_what_the_graphs_hold(self):
+        """Only level 0 graphs hold the one-width capacity, which limits them to
+        whole groups of that width; above it they hold the width-free layout and
+        take every size. Rows are kept only where the compact head fills them,
+        and LoRA, whose graph key slot the beam label takes, leaves
+        shared-context attention no graph."""
+        # (level, compact head, LoRA): (one-width capacity, layout, kept rows)
+        cases = {
+            (0, True, False): (True, False, False),
+            (2, True, False): (False, True, False),
+            (3, True, False): (False, True, True),
+            (3, False, False): (False, True, False),
+            (2, True, True): (False, False, False),
+        }
+        for (level, compact_head, lora), holds in cases.items():
+            with self.subTest(level=level, compact_head=compact_head, lora=lora):
+                with (
+                    _decode_graph_level(level, SGLANG_BEAM_DECODE_GRAPH_WIDTH=2),
+                    mock.patch.object(
+                        beam_decode_cuda_graph_runner,
+                        "get_beam_trie_config",
+                        return_value=_TRIE_CONFIG,
+                    ),
+                ):
+                    inputs = _beam_graph_inputs(
+                        _model_runner(compact_head=compact_head, lora=lora)
+                    )
+                self.assertEqual(
+                    (
+                        inputs.shared_context is not None,
+                        inputs.ragged_layout is not None,
+                        inputs.dense_rows is not None,
+                    ),
+                    holds,
+                )
+                self.assertEqual(inputs.supports_rows(3), level != 0)
+                self.assertEqual(inputs.levels is not None, compact_head)
+
     def test_any_split_stages_into_a_larger_graph(self):
         """Level 2 graphs take a batch of any widths and fewer rows than they
         hold: over a larger earlier batch's tables, the staged tiles must cover
