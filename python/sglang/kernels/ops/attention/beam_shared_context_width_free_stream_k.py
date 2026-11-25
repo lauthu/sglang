@@ -13,18 +13,21 @@
 # ==============================================================================
 """Stream-K shared-context attention for beam requests of any widths.
 
-Opt-in with SGLANG_BEAM_SHARED_CONTEXT_KERNEL=stream_k, on the beam decode graphs
-that take any beam width. It computes what beam_shared_context_width_free.py
-computes, from the same layout. That kernel gives a program whole tiles, so one
-request with a long prompt keeps a few SMs busy and leaves the others idle; this
-one shares the work of a batch evenly over the SMs.
+Opt-in with SGLANG_BEAM_SHARED_CONTEXT_KERNEL=stream_k on a server whose beam
+decode graphs take any beam width; every beam decode batch there runs it,
+replayed or eager. It computes what the default kernel
+(beam_shared_context_width_free.py) computes, from the same layout. That kernel
+gives a program whole tiles, so one request with a long prompt keeps a few SMs
+busy and leaves the others idle; this one shares the work of a batch evenly over
+the SMs.
 
-Terms (group, tile, real rows and the layout are defined in that module):
+Terms (group, tile, pool row, real rows and the layout are defined in that module):
 - task: one tile attended for one query head. Tasks are numbered tile by tile,
-  then head by head: task = tile * Q_HEADS + q_head.
-- unit: the scheduler's measure of work. A task is SETUP_UNITS for starting it,
-  then one work unit per BLOCK_N prompt tokens, then one per decode step. The
-  units of a batch are numbered task by task.
+  then head by head: task = tile * Q_HEADS + q_head. (The fixed-width
+  beam_shared_context_stream_k.py calls this a tile; here a tile has no head.)
+- unit: the measure of work that the schedule counts and the CTAs share. A task
+  is SETUP_UNITS for starting it, then one work unit per BLOCK_N prompt tokens,
+  then one per decode step. The units of a batch are numbered task by task.
 - run: the consecutive units [run_start, run_end) that one CTA executes.
 - segment: the part of a task that lies in one run.
 - schedule: what the host appends to the layout (build_schedule), counted for
@@ -33,9 +36,9 @@ Terms (group, tile, real rows and the layout are defined in that module):
   before tile t.
 
 The grid is persistent: one CTA per SM for any batch. Each CTA takes an equal run
-of the batch's units, so a run may start and end inside a task. When the batch
-has enough tasks to fill the SMs without splitting any, the runs end at task
-bounds instead (_cta_run).
+of the batch's units, so a run may start and end inside a task. When whole tasks
+load the busiest CTA no more than an equal run plus the cost of a split, the runs
+end at task bounds instead (_cta_run).
 
 A task that lies in one run is written to the output directly. A task split over
 several runs leaves one partial result per segment, which the merge kernel
@@ -44,13 +47,16 @@ combines:
   2 * c holds the segment that CTA c's run starts with, slot 2 * c + 1 a segment
   that starts later in the run; only a run's first and last segments can be
   partial.
-- merge list: one entry per CTA, (tile or -1, query head, last CTA, first slot).
-  The CTA whose run holds the first work unit of a split task lists the task.
+- merge list: one entry per CTA, (tile or -1, query head, last CTA, first
+  segment's slot). The CTA whose run holds the first work unit of a split task
+  lists it: the task, the CTA that runs the task's last unit, and the partial
+  slot (2 * c or 2 * c + 1) of the listing CTA's own segment.
 
-Against the tile-per-CTA kernel of beam_shared_context_width_free.py, per launch on
-SM120 with 2,048-token prompts: 2.7x to 3.8x faster for one request of 16 to 256
-beams, 1.2x for 8 requests of 256 beams, and 6% to 8% slower when 8 requests of
-16 to 256 beams give each SM about one whole task.
+Against the default kernel, per launch on SM120 with 2,048-token prompts: 2.7x to
+3.8x faster for one request of 16 to 256 beams, 1.2x for 4 or 8 requests of 256
+beams, and 6% slower for 8 requests of 16, 64 and 256 beams. That batch already
+gives each SM about one task, so nothing is left to balance, and a unit costs
+more here (2 pipeline stages against 3).
 """
 
 from __future__ import annotations
@@ -76,18 +82,21 @@ from sglang.kernels.ops.attention.beam_shared_context_width_free import (
     load_q,
     store_output,
     tile_rows,
-    zero_padded_rows,
+    zero_padding_rows,
 )
 
-# Measured on RTX PRO 6000 (SM120), Qwen3-0.6B heads, 1-8 groups of 1-2,000 beams.
+# The fixed-width stream-K kernel's values (beam_shared_context_stream_k.py). This
+# kernel was timed with them on RTX PRO 6000 (SM120), Qwen3-0.6B heads, 1-8 groups
+# of 1-2,000 beams.
 _BLOCK_N = 64
 _NUM_WARPS = 8
 _NUM_STAGES = 2
 # What starting a task costs (a Q load, an output store), in units. Not swept
 # here: beam_shared_context_stream_k.py measured 1 as the best of 0-3.
 _SETUP_UNITS = 1
-# Units a split adds to its share (a second Q load, partial stores, the merge).
-# Measured: of 0-16, 2 picks the faster of split and whole tasks at 39 batch shapes.
+# Units that splitting tasks adds to a CTA's equal share (a second Q load, partial
+# stores, the merge). Measured: of 0-16, 2 picks the faster of equal runs and
+# whole tasks at 39 batch shapes.
 _SPLIT_COST_UNITS = 2
 # Measured: 8-row merge programs are fastest at 1-4 groups (8-64 tried).
 _MERGE_ROWS = 8
@@ -95,9 +104,11 @@ _MERGE_ROWS = 8
 _TILE_SEARCH = 128
 # Schedule fields before unit_starts.
 _SCHEDULE_HEADER = 2
-# Merge list fields per CTA: tile (-1: none), query head, last CTA, first slot.
+# Merge list fields per CTA: tile (-1: none), query head, last CTA, first
+# segment's slot.
 _MERGE_FIELDS = 4
-# K/V offsets are 32-bit: 64-bit ones cost the registers of a third pipeline stage.
+# K/V offsets are computed in 32 bits, which saves registers: 64-bit offsets take
+# as many as a third pipeline stage would.
 _MAX_OFFSET = 2**31
 
 
@@ -141,17 +152,17 @@ def _task_first_unit(
 def _find_tile(
     unit_starts,  # [tiles + 1] int32, increasing
     num_tiles,
-    units_per_head,  # a count of units of one query head
+    head_unit,  # a unit number // Q_HEADS: a position on unit_starts' scale
     TILE_SEARCH: tl.constexpr,
 ):
-    """The last tile t with unit_starts[t] <= units_per_head; -1 without tiles.
+    """The last tile t with unit_starts[t] <= head_unit; -1 without tiles.
     Counts the tiles that start by then, TILE_SEARCH of them per step."""
     found = -1
     for base in range(0, num_tiles, TILE_SEARCH):
         candidates = base + tl.arange(0, TILE_SEARCH)
         valid = candidates < num_tiles
         starts = tl.load(unit_starts + candidates, mask=valid, other=0)
-        found += tl.sum(((starts <= units_per_head) & valid).to(tl.int32))
+        found += tl.sum(((starts <= head_unit) & valid).to(tl.int32))
     return found
 
 
@@ -166,7 +177,13 @@ def _task_of_unit(
     """The task that holds a unit."""
     # Tile t holds units [unit_starts[t] * Q_HEADS, unit_starts[t + 1] * Q_HEADS).
     tile = tl.maximum(
-        _find_tile(unit_starts, num_tiles, unit // Q_HEADS, TILE_SEARCH), 0
+        _find_tile(
+            unit_starts=unit_starts,
+            num_tiles=num_tiles,
+            head_unit=unit // Q_HEADS,
+            TILE_SEARCH=TILE_SEARCH,
+        ),
+        0,
     )
     tile_start = tl.load(unit_starts + tile)
     # At least 1: a zeroed layout, which a graph is captured with, has no units.
@@ -178,6 +195,8 @@ def _task_of_unit(
 def _unit_owner(unit, total_units, num_ctas):
     """The CTA whose equal run holds a unit: CTA c runs units
     [c * total_units // num_ctas, (c + 1) * total_units // num_ctas)."""
+    # unit < (c + 1) * total // n  <=>  c >= ((unit + 1) * n - 1) // total.
+    # The divisor is at least 1 for a zeroed layout, which has no units.
     owner = ((unit + 1).to(tl.int64) * num_ctas - 1) // tl.maximum(total_units, 1)
     return owner.to(tl.int32)
 
@@ -195,11 +214,13 @@ def _cta_run(
     """This CTA's run, [run_start, run_end), and the units of the batch.
 
     Two ways to share a batch's units, compared by the units of the busiest CTA:
-    - whole tasks: every CTA takes the same number of consecutive tasks, and no
-      task is split;
+    - whole tasks: CTA c takes tasks [c * n, (c + 1) * n), n = ceil(tasks / CTAs);
+      the last CTAs get fewer or none, and no task is split;
     - equal runs: every CTA takes the same number of units, and a task that is
       split costs SPLIT_COST_UNITS more.
-    Whole tasks win when the batch has about as many tasks as CTAs, or more.
+    Whole tasks win when splitting would save the busiest CTA at most
+    SPLIT_COST_UNITS units: the tasks are short, or their count is at or just
+    under a multiple of the CTA count.
     """
     longest_task_units = tl.load(schedule)
     total_units = tl.load(schedule + 1) * Q_HEADS
@@ -211,8 +232,12 @@ def _cta_run(
     if whole_tasks_cost <= equal_runs_cost:
         first_task = tl.minimum(cta * tasks_per_cta, num_tasks)
         end_task = tl.minimum(first_task + tasks_per_cta, num_tasks)
-        run_start = _task_first_unit(unit_starts, first_task, Q_HEADS)
-        run_end = _task_first_unit(unit_starts, end_task, Q_HEADS)
+        run_start = _task_first_unit(
+            unit_starts=unit_starts, task=first_task, Q_HEADS=Q_HEADS
+        )
+        run_end = _task_first_unit(
+            unit_starts=unit_starts, task=end_task, Q_HEADS=Q_HEADS
+        )
     else:
         run_start = ((cta.to(tl.int64) * total_units) // num_ctas).to(tl.int32)
         run_end = (((cta + 1).to(tl.int64) * total_units) // num_ctas).to(tl.int32)
@@ -245,8 +270,12 @@ def _write_merge_entry(
     A split task is listed once, by the CTA whose run holds its first work unit.
     Only the run's last task can be one: an earlier task of the run ends in it.
     """
-    task_start = _task_first_unit(unit_starts, last_task, Q_HEADS)
-    task_end = _task_first_unit(unit_starts, last_task + 1, Q_HEADS)
+    task_start = _task_first_unit(
+        unit_starts=unit_starts, task=last_task, Q_HEADS=Q_HEADS
+    )
+    task_end = _task_first_unit(
+        unit_starts=unit_starts, task=last_task + 1, Q_HEADS=Q_HEADS
+    )
     first_work_unit = task_start + SETUP_UNITS
     holds_first_work_unit = (run_start <= first_work_unit) & (first_work_unit < run_end)
     finished_later = run_end < task_end
@@ -256,8 +285,14 @@ def _write_merge_entry(
     tl.store(entry, tl.where(listed, last_task // Q_HEADS, -1))
     tl.store(entry + 1, last_task % Q_HEADS)
     # The merge reads the segments up to the CTA that runs the task's last unit.
-    tl.store(entry + 2, _unit_owner(task_end - 1, total_units, num_ctas))
-    tl.store(entry + 3, _segment_slot(cta, run_start, task_start))
+    last_cta = _unit_owner(
+        unit=task_end - 1, total_units=total_units, num_ctas=num_ctas
+    )
+    tl.store(entry + 2, last_cta)
+    first_segment_slot = _segment_slot(
+        cta=cta, run_start=run_start, task_start=task_start
+    )
+    tl.store(entry + 3, first_segment_slot)
 
 
 @triton.jit
@@ -306,9 +341,10 @@ def _attend_task(
 ):
     """Softmax state of a task after its work units [work_start, work_end).
 
-    The two loops of _width_free_shared_context_kernel, each limited to the range:
-    a task's first work units are its prompt blocks, the following ones its
-    decode steps. Returns (rows, beam_mask, max_values, normalizers, accumulator).
+    The two loops of the default kernel (_width_free_shared_context_kernel), each
+    limited to the range: a task's first work units are its prompt blocks, the
+    following ones its decode steps. KV slots stay 32-bit here (_MAX_OFFSET).
+    Returns (rows, beam_mask, max_values, normalizers, accumulator).
     """
     kv_head = q_head // Q_PER_KV
     beam_offsets = tl.arange(0, BLOCK_M)
@@ -318,14 +354,20 @@ def _attend_task(
     negative_infinity = -float("inf")
 
     rows, beam_mask, leader_row, prompt_len = tile_rows(
-        tiles, tile, beam_offsets, TILE_FIELDS
+        tiles=tiles, tile=tile, beam_offsets=beam_offsets, TILE_FIELDS=TILE_FIELDS
     )
     row_mask = beam_mask[:, None] & dim_mask[None, :]
     q_values = load_q(
-        q, rows, q_head, dim_offsets, row_mask, stride_q_row, stride_q_head
+        q=q,
+        rows=rows,
+        q_head=q_head,
+        dim_offsets=dim_offsets,
+        mask=row_mask,
+        stride_q_row=stride_q_row,
+        stride_q_head=stride_q_head,
     )
     max_values, normalizers, accumulator = empty_softmax_state(
-        beam_mask, BLOCK_M, BLOCK_D
+        beam_mask=beam_mask, BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D
     )
 
     # The prompt: all beams of the tile attend the same tokens, BLOCK_N at a time.
@@ -339,22 +381,34 @@ def _attend_task(
         slots = tl.load(prompt_slots + tokens, mask=token_mask, other=0)
         kv_mask = token_mask[:, None] & dim_mask[None, :]
         k_values = load_kv(
-            k_buffer, slots, kv_head, dim_offsets, kv_mask, stride_k_slot, stride_k_head
+            buffer=k_buffer,
+            slots=slots,
+            kv_head=kv_head,
+            dim_offsets=dim_offsets,
+            mask=kv_mask,
+            stride_slot=stride_k_slot,
+            stride_head=stride_k_head,
         )
         v_values = load_kv(
-            v_buffer, slots, kv_head, dim_offsets, kv_mask, stride_v_slot, stride_v_head
+            buffer=v_buffer,
+            slots=slots,
+            kv_head=kv_head,
+            dim_offsets=dim_offsets,
+            mask=kv_mask,
+            stride_slot=stride_v_slot,
+            stride_head=stride_v_head,
         )
         scores = tl.dot(q_values, tl.trans(k_values))
         scores = tl.where(
             beam_mask[:, None] & token_mask[None, :], scores, negative_infinity
         )
         max_values, normalizers, accumulator = attend_prompt_block(
-            scores,
-            v_values,
-            max_values,
-            normalizers,
-            accumulator,
-            softmax_scale_log2,
+            scores=scores,
+            v_values=v_values,
+            max_values=max_values,
+            normalizers=normalizers,
+            accumulator=accumulator,
+            softmax_scale_log2=softmax_scale_log2,
         )
 
     # The generated tokens: each beam attends its own, one decode step at a time.
@@ -370,32 +424,32 @@ def _attend_task(
     ):
         slots = tl.load(decode_slots + step, mask=beam_mask, other=0)
         k_values = load_kv(
-            k_buffer,
-            slots,
-            kv_head,
-            dim_offsets,
-            row_mask,
-            stride_k_slot,
-            stride_k_head,
+            buffer=k_buffer,
+            slots=slots,
+            kv_head=kv_head,
+            dim_offsets=dim_offsets,
+            mask=row_mask,
+            stride_slot=stride_k_slot,
+            stride_head=stride_k_head,
         )
         v_values = load_kv(
-            v_buffer,
-            slots,
-            kv_head,
-            dim_offsets,
-            row_mask,
-            stride_v_slot,
-            stride_v_head,
+            buffer=v_buffer,
+            slots=slots,
+            kv_head=kv_head,
+            dim_offsets=dim_offsets,
+            mask=row_mask,
+            stride_slot=stride_v_slot,
+            stride_head=stride_v_head,
         )
         scores = tl.sum(q_values.to(tl.float32) * k_values.to(tl.float32), axis=1)
         scores = tl.where(beam_mask, scores, negative_infinity)
         max_values, normalizers, accumulator = attend_beam_token(
-            scores,
-            v_values,
-            max_values,
-            normalizers,
-            accumulator,
-            softmax_scale_log2,
+            scores=scores,
+            v_values=v_values,
+            max_values=max_values,
+            normalizers=normalizers,
+            accumulator=accumulator,
+            softmax_scale_log2=softmax_scale_log2,
         )
     return rows, beam_mask, max_values, normalizers, accumulator
 
@@ -409,7 +463,7 @@ def _width_free_stream_k_kernel(
     req_pool_indices,  # [rows] int32 or int64, each row's pool row
     seq_lens,  # [rows] int32 or int64; only the leaders' are read
     layout,  # int32: header, tiles, schedule
-    output,  # like q; whole tasks and the padded rows are written here
+    output,  # like q; whole tasks and the padding rows are written here
     partial_output,  # [2 * num_ctas, BLOCK_M, HEAD_DIM] fp32, the segments' outputs
     partial_lse,  # [2 * num_ctas, BLOCK_M] fp32, log2 of the segments' softmax sums
     merge_list,  # [num_ctas, MERGE_FIELDS] int32, written for the merge kernel
@@ -455,24 +509,40 @@ def _width_free_stream_k_kernel(
     unit_starts = schedule + SCHEDULE_HEADER
 
     run_start, run_end, total_units = _cta_run(
-        schedule, unit_starts, num_tiles, cta, num_ctas, Q_HEADS, SPLIT_COST_UNITS
+        schedule=schedule,
+        unit_starts=unit_starts,
+        num_tiles=num_tiles,
+        cta=cta,
+        num_ctas=num_ctas,
+        Q_HEADS=Q_HEADS,
+        SPLIT_COST_UNITS=SPLIT_COST_UNITS,
     )
-    first_task = _task_of_unit(unit_starts, num_tiles, run_start, Q_HEADS, TILE_SEARCH)
+    first_task = _task_of_unit(
+        unit_starts=unit_starts,
+        num_tiles=num_tiles,
+        unit=run_start,
+        Q_HEADS=Q_HEADS,
+        TILE_SEARCH=TILE_SEARCH,
+    )
     last_task = _task_of_unit(
-        unit_starts, num_tiles, tl.maximum(run_end - 1, 0), Q_HEADS, TILE_SEARCH
+        unit_starts=unit_starts,
+        num_tiles=num_tiles,
+        unit=tl.maximum(run_end - 1, 0),
+        Q_HEADS=Q_HEADS,
+        TILE_SEARCH=TILE_SEARCH,
     )
     _write_merge_entry(
-        merge_list,
-        unit_starts,
-        cta,
-        num_ctas,
-        run_start,
-        run_end,
-        total_units,
-        last_task,
-        Q_HEADS,
-        SETUP_UNITS,
-        MERGE_FIELDS,
+        merge_list=merge_list,
+        unit_starts=unit_starts,
+        cta=cta,
+        num_ctas=num_ctas,
+        run_start=run_start,
+        run_end=run_end,
+        total_units=total_units,
+        last_task=last_task,
+        Q_HEADS=Q_HEADS,
+        SETUP_UNITS=SETUP_UNITS,
+        MERGE_FIELDS=MERGE_FIELDS,
     )
     if run_start == run_end:
         # This CTA has no units: the batch has fewer units, or tasks, than CTAs.
@@ -481,58 +551,69 @@ def _width_free_stream_k_kernel(
             partial_lse + 2 * cta * BLOCK_M + beam_offsets,
             tl.full((BLOCK_M,), -float("inf"), tl.float32),
         )
+        # No task to attend: the loop below is empty.
         last_task = first_task - 1
 
     for task in range(first_task, last_task + 1):
-        task_start = _task_first_unit(unit_starts, task, Q_HEADS)
-        task_end = _task_first_unit(unit_starts, task + 1, Q_HEADS)
+        task_start = _task_first_unit(
+            unit_starts=unit_starts, task=task, Q_HEADS=Q_HEADS
+        )
+        task_end = _task_first_unit(
+            unit_starts=unit_starts, task=task + 1, Q_HEADS=Q_HEADS
+        )
         work_start, work_end = _work_range(
-            run_start, run_end, task_start, task_end, SETUP_UNITS
+            run_start=run_start,
+            run_end=run_end,
+            task_start=task_start,
+            task_end=task_end,
+            SETUP_UNITS=SETUP_UNITS,
         )
         if work_start < work_end:
             q_head = task % Q_HEADS
             rows, beam_mask, max_values, normalizers, accumulator = _attend_task(
-                q,
-                k_buffer,
-                v_buffer,
-                req_to_token,
-                req_pool_indices,
-                seq_lens,
-                tiles,
-                task // Q_HEADS,
-                q_head,
-                work_start,
-                work_end,
-                softmax_scale_log2,
-                stride_q_row,
-                stride_q_head,
-                stride_k_slot,
-                stride_k_head,
-                stride_v_slot,
-                stride_v_head,
-                stride_req_to_token,
-                Q_PER_KV,
-                HEAD_DIM,
-                BLOCK_M,
-                BLOCK_N,
-                BLOCK_D,
-                TILE_FIELDS,
+                q=q,
+                k_buffer=k_buffer,
+                v_buffer=v_buffer,
+                req_to_token=req_to_token,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                tiles=tiles,
+                tile=task // Q_HEADS,
+                q_head=q_head,
+                work_start=work_start,
+                work_end=work_end,
+                softmax_scale_log2=softmax_scale_log2,
+                stride_q_row=stride_q_row,
+                stride_q_head=stride_q_head,
+                stride_k_slot=stride_k_slot,
+                stride_k_head=stride_k_head,
+                stride_v_slot=stride_v_slot,
+                stride_v_head=stride_v_head,
+                stride_req_to_token=stride_req_to_token,
+                Q_PER_KV=Q_PER_KV,
+                HEAD_DIM=HEAD_DIM,
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
+                BLOCK_D=BLOCK_D,
+                TILE_FIELDS=TILE_FIELDS,
             )
             row_mask = beam_mask[:, None] & dim_mask[None, :]
             covers_whole_task = (work_start == 0) & (run_end >= task_end)
             if covers_whole_task:
                 store_output(
-                    output,
-                    rows,
-                    q_head,
-                    dim_offsets,
-                    accumulator / normalizers[:, None],
-                    row_mask,
-                    stride_out_row,
-                    stride_out_head,
+                    output=output,
+                    rows=rows,
+                    q_head=q_head,
+                    dim_offsets=dim_offsets,
+                    values=accumulator / normalizers[:, None],
+                    mask=row_mask,
+                    stride_out_row=stride_out_row,
+                    stride_out_head=stride_out_head,
                 )
             else:
-                slot = _segment_slot(cta, run_start, task_start)
+                slot = _segment_slot(
+                    cta=cta, run_start=run_start, task_start=task_start
+                )
                 slot_beams = slot * BLOCK_M + beam_offsets
                 tl.store(
                     partial_output
@@ -550,18 +631,18 @@ def _width_free_stream_k_kernel(
 
     num_real_rows = tl.load(layout + 1)
     for q_head in range(0, Q_HEADS):
-        zero_padded_rows(
-            output,
-            num_real_rows,
-            num_rows,
-            cta,
-            num_ctas,
-            q_head,
-            stride_out_row,
-            stride_out_head,
-            HEAD_DIM,
-            BLOCK_M,
-            BLOCK_D,
+        zero_padding_rows(
+            output=output,
+            num_real_rows=num_real_rows,
+            num_rows=num_rows,
+            program=cta,
+            num_programs=num_ctas,
+            q_head=q_head,
+            stride_out_row=stride_out_row,
+            stride_out_head=stride_out_head,
+            HEAD_DIM=HEAD_DIM,
+            BLOCK_M=BLOCK_M,
+            BLOCK_D=BLOCK_D,
         )
 
 
@@ -584,9 +665,9 @@ def _width_free_merge_kernel(
 ):
     """Program (c, chunk) writes MERGE_ROWS beams of the split task CTA c listed.
 
-    The task's segments are in CTA c's first slot, then in slot 2 * c' of every
-    later CTA c' up to the listed last one. The output is their mean, weighted
-    by each segment's softmax sum.
+    The task's segments are in the slot that CTA c listed, then in slot 2 * c' of
+    every later CTA c' up to the listed last one. The output is their mean,
+    weighted by each segment's softmax sum.
     """
     cta = tl.program_id(0)
     entry = merge_list + MERGE_FIELDS * cta
@@ -594,10 +675,12 @@ def _width_free_merge_kernel(
     if tile >= 0:
         q_head = tl.load(entry + 1)
         last_cta = tl.load(entry + 2)
-        first_slot = tl.load(entry + 3)
+        first_segment_slot = tl.load(entry + 3)
         beam_offsets = tl.program_id(1) * MERGE_ROWS + tl.arange(0, MERGE_ROWS)
         tiles = layout + LAYOUT_HEADER
-        rows, beam_mask, _, _ = tile_rows(tiles, tile, beam_offsets, TILE_FIELDS)
+        rows, beam_mask, _, _ = tile_rows(
+            tiles=tiles, tile=tile, beam_offsets=beam_offsets, TILE_FIELDS=TILE_FIELDS
+        )
         # The last chunk reaches past the tile if MERGE_ROWS does not divide BLOCK_M.
         beam_mask = beam_mask & (beam_offsets < BLOCK_M)
         if tl.sum(beam_mask.to(tl.int32)) > 0:
@@ -608,7 +691,7 @@ def _width_free_merge_kernel(
             total_weight = tl.zeros((MERGE_ROWS,), tl.float32)
             accumulator = tl.zeros((MERGE_ROWS, BLOCK_D), tl.float32)
             for segment_cta in range(cta, last_cta + 1):
-                slot = tl.where(segment_cta == cta, first_slot, 2 * segment_cta)
+                slot = tl.where(segment_cta == cta, first_segment_slot, 2 * segment_cta)
                 slot_beams = slot * BLOCK_M + beam_offsets
                 segment_lse = tl.load(
                     partial_lse + slot_beams,
@@ -634,14 +717,14 @@ def _width_free_merge_kernel(
                 total_weight = total_weight * previous_scale + weight
                 max_lse = new_max
             store_output(
-                output,
-                rows,
-                q_head,
-                dim_offsets,
-                accumulator / total_weight[:, None],
-                row_mask,
-                stride_out_row,
-                stride_out_head,
+                output=output,
+                rows=rows,
+                q_head=q_head,
+                dim_offsets=dim_offsets,
+                values=accumulator / total_weight[:, None],
+                mask=row_mask,
+                stride_out_row=stride_out_row,
+                stride_out_head=stride_out_head,
             )
 
 

@@ -19,12 +19,14 @@ reads each prompt block once for up to BLOCK_M beams.
 
 Terms:
 - group: the rows of one beam request, a leader row and member rows. Beam 0 is
-  the leader; beam i >= 1 is member row `first member row + i - 1`. The prompt's
-  KV slots are in the leader's pool row.
+  the leader; beam i >= 1 is member row `first member row + i - 1`.
+- pool row: a batch row's row of req_to_token, req_pool_indices[row]. It lists
+  the KV slots of the row's tokens.
 - tile: up to BLOCK_M consecutive beams of one group, the work of one program at
   a time.
-- real rows: the rows of the batch. A CUDA graph captured for more rows pads Q
-  past them; padded rows are in no tile and their output is written as zeros.
+- real rows: the rows of the batch. A CUDA graph captured for more rows has
+  padding rows after them; they are in no tile and their output is written as
+  zeros.
 
 The layout is one int32 tensor that the host writes per batch
 (srt/beam_search/shared_context_width_free.py), its parts back to back:
@@ -60,10 +62,10 @@ from sglang.kernels.ops.attention.beam_shared_context import (
 _BLOCK_N = 64
 _NUM_STAGES = 3
 _NUM_WARPS = 8
-# Programs per SM. The grid is fixed, so that a graph can keep it, and program c
-# takes tiles c, c + num_ctas, ...; more programs than SMs even out tiles of
-# different lengths. Measured, same setup (2-16 tried): 8 is fastest for 4 groups
-# of 2,000 beams and within 3 us of the best elsewhere.
+# Programs per SM. The grid is fixed, so that a graph can keep it, and program p
+# of a query head takes tiles p, p + programs_per_head, ...; more programs than
+# SMs even out tiles of different lengths. Measured, same setup (2-16 tried): 8
+# is fastest for 4 groups of 2,000 beams and within 3 us of the best elsewhere.
 _PROGRAMS_PER_SM = 8
 
 # int32 entries of the layout's header and of one tile.
@@ -80,7 +82,7 @@ def header_and_tiles_len(num_tiles: int) -> int:
 def tile_rows(
     tiles,  # the layout's tiles, TILE_FIELDS int32 each
     tile,  # index of the tile to read
-    beam_offsets,  # [n] int32, positions in the tile, each in [0, BLOCK_M)
+    beam_offsets,  # [n] int32 positions in the tile; a caller masks those >= BLOCK_M
     TILE_FIELDS: tl.constexpr,
 ):
     """Batch rows of a tile's beams: (rows, beam_mask, leader_row, prompt_len).
@@ -169,12 +171,12 @@ def store_output(
 
 
 @triton.jit
-def zero_padded_rows(
+def zero_padding_rows(
     output,  # [rows, q_heads, HEAD_DIM]
     num_real_rows,  # rows of the batch, from the layout's header
     num_rows,  # rows of q and output, at least num_real_rows
-    cta,  # this program's index among the num_ctas that share the rows
-    num_ctas,
+    program,  # this program's index among the num_programs that share the rows
+    num_programs,
     q_head,
     stride_out_row,  # output.stride(0)
     stride_out_head,  # output.stride(1)
@@ -182,25 +184,26 @@ def zero_padded_rows(
     BLOCK_M: tl.constexpr,  # rows zeroed per store
     BLOCK_D: tl.constexpr,  # HEAD_DIM rounded up to a power of 2
 ):
-    """Zero one query head of the padded rows [num_real_rows, num_rows).
+    """Zero one query head of the padding rows [num_real_rows, num_rows).
 
-    No tile writes them and the output buffer starts uninitialized. The num_ctas
-    programs share the rows in blocks of BLOCK_M: program cta takes blocks cta,
-    cta + num_ctas, and so on.
+    No tile writes them and the output buffer starts uninitialized. The programs
+    share the rows in blocks of BLOCK_M: program p takes blocks p,
+    p + num_programs, and so on.
     """
     row_offsets = tl.arange(0, BLOCK_M)
     dim_offsets = tl.arange(0, BLOCK_D)
-    for row_start in range(num_real_rows + cta * BLOCK_M, num_rows, num_ctas * BLOCK_M):
-        padded_rows = row_start + row_offsets
+    first_row = num_real_rows + program * BLOCK_M
+    for row_start in range(first_row, num_rows, num_programs * BLOCK_M):
+        padding_rows = row_start + row_offsets
         store_output(
-            output,
-            padded_rows,
-            q_head,
-            dim_offsets,
-            tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32),
-            (padded_rows < num_rows)[:, None] & (dim_offsets < HEAD_DIM)[None, :],
-            stride_out_row,
-            stride_out_head,
+            output=output,
+            rows=padding_rows,
+            q_head=q_head,
+            dim_offsets=dim_offsets,
+            values=tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32),
+            mask=(padding_rows < num_rows)[:, None] & (dim_offsets < HEAD_DIM)[None, :],
+            stride_out_row=stride_out_row,
+            stride_out_head=stride_out_head,
         )
 
 
@@ -213,7 +216,7 @@ def _width_free_shared_context_kernel(
     req_pool_indices,  # [rows] int32 or int64, each row's pool row
     seq_lens,  # [rows] int32 or int64; only the leaders' are read
     layout,  # int32, see the module docstring
-    output,  # like q; every row is written, the padded ones with zeros
+    output,  # like q; every row is written, the padding rows with zeros
     softmax_scale,  # float, scales q.k before the softmax
     num_rows,  # q.shape[0]
     stride_q_row,  # q.stride(0); all strides are in elements
@@ -233,11 +236,11 @@ def _width_free_shared_context_kernel(
     LAYOUT_HEADER: tl.constexpr,
     TILE_FIELDS: tl.constexpr,
 ):
-    """Program (cta, q_head) attends tiles cta, cta + num_ctas, ... for one query
-    head, each from its first prompt token to its last generated token."""
-    cta = tl.program_id(0)
+    """Program (p, q_head) attends tiles p, p + programs_per_head, ... for one
+    query head, each from its first prompt token to its last generated token."""
+    program = tl.program_id(0)
     q_head = tl.program_id(1)
-    num_ctas = tl.num_programs(0)
+    programs_per_head = tl.num_programs(0)
     kv_head = q_head // Q_PER_KV
 
     beam_offsets = tl.arange(0, BLOCK_M)
@@ -250,16 +253,22 @@ def _width_free_shared_context_kernel(
 
     num_tiles = tl.load(layout)
     tiles = layout + LAYOUT_HEADER
-    for tile in range(cta, num_tiles, num_ctas):
+    for tile in range(program, num_tiles, programs_per_head):
         rows, beam_mask, leader_row, prompt_len = tile_rows(
-            tiles, tile, beam_offsets, TILE_FIELDS
+            tiles=tiles, tile=tile, beam_offsets=beam_offsets, TILE_FIELDS=TILE_FIELDS
         )
         row_mask = beam_mask[:, None] & dim_mask[None, :]
         q_values = load_q(
-            q, rows, q_head, dim_offsets, row_mask, stride_q_row, stride_q_head
+            q=q,
+            rows=rows,
+            q_head=q_head,
+            dim_offsets=dim_offsets,
+            mask=row_mask,
+            stride_q_row=stride_q_row,
+            stride_q_head=stride_q_head,
         )
         max_values, normalizers, accumulator = empty_softmax_state(
-            beam_mask, BLOCK_M, BLOCK_D
+            beam_mask=beam_mask, BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D
         )
 
         # The prompt: all beams of the tile attend the same tokens, BLOCK_N at a
@@ -274,34 +283,34 @@ def _width_free_shared_context_kernel(
             )
             kv_mask = token_mask[:, None] & dim_mask[None, :]
             k_values = load_kv(
-                k_buffer,
-                slots,
-                kv_head,
-                dim_offsets,
-                kv_mask,
-                stride_k_slot,
-                stride_k_head,
+                buffer=k_buffer,
+                slots=slots,
+                kv_head=kv_head,
+                dim_offsets=dim_offsets,
+                mask=kv_mask,
+                stride_slot=stride_k_slot,
+                stride_head=stride_k_head,
             )
             v_values = load_kv(
-                v_buffer,
-                slots,
-                kv_head,
-                dim_offsets,
-                kv_mask,
-                stride_v_slot,
-                stride_v_head,
+                buffer=v_buffer,
+                slots=slots,
+                kv_head=kv_head,
+                dim_offsets=dim_offsets,
+                mask=kv_mask,
+                stride_slot=stride_v_slot,
+                stride_head=stride_v_head,
             )
             scores = tl.dot(q_values, tl.trans(k_values))
             scores = tl.where(
                 beam_mask[:, None] & token_mask[None, :], scores, negative_infinity
             )
             max_values, normalizers, accumulator = attend_prompt_block(
-                scores,
-                v_values,
-                max_values,
-                normalizers,
-                accumulator,
-                softmax_scale_log2,
+                scores=scores,
+                v_values=v_values,
+                max_values=max_values,
+                normalizers=normalizers,
+                accumulator=accumulator,
+                softmax_scale_log2=softmax_scale_log2,
             )
 
         # The generated tokens: each beam attends its own, one decode step at a
@@ -314,22 +323,22 @@ def _width_free_shared_context_kernel(
         for step in range(0, decode_len):
             slots = tl.load(decode_slots + step, mask=beam_mask, other=0).to(tl.int64)
             k_values = load_kv(
-                k_buffer,
-                slots,
-                kv_head,
-                dim_offsets,
-                row_mask,
-                stride_k_slot,
-                stride_k_head,
+                buffer=k_buffer,
+                slots=slots,
+                kv_head=kv_head,
+                dim_offsets=dim_offsets,
+                mask=row_mask,
+                stride_slot=stride_k_slot,
+                stride_head=stride_k_head,
             )
             v_values = load_kv(
-                v_buffer,
-                slots,
-                kv_head,
-                dim_offsets,
-                row_mask,
-                stride_v_slot,
-                stride_v_head,
+                buffer=v_buffer,
+                slots=slots,
+                kv_head=kv_head,
+                dim_offsets=dim_offsets,
+                mask=row_mask,
+                stride_slot=stride_v_slot,
+                stride_head=stride_v_head,
             )
             scores = tl.sum(
                 q_values.to(tl.float32) * k_values.to(tl.float32),
@@ -337,44 +346,45 @@ def _width_free_shared_context_kernel(
             )
             scores = tl.where(beam_mask, scores, negative_infinity)
             max_values, normalizers, accumulator = attend_beam_token(
-                scores,
-                v_values,
-                max_values,
-                normalizers,
-                accumulator,
-                softmax_scale_log2,
+                scores=scores,
+                v_values=v_values,
+                max_values=max_values,
+                normalizers=normalizers,
+                accumulator=accumulator,
+                softmax_scale_log2=softmax_scale_log2,
             )
 
         store_output(
-            output,
-            rows,
-            q_head,
-            dim_offsets,
-            accumulator / normalizers[:, None],
-            row_mask,
-            stride_out_row,
-            stride_out_head,
+            output=output,
+            rows=rows,
+            q_head=q_head,
+            dim_offsets=dim_offsets,
+            values=accumulator / normalizers[:, None],
+            mask=row_mask,
+            stride_out_row=stride_out_row,
+            stride_out_head=stride_out_head,
         )
 
     num_real_rows = tl.load(layout + 1)
-    zero_padded_rows(
-        output,
-        num_real_rows,
-        num_rows,
-        cta,
-        num_ctas,
-        q_head,
-        stride_out_row,
-        stride_out_head,
-        HEAD_DIM,
-        BLOCK_M,
-        BLOCK_D,
+    zero_padding_rows(
+        output=output,
+        num_real_rows=num_real_rows,
+        num_rows=num_rows,
+        program=program,
+        num_programs=programs_per_head,
+        q_head=q_head,
+        stride_out_row=stride_out_row,
+        stride_out_head=stride_out_head,
+        HEAD_DIM=HEAD_DIM,
+        BLOCK_M=BLOCK_M,
+        BLOCK_D=BLOCK_D,
     )
 
 
-def _programs_per_q_head(device_index: int, q_heads: int) -> int:
-    """Grid width: _PROGRAMS_PER_SM programs per SM, over all query heads. It
-    depends on the device and the model only, so a graph keeps it for any batch."""
+def _programs_per_head(device_index: int, q_heads: int) -> int:
+    """Programs per query head, the grid's first axis; the whole grid then has
+    about _PROGRAMS_PER_SM programs per SM. It depends on the device and the
+    model only, so a graph keeps it for any batch."""
     return max(1, triton.cdiv(_PROGRAMS_PER_SM * num_sms(device_index), q_heads))
 
 
@@ -441,8 +451,8 @@ def shared_context_attention_width_free(
     - `q`: [rows, q_heads, head_dim], float16 or bfloat16, like the 3-D K/V buffers.
     - `layout`: the module's int32 layout of the batch.
     - `block_m`: beams per tile; it must be the tile size the layout was built with.
-    - `output`: like `q`, allocated when None. Rows past the layout's real rows
-      are written as zeros.
+    - `output`: like `q`, allocated when None. The padding rows, those past the
+      layout's real rows, are written as zeros.
     Tuned on SM120 only. One program reads a tile's whole prompt; the stream-K
     kernel of this layout splits long prompts over programs.
     """
@@ -459,7 +469,7 @@ def shared_context_attention_width_free(
     num_rows, q_heads, head_dim = q.shape
     kv_heads = k_buffer.shape[1]
 
-    grid = (_programs_per_q_head(q.device.index, q_heads), q_heads)
+    grid = (_programs_per_head(q.device.index, q_heads), q_heads)
     _width_free_shared_context_kernel[grid](
         q,
         k_buffer,

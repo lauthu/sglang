@@ -134,8 +134,8 @@ class TestSharedContextGraphReplay(CustomTestCase):
 class TestWidthFreeGraphReplay(CustomTestCase):
     def test_graph_captured_once_replays_any_widths(self):
         """Capture records no beam width, group count or length: one beam graph
-        replays every batch loaded into its layout, and the rows past a batch's
-        read 0. With stream-K, the batches alternate between splitting tasks and
+        replays every batch loaded into its layout, and the padding rows after
+        a batch's read 0. With stream-K, the batches alternate between splitting tasks and
         whole tasks per CTA (the batch of 40 groups)."""
         batches = (
             dict(widths=(256, 256), prompt_lens=(2048, 7), decode_lens=(2, 1)),
@@ -219,8 +219,8 @@ class TestWidthFreeGraphReplay(CustomTestCase):
                 torch.testing.assert_close(
                     output[:num_rows].float(), case.reference, rtol=1e-2, atol=1e-2
                 )
-                padded_rows = output[num_rows:]
-                self.assertEqual(int(padded_rows.abs().sum()), 0)
+                padding_rows = output[num_rows:]
+                self.assertEqual(int(padding_rows.abs().sum()), 0)
 
 
 if __name__ == "__main__":

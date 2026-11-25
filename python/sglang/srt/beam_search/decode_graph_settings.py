@@ -35,8 +35,10 @@ _WIDTH_FREE_KERNELS = ("default", "stream_k")
 
 
 def width_free_graphs_enabled() -> bool:
-    """The beam decode graphs take any beam width. Every beam decode batch then
-    gets the width-free layout, replayed or not."""
+    """SGLANG_ENABLE_BEAM_DECODE_GRAPH is on with no fixed width. With
+    shared-context attention on, which the callers check, the beam decode graphs
+    then take any beam width, and every beam decode batch gets the width-free
+    layout, replayed or not."""
     return (
         envs.SGLANG_ENABLE_BEAM_DECODE_GRAPH.get()
         and envs.SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH.get() is None

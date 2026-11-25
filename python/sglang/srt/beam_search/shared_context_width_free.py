@@ -157,8 +157,9 @@ def allocate_graph_metadata(
     stream_k: bool = False,
 ) -> WidthFreeBeamAttentionMetadata:
     """The metadata every beam graph captures: one zeroed layout buffer, long
-    enough for any batch of up to max_rows rows. A zeroed layout has no tiles, so
-    the captured launch does no work."""
+    enough for any batch of up to max_rows rows. A zeroed layout has no tiles and
+    no real rows, so the captured launch attends nothing and writes every output
+    row as zeros."""
     from sglang.kernels.ops.attention.beam_shared_context_width_free import (
         header_and_tiles_len,
     )

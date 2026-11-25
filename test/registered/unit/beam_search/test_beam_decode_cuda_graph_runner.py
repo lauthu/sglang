@@ -46,7 +46,10 @@ from sglang.srt.beam_search.shared_context_attention import (
     BeamAttentionBucket,
     BeamAttentionMetadata,
 )
-from sglang.srt.beam_search.shared_context_width_free import BEAMS_PER_TILE
+from sglang.srt.beam_search.shared_context_width_free import (
+    BEAMS_PER_TILE,
+    WidthFreeBeamAttentionMetadata,
+)
 from sglang.srt.beam_search.trie_config import TrieOutputHeadConfig
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -456,7 +459,10 @@ class TestWidthFreeBeamGraphInputs(CustomTestCase):
                 ),
             ):
                 metadata = shared_context_attention.build_metadata(batch, runner)
-                self.assertEqual(metadata is not width_buckets, expects_width_free)
+                self.assertEqual(
+                    isinstance(metadata, WidthFreeBeamAttentionMetadata),
+                    expects_width_free,
+                )
 
     def test_any_widths_load_into_a_larger_graph(self):
         """Width-free graphs take a batch of any widths and of fewer rows than
