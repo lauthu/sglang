@@ -202,62 +202,67 @@ def build_stream_k_plan(
     )
     first_task = np.minimum(first_task, num_tasks - 1)
     last_task = np.minimum(last_task, num_tasks - 1)
+    first_task_end = task_ends[first_task]
+    last_task_end = task_ends[last_task]
+    last_first_work_unit = first_work_units[last_task]
 
     # The segments of the first and the last task; the tasks between are whole.
     first_work_start = np.maximum(run_start - first_work_units[first_task], 0)
     last_work_start = np.where(last_task == first_task, first_work_start, 0)
-    last_work_end = (
-        np.minimum(run_end, task_ends[last_task]) - first_work_units[last_task]
-    )
+    last_work_end = np.minimum(run_end, last_task_end) - last_first_work_unit
 
     # A run that ends in its last task's setup units has no work for that task: the
     # task before it is then the run's last one, attended to its end.
     last_has_work = last_work_end > last_work_start
-    end_task = np.where(last_has_work, last_task + 1, last_task)
+    end_task = last_task + last_has_work
+    work_units_per_task = task_ends - first_work_units
     last_work_end = np.where(
-        last_has_work,
-        last_work_end,
-        task_ends[end_task - 1] - first_work_units[end_task - 1],
+        last_has_work, last_work_end, work_units_per_task[end_task - 1]
     )
     has_tasks = (run_start < run_end) & (first_task < end_task)
 
     # A segment is partial when another run has work units of its task.
-    first_is_partial = (first_work_start > 0) | (run_end < task_ends[first_task])
+    first_is_partial = (first_work_start > 0) | (run_end < first_task_end)
     last_is_partial = np.where(
         end_task - 1 == first_task,
         first_is_partial,
-        last_has_work & (run_end < task_ends[last_task]),
+        last_has_work & (run_end < last_task_end),
     )
 
     # A split task is listed by the run that holds its first work unit; only a
     # run's last task can be one. The merge reads its segments up to the CTA that
     # runs its last unit: CTA c runs units [c * total // n, (c + 1) * total // n).
     lists_task = (
-        (run_start <= first_work_units[last_task])
-        & (first_work_units[last_task] < run_end)
-        & (run_end < task_ends[last_task])
+        (run_start <= last_first_work_unit)
+        & (last_first_work_unit < run_end)
+        & (run_end < last_task_end)
     )
-    merge_last_cta = (task_ends[last_task] * num_ctas - 1) // max(total_units, 1)
-    starts_with_task = run_start >= task_starts[last_task]
+    merge_last_cta = (last_task_end * num_ctas - 1) // max(total_units, 1)
+    starts_with_task = run_start >= last_first_work_unit - _SETUP_UNITS
     merge_first_slot = 2 * np.arange(num_ctas) + np.where(starts_with_task, 0, 1)
 
-    # The kernels' field order (PLAN_FIELDS).
-    plan = np.stack(
+    # The kernels' field order (PLAN_FIELDS). A CTA without a task has zeros in
+    # the first six fields, one that lists no task in the last four.
+    segments = np.stack(
         [
-            np.where(has_tasks, first_task, 0),
-            np.where(has_tasks, end_task, 0),
-            np.where(has_tasks, first_work_start, 0),
-            np.where(has_tasks, last_work_end, 0),
-            has_tasks & first_is_partial,
-            has_tasks & last_is_partial,
-            np.where(lists_task, last_task // q_heads + 1, 0),
-            np.where(lists_task, last_task % q_heads, 0),
-            np.where(lists_task, merge_last_cta, 0),
-            np.where(lists_task, merge_first_slot, 0),
-        ],
-        axis=1,
+            first_task,
+            end_task,
+            first_work_start,
+            last_work_end,
+            first_is_partial,
+            last_is_partial,
+        ]
     )
-    return plan.astype(np.int32)
+    merge = np.stack(
+        [
+            last_task // q_heads + 1,
+            last_task % q_heads,
+            merge_last_cta,
+            merge_first_slot,
+        ]
+    )
+    plan = np.concatenate((segments * has_tasks, merge * lists_task))
+    return plan.T.astype(np.int32)
 
 
 @triton.jit
