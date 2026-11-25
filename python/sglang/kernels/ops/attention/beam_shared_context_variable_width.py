@@ -31,11 +31,11 @@ Terms:
   units are its prompt blocks (BLOCK_N tokens each), then its decode steps.
 
 The layout is one int32 tensor that the host writes per batch
-(srt/beam_search/shared_context_width_free.py), its parts back to back:
+(srt/beam_search/shared_context_variable_width.py), its parts back to back:
 - header: [number of tiles, number of real rows]
 - per tile: (leader row, first member row, members, prompt length, first beam)
 - for the stream-K kernel only: its schedule
-  (beam_shared_context_width_free_stream_k.py)
+  (beam_shared_context_variable_width_stream_k.py)
 The tensor may be longer than a batch's layout: the header bounds what is read.
 Beam widths live in this tensor, not in the launch arguments, so a graph captured
 for a row count replays for any widths that add up to at most that many rows.
@@ -457,7 +457,7 @@ def attend_tile(
 
 
 @triton.jit
-def _width_free_shared_context_kernel(
+def _variable_width_shared_context_kernel(
     q,  # [rows, q_heads, HEAD_DIM]; only the real rows are read
     k_buffer,  # [kv_slots, kv_heads, HEAD_DIM], the layer's K cache
     v_buffer,  # [kv_slots, kv_heads, HEAD_DIM], the layer's V cache
@@ -560,7 +560,7 @@ def _programs_per_head(device_index: int, q_heads: int) -> int:
     return max(1, triton.cdiv(_PROGRAMS_PER_SM * num_sms(device_index), q_heads))
 
 
-def check_width_free_inputs(
+def check_variable_width_inputs(
     q: torch.Tensor,
     k_buffer: torch.Tensor,
     v_buffer: torch.Tensor,
@@ -605,7 +605,7 @@ def check_width_free_inputs(
     return output
 
 
-def shared_context_attention_width_free(
+def shared_context_attention_variable_width(
     q: torch.Tensor,
     k_buffer: torch.Tensor,
     v_buffer: torch.Tensor,
@@ -628,7 +628,7 @@ def shared_context_attention_width_free(
     Tuned on SM120 only. One program reads a tile's whole prompt; the stream-K
     kernel of this layout splits long prompts over programs.
     """
-    output = check_width_free_inputs(
+    output = check_variable_width_inputs(
         q=q,
         k_buffer=k_buffer,
         v_buffer=v_buffer,
@@ -642,7 +642,7 @@ def shared_context_attention_width_free(
     kv_heads = k_buffer.shape[1]
 
     grid = (_programs_per_head(q.device.index, q_heads), q_heads)
-    _width_free_shared_context_kernel[grid](
+    _variable_width_shared_context_kernel[grid](
         q,
         k_buffer,
         v_buffer,

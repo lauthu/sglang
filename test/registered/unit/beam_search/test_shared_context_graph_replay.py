@@ -24,18 +24,18 @@ from sglang.srt.beam_search.beam_decode_cuda_graph_runner import (
     FixedWidthCapacity,
     FixedWidthSharedContextInput,
     TrieLevelsInput,
-    WidthFreeSharedContextInput,
+    VariableWidthSharedContextInput,
 )
 from sglang.srt.beam_search.forward_inputs import BeamForwardInputs
 from sglang.srt.beam_search.shared_context_attention import (
     BeamAttentionBucket,
     BeamAttentionMetadata,
 )
-from sglang.srt.beam_search.shared_context_width_free import build_width_free_metadata
+from sglang.srt.beam_search.shared_context_variable_width import build_variable_width_metadata
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.beam_shared_context import (
-    run_width_free_attention,
-    width_free_case,
+    run_variable_width_attention,
+    variable_width_case,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -131,7 +131,7 @@ class TestSharedContextGraphReplay(CustomTestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-class TestWidthFreeGraphReplay(CustomTestCase):
+class TestVariableWidthGraphReplay(CustomTestCase):
     def test_graph_captured_once_replays_any_widths(self):
         """Capture records no beam width, group count or length: one beam graph
         replays every batch loaded into its layout, and the padding rows after
@@ -151,7 +151,7 @@ class TestWidthFreeGraphReplay(CustomTestCase):
             ),
         )
         cases = tuple(
-            width_free_case(**batch, max_context=4096, seed=seed)
+            variable_width_case(**batch, max_context=4096, seed=seed)
             for seed, batch in enumerate(batches)
         )
         for stream_k in (False, True):
@@ -177,7 +177,7 @@ class TestWidthFreeGraphReplay(CustomTestCase):
             )
         beam_graph_inputs = BeamGraphInputs(
             trie_levels_input=TrieLevelsInput(max_rows=graph_size, device="cuda"),
-            shared_context_input=WidthFreeSharedContextInput(
+            shared_context_input=VariableWidthSharedContextInput(
                 max_rows=graph_size,
                 device=req_to_token.device,
                 req_to_token=req_to_token,
@@ -188,10 +188,10 @@ class TestWidthFreeGraphReplay(CustomTestCase):
             graph_size
         ).attention_metadata
         # Compile the kernels outside the capture.
-        run_width_free_attention(graph_tensors, graph_metadata)
+        run_variable_width_attention(graph_tensors, graph_metadata)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            output = run_width_free_attention(graph_tensors, graph_metadata)
+            output = run_variable_width_attention(graph_tensors, graph_metadata)
 
         for index, case in enumerate(cases):
             with self.subTest(batch=index):
@@ -204,7 +204,7 @@ class TestWidthFreeGraphReplay(CustomTestCase):
                 req_to_token[: len(case.req_to_token)].copy_(case.req_to_token)
                 batch_inputs = BeamForwardInputs(
                     trie_levels=torch.zeros(num_rows, dtype=torch.int64, device="cuda"),
-                    attention_metadata=build_width_free_metadata(
+                    attention_metadata=build_variable_width_metadata(
                         batch=case.batch,
                         req_to_token=case.req_to_token,
                         stream_k=stream_k,

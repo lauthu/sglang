@@ -6,7 +6,7 @@
 - Acceptance: sequence-set overlap vs HF transformers >= 0.8 for k in {2, 10}.
 - TestBeamParityDecodeGraph: the same acceptance on a server that replays
   all-beam decode batches as CUDA graphs.
-- TestBeamParityWidthFreeDecodeGraph: the same on graphs that take any beam
+- TestBeamParityVariableWidthDecodeGraph: the same on graphs that take any beam
   width (no SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH).
 
 Manual test (GPU host): python3 test_beam_parity.py
@@ -192,8 +192,8 @@ class TestBeamParityDecodeGraph(TestBeamParity):
         self.assertEqual(after["decode_none"], before["decode_none"])
 
 
-class TestBeamParityWidthFreeDecodeGraph(TestBeamParity):
-    """The same acceptance on the width-free graphs: requests of any beam width
+class TestBeamParityVariableWidthDecodeGraph(TestBeamParity):
+    """The same acceptance on the variable-width graphs: requests of any beam width
     replay graphs of the default decode graph sizes, with no width and no token
     budget set."""
 

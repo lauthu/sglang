@@ -23,10 +23,10 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 import torch
 
-from sglang.srt.beam_search import shared_context_width_free as width_free
+from sglang.srt.beam_search import shared_context_variable_width as variable_width
 from sglang.srt.beam_search.decode_graph_settings import (
     stream_k_selected,
-    width_free_graphs_enabled,
+    variable_width_graphs_enabled,
 )
 from sglang.srt.environ import envs
 
@@ -149,7 +149,7 @@ def _metadata_tensor(values, dtype, device):
 def build_metadata(
     batch: ScheduleBatch,
     model_runner: ModelRunner,
-) -> Optional[BeamAttentionMetadata | width_free.WidthFreeBeamAttentionMetadata]:
+) -> Optional[BeamAttentionMetadata | variable_width.VariableWidthBeamAttentionMetadata]:
     if batch.beam_tail is None or not batch.forward_mode.is_decode() or not enabled():
         return None
     if not supports_shared_context(model_runner):
@@ -157,10 +157,10 @@ def build_metadata(
     entries = batch.beam_tail.entries
     if not entries or batch.seq_lens_cpu is None:
         return None
-    # A width-free graph replays only the width-free layout, so on such a server
+    # A variable-width graph replays only the variable-width layout, so on such a server
     # every beam decode batch gets it, replayed or not.
-    if width_free_graphs_enabled():
-        return width_free.build_width_free_metadata(
+    if variable_width_graphs_enabled():
+        return variable_width.build_variable_width_metadata(
             batch=batch,
             req_to_token=model_runner.req_to_token_pool.req_to_token,
             stream_k=stream_k_selected(),
@@ -282,9 +282,9 @@ def forward(
     k_buffer, v_buffer = kv_layers.read(layer.layer_id).kv()
     if k_buffer.ndim != 3 or v_buffer.ndim != 3:
         raise RuntimeError("Shared-context attention requires 3D MHA K/V cache buffers")
-    # A width-free layout has no buckets; its own kernels read it.
-    if isinstance(metadata, width_free.WidthFreeBeamAttentionMetadata):
-        return width_free.forward(
+    # A variable-width layout has no buckets; its own kernels read it.
+    if isinstance(metadata, variable_width.VariableWidthBeamAttentionMetadata):
+        return variable_width.forward(
             q=q,
             layer=layer,
             forward_batch=forward_batch,

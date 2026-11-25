@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Width-free shared-context attention: the host side.
+"""Variable-width shared-context attention: the host side.
 
 The beam decode graphs that take any beam width (decode_graph_settings) cannot
 record a width at capture. So instead of per-width buckets of gathered KV slots,
@@ -25,7 +25,7 @@ Terms:
 - tile: up to BEAMS_PER_TILE consecutive beams of one group. The kernels work
   tile by tile.
 - layout: one int32 tensor that lists a batch's tiles. Its format is in
-  kernels/ops/attention/beam_shared_context_width_free.py.
+  kernels/ops/attention/beam_shared_context_variable_width.py.
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ if TYPE_CHECKING:
 BEAMS_PER_TILE = 128
 
 
-class WidthFreeBeamAttentionMetadata(msgspec.Struct):
+class VariableWidthBeamAttentionMetadata(msgspec.Struct):
     # One batch's layout, or the graphs' shared buffer, which is long enough for
     # the largest graph's layout.
     layout: torch.Tensor
@@ -75,12 +75,12 @@ def _layout_tensor(values: list[int], device) -> torch.Tensor:
     return torch.tensor(values, dtype=torch.int32, device=device)
 
 
-def build_width_free_metadata(
+def build_variable_width_metadata(
     batch: ScheduleBatch,
     req_to_token: torch.Tensor,
     *,
     stream_k: bool = False,
-) -> Optional[WidthFreeBeamAttentionMetadata]:
+) -> Optional[VariableWidthBeamAttentionMetadata]:
     """The layout of a beam decode batch, built on the host. Returns None for a
     batch the kernels do not take; it then runs ordinary attention."""
     num_rows = len(batch.seq_lens)
@@ -124,7 +124,7 @@ def build_width_free_metadata(
         values.extend(msgspec.structs.astuple(tile))
     if stream_k:
         values.extend(_stream_k_schedule(tiles=tiles, decode_lens=decode_lens))
-    return WidthFreeBeamAttentionMetadata(
+    return VariableWidthBeamAttentionMetadata(
         layout=_layout_tensor(values=values, device=batch.device),
         req_to_token=req_to_token,
         stream_k=stream_k,
@@ -136,7 +136,7 @@ def _stream_k_schedule(tiles: list[_Tile], decode_lens: list[int]) -> list[int]:
     prompt length and generated tokens."""
     # The kernel modules import Triton, so this module imports them where it calls
     # them.
-    from sglang.kernels.ops.attention.beam_shared_context_width_free_stream_k import (
+    from sglang.kernels.ops.attention.beam_shared_context_variable_width_stream_k import (
         build_schedule,
         task_units,
     )
@@ -155,15 +155,15 @@ def allocate_graph_metadata(
     req_to_token: torch.Tensor,
     *,
     stream_k: bool = False,
-) -> WidthFreeBeamAttentionMetadata:
+) -> VariableWidthBeamAttentionMetadata:
     """The metadata every beam graph captures: one zeroed layout buffer, long
     enough for any batch of up to max_rows rows. A zeroed layout has no tiles and
     no real rows, so the captured launch attends nothing and writes every output
     row as zeros."""
-    from sglang.kernels.ops.attention.beam_shared_context_width_free import (
+    from sglang.kernels.ops.attention.beam_shared_context_variable_width import (
         header_and_tiles_len,
     )
-    from sglang.kernels.ops.attention.beam_shared_context_width_free_stream_k import (
+    from sglang.kernels.ops.attention.beam_shared_context_variable_width_stream_k import (
         schedule_len,
     )
 
@@ -174,7 +174,7 @@ def allocate_graph_metadata(
     layout_len = header_and_tiles_len(num_tiles=max_tiles)
     if stream_k:
         layout_len += schedule_len(num_tiles=max_tiles)
-    return WidthFreeBeamAttentionMetadata(
+    return VariableWidthBeamAttentionMetadata(
         layout=torch.zeros(layout_len, dtype=torch.int32, device=device),
         req_to_token=req_to_token,
         stream_k=stream_k,
@@ -186,23 +186,23 @@ def attention_kernel(stream_k: bool):
     SGLANG_BEAM_SHARED_CONTEXT_KERNEL; the stream-K module says where each is
     faster."""
     if stream_k:
-        from sglang.kernels.ops.attention.beam_shared_context_width_free_stream_k import (
-            shared_context_attention_width_free_stream_k,
+        from sglang.kernels.ops.attention.beam_shared_context_variable_width_stream_k import (
+            shared_context_attention_variable_width_stream_k,
         )
 
-        return shared_context_attention_width_free_stream_k
-    from sglang.kernels.ops.attention.beam_shared_context_width_free import (
-        shared_context_attention_width_free,
+        return shared_context_attention_variable_width_stream_k
+    from sglang.kernels.ops.attention.beam_shared_context_variable_width import (
+        shared_context_attention_variable_width,
     )
 
-    return shared_context_attention_width_free
+    return shared_context_attention_variable_width
 
 
 def forward(
     q: torch.Tensor,
     layer: RadixAttention,
     forward_batch: ForwardBatch,
-    metadata: WidthFreeBeamAttentionMetadata,
+    metadata: VariableWidthBeamAttentionMetadata,
     k_buffer: torch.Tensor,
     v_buffer: torch.Tensor,
 ) -> torch.Tensor:

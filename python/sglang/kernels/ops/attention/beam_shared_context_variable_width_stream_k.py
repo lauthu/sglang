@@ -16,7 +16,7 @@
 Opt-in with SGLANG_BEAM_SHARED_CONTEXT_KERNEL=stream_k on a server whose beam
 decode graphs take any beam width; every beam decode batch there runs it,
 replayed or eager. It computes what the default kernel
-(beam_shared_context_width_free.py) computes, from the same layout. That kernel
+(beam_shared_context_variable_width.py) computes, from the same layout. That kernel
 gives a program whole tiles, so one request with a long prompt keeps a few SMs
 busy and leaves the others idle; this one shares the work of a batch evenly over
 the SMs.
@@ -70,11 +70,11 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.beam_shared_context import num_sms
-from sglang.kernels.ops.attention.beam_shared_context_width_free import (
+from sglang.kernels.ops.attention.beam_shared_context_variable_width import (
     LAYOUT_HEADER,
     TILE_FIELDS,
     attend_tile,
-    check_width_free_inputs,
+    check_variable_width_inputs,
     store_output,
     tile_rows,
     zero_padding_rows,
@@ -307,7 +307,7 @@ def _work_range(
 
 
 @triton.jit
-def _width_free_stream_k_kernel(
+def _variable_width_stream_k_kernel(
     q,  # [rows, q_heads, HEAD_DIM]; only the real rows are read
     k_buffer,  # [kv_slots, kv_heads, HEAD_DIM], the layer's K cache
     v_buffer,  # [kv_slots, kv_heads, HEAD_DIM], the layer's V cache
@@ -500,7 +500,7 @@ def _width_free_stream_k_kernel(
 
 
 @triton.jit
-def _width_free_merge_kernel(
+def _variable_width_merge_kernel(
     partial_output,  # [2 * num_ctas, BLOCK_M, HEAD_DIM] fp32, the segments' outputs
     partial_lse,  # [2 * num_ctas, BLOCK_M] fp32, log2 of the segments' softmax sums
     merge_list,  # [num_ctas, MERGE_FIELDS] int32, from the stream-K kernel
@@ -581,7 +581,7 @@ def _width_free_merge_kernel(
             )
 
 
-def shared_context_attention_width_free_stream_k(
+def shared_context_attention_variable_width_stream_k(
     q: torch.Tensor,
     k_buffer: torch.Tensor,
     v_buffer: torch.Tensor,
@@ -596,7 +596,7 @@ def shared_context_attention_width_free_stream_k(
     num_ctas: int | None = None,
     split_cost_units: int = _SPLIT_COST_UNITS,
 ) -> torch.Tensor:
-    """shared_context_attention_width_free on a persistent stream-K grid.
+    """shared_context_attention_variable_width on a persistent stream-K grid.
 
     Same inputs and output; `layout` must carry the schedule of its tiles
     (`build_schedule`) after them. Rejects K/V buffers of 2^31 elements or more.
@@ -607,7 +607,7 @@ def shared_context_attention_width_free_stream_k(
     - `split_cost_units`: a very large value forces whole tasks, a negative one
       equal runs.
     """
-    output = check_width_free_inputs(
+    output = check_variable_width_inputs(
         q=q,
         k_buffer=k_buffer,
         v_buffer=v_buffer,
@@ -639,7 +639,7 @@ def shared_context_attention_width_free_stream_k(
         (num_ctas, _MERGE_FIELDS), dtype=torch.int32, device=q.device
     )
     block_d = triton.next_power_of_2(head_dim)
-    _width_free_stream_k_kernel[(num_ctas,)](
+    _variable_width_stream_k_kernel[(num_ctas,)](
         q,
         k_buffer,
         v_buffer,
@@ -679,7 +679,7 @@ def shared_context_attention_width_free_stream_k(
         num_warps=_NUM_WARPS,
         num_stages=_NUM_STAGES,
     )
-    _width_free_merge_kernel[(num_ctas, triton.cdiv(block_m, _MERGE_ROWS))](
+    _variable_width_merge_kernel[(num_ctas, triton.cdiv(block_m, _MERGE_ROWS))](
         partial_output,
         partial_lse,
         merge_list,

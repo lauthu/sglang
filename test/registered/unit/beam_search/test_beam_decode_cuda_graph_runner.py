@@ -35,7 +35,7 @@ from sglang.srt.beam_search.beam_decode_cuda_graph_runner import (
     FixedWidthCapacity,
     FixedWidthSharedContextInput,
     TrieLevelsInput,
-    WidthFreeSharedContextInput,
+    VariableWidthSharedContextInput,
     _create_beam_graph_inputs,
 )
 from sglang.srt.beam_search.forward_inputs import (
@@ -46,9 +46,9 @@ from sglang.srt.beam_search.shared_context_attention import (
     BeamAttentionBucket,
     BeamAttentionMetadata,
 )
-from sglang.srt.beam_search.shared_context_width_free import (
+from sglang.srt.beam_search.shared_context_variable_width import (
     BEAMS_PER_TILE,
-    WidthFreeBeamAttentionMetadata,
+    VariableWidthBeamAttentionMetadata,
 )
 from sglang.srt.beam_search.trie_config import TrieOutputHeadConfig
 from sglang.srt.environ import envs
@@ -299,7 +299,7 @@ def _model_runner(compact_head=True, lora=False):
 def _shared_context_server(*, decode_graphs=True, fixed_width=None, kernel="default"):
     """The settings of a server with shared-context attention on and supported.
     With the beam decode graphs on and no fixed width, its graphs are the
-    width-free ones."""
+    variable-width ones."""
     with contextlib.ExitStack() as stack:
         overrides = (
             (envs.SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION, True),
@@ -364,12 +364,12 @@ def _decode_batch(widths, prompt_len=7, decode_len=2):
     )
 
 
-def _width_free_graph_inputs(max_rows, *, trie_head=True):
+def _variable_width_graph_inputs(max_rows, *, trie_head=True):
     return BeamGraphInputs(
         trie_levels_input=(
             TrieLevelsInput(max_rows=max_rows, device="cpu") if trie_head else None
         ),
-        shared_context_input=WidthFreeSharedContextInput(
+        shared_context_input=VariableWidthSharedContextInput(
             max_rows=max_rows,
             device="cpu",
             req_to_token=torch.zeros(4, 8, dtype=torch.int32),
@@ -399,18 +399,18 @@ def _rows_in_tiles(layout):
     return rows
 
 
-class TestWidthFreeBeamGraphInputs(CustomTestCase):
+class TestVariableWidthBeamGraphInputs(CustomTestCase):
     def test_settings_decide_what_the_graphs_hold(self):
         """With a fixed width set, graphs hold the fixed-width shared-context
         input, which limits them to whole groups of that width. Without one they
-        hold the width-free input and are captured at every size. A LoRA server
+        hold the variable-width input and are captured at every size. A LoRA server
         gets no beam graphs: the beam label takes LoRA's slot of the graph key."""
         # (fixed width, compact head, LoRA) -> the shared-context input's class,
         # or None for a server without beam graphs.
         cases = {
             (2, True, False): FixedWidthSharedContextInput,
-            (None, True, False): WidthFreeSharedContextInput,
-            (None, False, False): WidthFreeSharedContextInput,
+            (None, True, False): VariableWidthSharedContextInput,
+            (None, False, False): VariableWidthSharedContextInput,
             (None, True, True): None,
         }
         for (fixed_width, compact_head, lora), input_class in cases.items():
@@ -436,19 +436,19 @@ class TestWidthFreeBeamGraphInputs(CustomTestCase):
                 # 3 rows are not whole groups of 2 beams.
                 self.assertEqual(inputs.can_capture(3), fixed_width is None)
 
-    def test_only_graphs_without_a_fixed_width_run_the_width_free_layout(self):
+    def test_only_graphs_without_a_fixed_width_run_the_variable_width_layout(self):
         """A server keeps the per-width buckets, and with them its kernel, unless
         its beam decode graphs take any width: with the graphs off, or with a
-        fixed width, a batch must not get the width-free layout."""
+        fixed width, a batch must not get the variable-width layout."""
         batch, runner = _decode_batch((4, 4)), _model_runner()
         width_buckets = object()
-        # Server settings -> whether a batch gets the width-free layout.
+        # Server settings -> whether a batch gets the variable-width layout.
         cases = (
             ({"decode_graphs": False}, False),
             ({"fixed_width": 4}, False),
             ({}, True),
         )
-        for settings, expects_width_free in cases:
+        for settings, expects_variable_width in cases:
             with (
                 self.subTest(settings=settings),
                 _shared_context_server(**settings),
@@ -460,16 +460,16 @@ class TestWidthFreeBeamGraphInputs(CustomTestCase):
             ):
                 metadata = shared_context_attention.build_metadata(batch, runner)
                 self.assertEqual(
-                    isinstance(metadata, WidthFreeBeamAttentionMetadata),
-                    expects_width_free,
+                    isinstance(metadata, VariableWidthBeamAttentionMetadata),
+                    expects_variable_width,
                 )
 
     def test_any_widths_load_into_a_larger_graph(self):
-        """Width-free graphs take a batch of any widths and of fewer rows than
+        """Variable-width graphs take a batch of any widths and of fewer rows than
         they hold. Loaded over a larger earlier batch's layout, the batch's tiles
         must cover each of its rows exactly once."""
         with _shared_context_server():
-            inputs = _width_free_graph_inputs(max_rows=600)
+            inputs = _variable_width_graph_inputs(max_rows=600)
             self.assertTrue(inputs.can_capture(431))
             captured = inputs.prepare_capture_inputs(512)
             runner = _model_runner()
@@ -488,10 +488,10 @@ class TestWidthFreeBeamGraphInputs(CustomTestCase):
             self.assertEqual(sorted(_rows_in_tiles(layout)), list(range(431)))
 
     def test_dense_head_batch_replays_without_trie_levels(self):
-        """With the compact trie head off, a beam batch carries its width-free
+        """With the compact trie head off, a beam batch carries its variable-width
         layout and no trie levels; a graph captured without levels replays it."""
         with _shared_context_server():
-            inputs = _width_free_graph_inputs(max_rows=600, trie_head=False)
+            inputs = _variable_width_graph_inputs(max_rows=600, trie_head=False)
             captured = inputs.prepare_capture_inputs(512)
             self.assertIsNone(captured.trie_levels)
             beam = build_beam_forward_inputs(
@@ -505,13 +505,13 @@ class TestWidthFreeBeamGraphInputs(CustomTestCase):
                 list(range(431)),
             )
 
-    def test_width_free_graph_takes_no_ordinary_attention_batch(self):
+    def test_variable_width_graph_takes_no_ordinary_attention_batch(self):
         """A batch that the layout builder turned away (here: a finished group's
         leader is still in it) carries no layout; replaying it would attend the
         previous batch's groups. A batch with a regular request carries no beam
         inputs at all, so it decodes on the ordinary path."""
         with _shared_context_server():
-            inputs = _width_free_graph_inputs(max_rows=600)
+            inputs = _variable_width_graph_inputs(max_rows=600)
             inputs.prepare_capture_inputs(512)
             beam = build_beam_forward_inputs(
                 _decode_batch((129, FINISHED_GROUP, 300)), _model_runner()
@@ -525,7 +525,7 @@ class TestWidthFreeBeamGraphInputs(CustomTestCase):
             )
 
     def test_startup_rejects_settings_that_cannot_run_together(self):
-        """The width-free graphs have no split-KV kernel: selecting it there must
+        """The variable-width graphs have no split-KV kernel: selecting it there must
         not silently run another kernel. With a fixed width, or with the graphs
         off, the server keeps the kernels that take all three names."""
         check = decode_graph_settings.check_settings
@@ -536,9 +536,9 @@ class TestWidthFreeBeamGraphInputs(CustomTestCase):
                 ValueError, "'split_kv' is not available when .* any beam width"
             ):
                 check()
-        for without_width_free_graphs in ({"fixed_width": 2}, {"decode_graphs": False}):
+        for without_variable_width_graphs in ({"fixed_width": 2}, {"decode_graphs": False}):
             for kernel in ("split_kv", "stream_k"):
-                with _shared_context_server(kernel=kernel, **without_width_free_graphs):
+                with _shared_context_server(kernel=kernel, **without_variable_width_graphs):
                     check()
 
 

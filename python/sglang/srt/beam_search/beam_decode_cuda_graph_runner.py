@@ -33,18 +33,18 @@ import msgspec
 import torch
 
 from sglang.srt.beam_search import shared_context_attention
-from sglang.srt.beam_search import shared_context_width_free as width_free
+from sglang.srt.beam_search import shared_context_variable_width as variable_width
 from sglang.srt.beam_search.decode_graph_settings import (
     stream_k_selected,
-    width_free_graphs_enabled,
+    variable_width_graphs_enabled,
 )
 from sglang.srt.beam_search.forward_inputs import BeamForwardInputs
 from sglang.srt.beam_search.shared_context_attention import (
     BeamAttentionBucket,
     BeamAttentionMetadata,
 )
-from sglang.srt.beam_search.shared_context_width_free import (
-    WidthFreeBeamAttentionMetadata,
+from sglang.srt.beam_search.shared_context_variable_width import (
+    VariableWidthBeamAttentionMetadata,
 )
 from sglang.srt.beam_search.trie_config import get_beam_trie_config
 from sglang.srt.environ import envs
@@ -281,12 +281,12 @@ class FixedWidthSharedContextInput:
         )
 
 
-class WidthFreeSharedContextInput:
+class VariableWidthSharedContextInput:
     """Graph buffer for shared-context attention with any beam widths, used when
     SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH is unset.
 
     Nothing about beam widths is captured: a batch describes its beams in one
-    layout that the kernels read at run time (shared_context_width_free). So:
+    layout that the kernels read at run time (shared_context_variable_width). So:
 
     - Every graph size gets a beam graph.
     - A batch pads to the next size like any decode batch.
@@ -304,7 +304,7 @@ class WidthFreeSharedContextInput:
         req_to_token: torch.Tensor,
         stream_k: bool,
     ):
-        self._graph_metadata = width_free.allocate_graph_metadata(
+        self._graph_metadata = variable_width.allocate_graph_metadata(
             max_rows=max_rows,
             device=device,
             req_to_token=req_to_token,
@@ -314,7 +314,7 @@ class WidthFreeSharedContextInput:
     @classmethod
     def create(
         cls, model_runner: ModelRunner, *, max_rows: int
-    ) -> Optional[WidthFreeSharedContextInput]:
+    ) -> Optional[VariableWidthSharedContextInput]:
         """Returns None, and logs why, when shared-context batches get no graph."""
         if model_runner.lora_manager is not None:
             logger.warning(
@@ -332,16 +332,16 @@ class WidthFreeSharedContextInput:
     def can_capture(self, graph_size: int) -> bool:
         return True
 
-    def prepare_capture_inputs(self, graph_size: int) -> WidthFreeBeamAttentionMetadata:
+    def prepare_capture_inputs(self, graph_size: int) -> VariableWidthBeamAttentionMetadata:
         return self._graph_metadata
 
     def can_replay(
-        self, metadata: Optional[WidthFreeBeamAttentionMetadata], *, graph_size: int
+        self, metadata: Optional[VariableWidthBeamAttentionMetadata], *, graph_size: int
     ) -> bool:
         # Any layout fits: the buffer holds the largest graph's.
         return metadata is not None
 
-    def load_replay_inputs(self, metadata: WidthFreeBeamAttentionMetadata) -> None:
+    def load_replay_inputs(self, metadata: VariableWidthBeamAttentionMetadata) -> None:
         # Entries past the batch's layout keep an earlier batch's values; the
         # kernels stop at the tile count in the layout's header.
         batch_layout = metadata.layout
@@ -364,7 +364,7 @@ class BeamGraphInputs:
         *,
         trie_levels_input: Optional[TrieLevelsInput],
         shared_context_input: Optional[
-            FixedWidthSharedContextInput | WidthFreeSharedContextInput
+            FixedWidthSharedContextInput | VariableWidthSharedContextInput
         ],
     ):
         self.trie_levels_input = trie_levels_input
@@ -430,8 +430,8 @@ def _create_beam_graph_inputs(model_runner: ModelRunner) -> Optional[BeamGraphIn
         shared_context_attention.supports_shared_context(model_runner)
     ):
         input_class = (
-            WidthFreeSharedContextInput
-            if width_free_graphs_enabled()
+            VariableWidthSharedContextInput
+            if variable_width_graphs_enabled()
             else FixedWidthSharedContextInput
         )
         shared_context_input = input_class.create(model_runner, max_rows=max_rows)

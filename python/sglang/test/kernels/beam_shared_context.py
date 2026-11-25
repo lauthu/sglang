@@ -1,4 +1,4 @@
-"""A decode batch for the width-free shared-context attention kernels, with its
+"""A decode batch for the variable-width shared-context attention kernels, with its
 FP32 reference: per row, plain softmax attention over the row's own KV slots."""
 
 import math
@@ -7,13 +7,13 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.beam_search.batch_tail import BeamTailEntry
-from sglang.srt.beam_search.shared_context_width_free import (
+from sglang.srt.beam_search.shared_context_variable_width import (
     BEAMS_PER_TILE,
     attention_kernel,
 )
 
 
-def width_free_case(
+def variable_width_case(
     widths,
     prompt_lens,
     decode_lens,
@@ -104,7 +104,7 @@ def width_free_case(
     )
 
 
-def run_width_free_attention(case, metadata, **stream_k_options):
+def run_variable_width_attention(case, metadata, **stream_k_options):
     """Launch the kernel a layout selects, as serving does, on a case's tensors
     (or on a graph's own, which carry the same fields). `stream_k_options` force
     the stream-K kernel's grid size and its choice of splitting tasks."""

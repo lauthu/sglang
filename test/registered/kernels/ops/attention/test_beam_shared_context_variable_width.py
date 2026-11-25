@@ -22,11 +22,11 @@ import unittest
 
 import torch
 
-from sglang.srt.beam_search.shared_context_width_free import build_width_free_metadata
+from sglang.srt.beam_search.shared_context_variable_width import build_variable_width_metadata
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.beam_shared_context import (
-    run_width_free_attention,
-    width_free_case,
+    run_variable_width_attention,
+    variable_width_case,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -41,18 +41,18 @@ TUNED_NUM_CTAS = 188
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-class TestWidthFreeSharedContextAttention(CustomTestCase):
+class TestVariableWidthSharedContextAttention(CustomTestCase):
     def _assert_matches_reference(self, case, *, stream_k, **stream_k_options):
-        metadata = build_width_free_metadata(
+        metadata = build_variable_width_metadata(
             batch=case.batch, req_to_token=case.req_to_token, stream_k=stream_k
         )
-        output = run_width_free_attention(case, metadata, **stream_k_options)
+        output = run_variable_width_attention(case, metadata, **stream_k_options)
         torch.testing.assert_close(output.float(), case.reference, rtol=1e-2, atol=1e-2)
 
     def test_any_widths_match_fp32_reference(self):
         """Beam widths on both sides of the 128-beam tile size in one batch, each
         request with its own prompt (up to 5,000 tokens) and generated tokens."""
-        case = width_free_case(
+        case = variable_width_case(
             widths=(2, 3, 127, 128, 129, 256, 300),
             prompt_lens=(1, 5000, 64, 65, 300, 129, 513),
             decode_lens=(1, 4, 2, 3, 1, 2, 4),
@@ -66,14 +66,14 @@ class TestWidthFreeSharedContextAttention(CustomTestCase):
         """Wherever the CTAs' runs cut the work (inside a prompt, at a decode step,
         between heads, tiles and groups, with CTAs left without units), the
         segments merge into the same attention; so do whole tasks per CTA."""
-        mixed = width_free_case(
+        mixed = variable_width_case(
             widths=(2, 129, 2, 300, 3, 7),
             prompt_lens=(1, 700, 64, 513, 2048, 130),
             decode_lens=(5, 1, 2, 4, 1, 3),
             max_context=4096,
         )
         # 4 tasks of 3 units each: most of the 64 CTAs get no unit.
-        tiny = width_free_case(widths=(2,), prompt_lens=(1,), decode_lens=(1,))
+        tiny = variable_width_case(widths=(2,), prompt_lens=(1,), decode_lens=(1,))
         runs = (
             (mixed, 1, ALWAYS_SPLIT),
             (mixed, 3, ALWAYS_SPLIT),

@@ -764,7 +764,7 @@ class Envs:
     # Replay decode batches made only of beam requests as CUDA graphs.
     SGLANG_ENABLE_BEAM_DECODE_GRAPH = EnvBool(False)
     # The one beam width of those graphs under shared-context attention. Unset:
-    # width-free graphs, for beam requests of any widths.
+    # variable-width graphs, for beam requests of any widths.
     SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH = EnvInt(None)
     # Tokens a fixed-width graph holds per request; required when the model has
     # no trie.
