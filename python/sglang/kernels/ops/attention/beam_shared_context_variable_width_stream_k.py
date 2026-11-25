@@ -53,11 +53,10 @@ The host builds the plan once per decode step and every layer's launch reads it.
 A zeroed plan gives every CTA no task and nothing to merge, so a graph captured
 on a zeroed layout attends nothing.
 
-Against the default kernel, per launch on SM120 with 2,048-token prompts: 2.7x to
-3.8x faster for one request of 16 to 256 beams, 1.2x for 4 or 8 requests of 256
-beams, and 6% slower for 8 requests of 16, 64 and 256 beams. That batch already
-gives each SM about one task, so nothing is left to balance, and a unit costs
-more here (2 pipeline stages against 3).
+Against the default kernel, per launch on SM120 with 2,048-token prompts: 3.0x to
+4.1x faster for one request of 16 to 256 beams, 1.2x to 1.3x for 4 or 8 requests
+of 256 beams, and as fast for 8 requests of 16, 64 and 256 beams. That batch
+already gives each SM about one task, so nothing is left to balance.
 """
 
 from __future__ import annotations

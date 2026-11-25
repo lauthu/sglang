@@ -245,7 +245,7 @@ def attend_prompt_blocks(
     # The loop variable counts tokens (PROMPT_LOOP_STEP is BLOCK_N) or blocks (1);
     # the blocks and their order are the same. The two kernels are each faster with
     # another one, measured per launch on SM120: the default kernel by 4% counting
-    # tokens, stream-K by 5% counting blocks.
+    # tokens, stream-K by 2% counting blocks.
     tokens_per_count = BLOCK_N // PROMPT_LOOP_STEP
     first_count = first_block * PROMPT_LOOP_STEP
     # Counted in tokens, the last block ends at the prompt's length.
