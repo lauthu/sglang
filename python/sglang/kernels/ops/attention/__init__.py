@@ -64,6 +64,8 @@ _TRITON_KERNELS = [
     ("fused_qk_rope_reshape_and_cache", "fused_qk_rope_reshape_and_cache"),
     ("mla_qk_prep", "concat_and_cast_mha_k_triton"),
     ("beam_shared_context", "shared_context_attention"),
+    ("beam_shared_context_split_kv", "shared_context_attention_split_kv"),
+    ("beam_shared_context_stream_k", "shared_context_attention_stream_k"),
     # One contract, shared-context attention for any beam widths in a launch;
     # two ops because the registry holds one spec per (op, backend).
     ("beam_shared_context_width_free", "shared_context_attention_width_free"),
@@ -774,3 +776,25 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
     )
 )
+register_kernel(
+    KernelSpec(
+        op="attention.indexer_head_gate",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsa.head_gate:indexer_head_gate",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
+    )
+)
+
+for _op, _module in (
+    ("finish_prefill_indexer_topk", "fp4_indexer"),
+    ("select_candidate_block_ids_triton", "candidate_blocks"),
+):
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_op}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.dsv4.{_module}:{_op}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+del _op, _module

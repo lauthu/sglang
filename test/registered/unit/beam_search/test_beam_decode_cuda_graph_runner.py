@@ -499,24 +499,25 @@ class TestWidthFreeBeamGraphInputs(CustomTestCase):
             )
 
     def test_startup_rejects_settings_that_cannot_run_together(self):
-        """The stream-K kernel exists only on the width-free graphs, and a kernel
-        name they do not have must not silently run another kernel."""
+        """The width-free graphs have no split-KV kernel: selecting it there must
+        not silently run another kernel. With a fixed width, or with the graphs
+        off, the fixed-width layout takes all three."""
         check = decode_graph_settings.check_settings
         with _beam_decode_graphs(SGLANG_BEAM_SHARED_CONTEXT_KERNEL="stream_k"):
             check()
+        with _beam_decode_graphs(SGLANG_BEAM_SHARED_CONTEXT_KERNEL="split_kv"):
+            with self.assertRaisesRegex(ValueError, "not a kernel of the width-free"):
+                check()
         for without_width_free_graphs in (
             {"fixed_width": 2},
             {"SGLANG_ENABLE_BEAM_DECODE_GRAPH": False},
         ):
-            with _beam_decode_graphs(
-                SGLANG_BEAM_SHARED_CONTEXT_KERNEL="stream_k",
-                **without_width_free_graphs,
-            ):
-                with self.assertRaisesRegex(ValueError, "FIXED_WIDTH unset"):
+            for kernel in ("split_kv", "stream_k"):
+                with _beam_decode_graphs(
+                    SGLANG_BEAM_SHARED_CONTEXT_KERNEL=kernel,
+                    **without_width_free_graphs,
+                ):
                     check()
-        with _beam_decode_graphs(SGLANG_BEAM_SHARED_CONTEXT_KERNEL="split_kv"):
-            with self.assertRaisesRegex(ValueError, "not one of"):
-                check()
 
 
 if __name__ == "__main__":

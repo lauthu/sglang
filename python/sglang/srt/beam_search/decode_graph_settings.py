@@ -41,7 +41,7 @@ def width_free_graphs_enabled() -> bool:
 
 
 def stream_k_selected() -> bool:
-    """The width-free layout runs the stream-K kernel, not the tile-per-CTA one."""
+    """The width-free layout runs its stream-K kernel, not its tile-per-CTA one."""
     return envs.SGLANG_BEAM_SHARED_CONTEXT_KERNEL.get() == "stream_k"
 
 
@@ -49,17 +49,14 @@ def check_settings() -> None:
     """Startup check: raise on settings that cannot run together, and name a
     setting that has no effect."""
     kernel = envs.SGLANG_BEAM_SHARED_CONTEXT_KERNEL.get()
-    if kernel not in _WIDTH_FREE_KERNELS:
-        raise ValueError(
-            f"SGLANG_BEAM_SHARED_CONTEXT_KERNEL={kernel!r} is not one of "
-            f"{', '.join(_WIDTH_FREE_KERNELS)}"
-        )
     width_free = width_free_graphs_enabled()
-    if kernel != "default" and not width_free:
+    # With a fixed width, or without the graphs, shared_context_attention checks
+    # the name against its own three kernels.
+    if width_free and kernel not in _WIDTH_FREE_KERNELS:
         raise ValueError(
-            f"SGLANG_BEAM_SHARED_CONTEXT_KERNEL={kernel!r} is a kernel of the "
-            "width-free beam decode graphs: set SGLANG_ENABLE_BEAM_DECODE_GRAPH "
-            "and leave SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH unset"
+            f"SGLANG_BEAM_SHARED_CONTEXT_KERNEL={kernel!r} is not a kernel of the "
+            f"width-free beam decode graphs ({', '.join(_WIDTH_FREE_KERNELS)}): "
+            "pick one of those or set SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH"
         )
     max_new_tokens = envs.SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH_MAX_NEW_TOKENS
     if width_free and max_new_tokens.is_set():
