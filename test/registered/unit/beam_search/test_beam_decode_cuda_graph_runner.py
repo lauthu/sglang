@@ -34,10 +34,10 @@ from sglang.srt.beam_search.batch_tail import BeamTailEntry
 from sglang.srt.beam_search.beam_decode_cuda_graph_runner import (
     BeamGraphInputs,
     DenseRowsInput,
-    FixedWidthAttentionInput,
     FixedWidthCapacity,
+    FixedWidthSharedContextInput,
     TrieLevelsInput,
-    WidthFreeAttentionInput,
+    WidthFreeSharedContextInput,
     _create_beam_graph_inputs,
 )
 from sglang.srt.beam_search.forward_inputs import (
@@ -67,8 +67,10 @@ def _inputs(max_rows, *, trie_head=True, shared_context=True) -> BeamGraphInputs
         trie_levels_input=(
             TrieLevelsInput(max_rows=max_rows, device="cpu") if trie_head else None
         ),
-        attention_input=(
-            FixedWidthAttentionInput(max_rows=max_rows, device="cpu", capacity=CAPACITY)
+        shared_context_input=(
+            FixedWidthSharedContextInput(
+                max_rows=max_rows, device="cpu", capacity=CAPACITY
+            )
             if shared_context
             else None
         ),
@@ -198,22 +200,22 @@ class TestBeamGraphInputs(CustomTestCase):
         )
 
 
-class TestFixedWidthAttentionInput(CustomTestCase):
+class TestFixedWidthSharedContextInput(CustomTestCase):
     def test_a_smaller_graph_captures_on_its_own_values(self):
         """Graphs of every size share the buffers, and a graph of fewer groups
         reads them at other offsets. What a larger graph's batch left there is
         no valid input: a length past the capacity reads outside the buffers."""
-        attention_input = FixedWidthAttentionInput(
+        shared_context_input = FixedWidthSharedContextInput(
             max_rows=8, device="cpu", capacity=CAPACITY
         )
-        attention_input.prepare_capture_inputs(8)
-        attention_input.load_replay_inputs(
+        shared_context_input.prepare_capture_inputs(8)
+        shared_context_input.load_replay_inputs(
             _metadata(
                 prompt_lens=[CAPACITY.max_context_len] * 4,
                 decode_lens=[CAPACITY.max_decode_len] * 4,
             )
         )
-        bucket = attention_input.prepare_capture_inputs(4).buckets[0]
+        bucket = shared_context_input.prepare_capture_inputs(4).buckets[0]
         self.assertEqual(sorted(bucket.row_indices.flatten().tolist()), [0, 1, 2, 3])
         prompt_offsets = bucket.context_cu_seqlens.tolist()
         self.assertEqual(prompt_offsets[0], 0)
@@ -258,7 +260,7 @@ class TestFixedWidthAttentionInput(CustomTestCase):
                     max_new_tokens
                 ),
             ):
-                attention = FixedWidthAttentionInput.create(runner, max_rows=8)
+                attention = FixedWidthSharedContextInput.create(runner, max_rows=8)
                 if max_decode_len is None:
                     self.assertIsNone(attention)
                 else:
@@ -356,7 +358,7 @@ def _width_free_inputs(max_rows, *, mixed_batches=False, trie_head=True):
         trie_levels_input=(
             TrieLevelsInput(max_rows=max_rows, device="cpu") if trie_head else None
         ),
-        attention_input=WidthFreeAttentionInput(
+        shared_context_input=WidthFreeSharedContextInput(
             max_rows=max_rows,
             device="cpu",
             req_to_token=torch.zeros(4, 8, dtype=torch.int32),
@@ -392,18 +394,18 @@ def _rows_in_tiles(layout):
 
 class TestWidthFreeBeamGraphInputs(CustomTestCase):
     def test_settings_decide_what_the_graphs_hold(self):
-        """Graphs hold the fixed-width attention input, which limits them to whole
+        """Graphs hold the fixed-width shared-context input, which limits them to whole
         groups of that width, only when a width is set; otherwise they hold the
         width-free one and take every size. Rows are kept only for mixed batches
         and where the compact head fills them, and LoRA, whose graph key slot the
         beam label takes, leaves a shared-context server without beam graphs."""
         # (fixed width, mixed batches, compact head, LoRA):
-        # (attention input, kept rows), None for no graphs
+        # (shared-context input, kept rows), None for no graphs
         cases = {
-            (2, False, True, False): (FixedWidthAttentionInput, False),
-            (None, False, True, False): (WidthFreeAttentionInput, False),
-            (None, True, True, False): (WidthFreeAttentionInput, True),
-            (None, True, False, False): (WidthFreeAttentionInput, False),
+            (2, False, True, False): (FixedWidthSharedContextInput, False),
+            (None, False, True, False): (WidthFreeSharedContextInput, False),
+            (None, True, True, False): (WidthFreeSharedContextInput, True),
+            (None, True, False, False): (WidthFreeSharedContextInput, False),
             (None, False, True, True): None,
         }
         for (fixed_width, mixed, compact_head, lora), holds in cases.items():
@@ -428,7 +430,7 @@ class TestWidthFreeBeamGraphInputs(CustomTestCase):
                     self.assertIsNone(inputs)
                     continue
                 attention, keeps_rows = holds
-                self.assertIs(type(inputs.attention_input), attention)
+                self.assertIs(type(inputs.shared_context_input), attention)
                 self.assertEqual(inputs.dense_rows_input is not None, keeps_rows)
                 self.assertEqual(inputs.trie_levels_input is not None, compact_head)
                 self.assertEqual(inputs.can_capture(3), fixed_width is None)
