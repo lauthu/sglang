@@ -25,8 +25,8 @@ import torch
 from sglang.srt.beam_search import beam_decode_cuda_graph_runner
 from sglang.srt.beam_search.beam_decode_cuda_graph_runner import (
     BeamGraphInputs,
-    FixedWidthSharedContextInput,
     FixedWidthCapacity,
+    FixedWidthSharedContextInput,
     TrieLevelsInput,
 )
 from sglang.srt.beam_search.forward_inputs import BeamForwardInputs

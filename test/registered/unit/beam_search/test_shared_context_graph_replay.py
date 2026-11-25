@@ -20,8 +20,8 @@ import torch
 from sglang.kernels.ops.attention.beam_shared_context import shared_context_attention
 from sglang.srt.beam_search.beam_decode_cuda_graph_runner import (
     BeamGraphInputs,
-    FixedWidthSharedContextInput,
     FixedWidthCapacity,
+    FixedWidthSharedContextInput,
 )
 from sglang.srt.beam_search.forward_inputs import BeamForwardInputs
 from sglang.srt.beam_search.shared_context_attention import (
