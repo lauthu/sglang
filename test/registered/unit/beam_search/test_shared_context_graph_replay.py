@@ -11,8 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Shared-context beam graphs replay the batch loaded into their shared buffers,
-and the trie head keeps regular requests' full-vocabulary rows on the way."""
+"""Shared-context beam graphs replay the batch loaded into their shared buffers."""
 
 import unittest
 from types import SimpleNamespace
@@ -28,7 +27,6 @@ from sglang.srt.beam_search.beam_decode_cuda_graph_runner import (
     WidthFreeSharedContextInput,
 )
 from sglang.srt.beam_search.forward_inputs import BeamForwardInputs
-from sglang.srt.beam_search.mixed_batch import BeamDenseRows
 from sglang.srt.beam_search.shared_context_attention import (
     BeamAttentionBucket,
     BeamAttentionMetadata,
@@ -37,8 +35,6 @@ from sglang.srt.beam_search.shared_context_ragged import (
     RAGGED_BLOCK_M,
     build_ragged_metadata,
 )
-from sglang.srt.beam_search.trie_config import TrieOutputHeadConfig
-from sglang.srt.beam_search.trie_output_head import BeamTrieOutputHead
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.beam_shared_context import ragged_case, run_ragged
 from sglang.test.test_utils import CustomTestCase
@@ -138,9 +134,9 @@ class TestSharedContextGraphReplay(CustomTestCase):
 class TestWidthFreeGraphReplay(CustomTestCase):
     def test_graph_captured_once_replays_any_split(self):
         """Nothing about widths, group count or lengths is recorded at capture: one
-        beam graph replays every split loaded into its layout, regular requests as
-        one-row groups included, and padded rows read 0. With stream-K, the batches
-        alternate between splitting the units and whole tiles per CTA (40 tiles)."""
+        beam graph replays every split loaded into its layout, and padded rows read
+        0. With stream-K, the batches alternate between splitting the units and
+        whole tiles per CTA (40 tiles)."""
         cases = tuple(
             ragged_case(*split, max_context=4096, seed=seed)
             for seed, split in enumerate(
@@ -149,7 +145,7 @@ class TestWidthFreeGraphReplay(CustomTestCase):
                     ((2, 129, 300), (5, 1000, 64), (3, 1, 2)),
                     ((2,) * 40, (64,) * 40, (1,) * 40),
                     ((7,), (33,), (4,)),
-                    ((1, 256, 1, 1), (900, 2048, 3000, 1), (2, 1, 0, 6)),
+                    ((2, 256, 3, 2), (900, 2048, 3000, 1), (2, 1, 1, 6)),
                 )
             )
         )
@@ -180,7 +176,6 @@ class TestWidthFreeGraphReplay(CustomTestCase):
                 max_rows=graph_size,
                 device=req_to_token.device,
                 req_to_token=req_to_token,
-                allow_one_row_groups=True,
                 stream_k=stream_k,
             ),
         )
@@ -203,7 +198,6 @@ class TestWidthFreeGraphReplay(CustomTestCase):
                     attention_metadata=build_ragged_metadata(
                         batch=case.batch,
                         req_to_token=case.req_to_token,
-                        allow_one_row_groups=True,
                         stream_k=stream_k,
                     ),
                 )
@@ -215,53 +209,6 @@ class TestWidthFreeGraphReplay(CustomTestCase):
                     output[:rows].float(), case.reference, rtol=1e-2, atol=1e-2
                 )
                 self.assertEqual(int(output[rows:].abs().sum()), 0)
-
-
-@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-class TestTrieHeadKeptRows(CustomTestCase):
-    def test_trie_head_keeps_every_chunk_in_its_columns(self):
-        """On CUDA the trie head writes each vocabulary chunk's transformed logits
-        into that chunk's columns of the kept rows, and keeping leaves its
-        normalizer as is."""
-        torch.manual_seed(0)
-        config = TrieOutputHeadConfig(
-            tensor_path="/unused/trie_output_head.safetensors",
-            token_start=8,
-            codebook_size=4,
-            num_codebooks=2,
-        )
-        vocab_size, chunk_size = 2500, 1000
-        hidden_states = torch.randn(6, 64, device="cuda", dtype=torch.bfloat16)
-        weight = torch.randn(2560, 64, device="cuda", dtype=torch.bfloat16)
-        depths = torch.zeros(6, dtype=torch.int64, device="cuda")
-
-        def project(states, selected_weight):
-            return torch.matmul(states, selected_weight.T)
-
-        def transform(logits):
-            return logits * 2
-
-        head = BeamTrieOutputHead(config, vocab_size=vocab_size, chunk_size=chunk_size)
-        plain = head.project_mixed(hidden_states, weight, depths, project, transform)
-        kept = head.project_mixed(
-            hidden_states,
-            weight,
-            depths,
-            project,
-            transform,
-            dense_rows=BeamDenseRows(num_rows=4),
-        )
-        chunks = [
-            transform(
-                project(
-                    hidden_states, weight[start : min(start + chunk_size, vocab_size)]
-                )
-            )
-            for start in range(0, vocab_size, chunk_size)
-        ]
-        reference = torch.cat(chunks, dim=1).float()
-        self.assertTrue(torch.equal(kept.dense_logits, reference[:4]))
-        self.assertTrue(torch.equal(kept.normalizer, plain.normalizer))
 
 
 if __name__ == "__main__":

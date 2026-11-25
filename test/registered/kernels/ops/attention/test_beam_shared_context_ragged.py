@@ -35,46 +35,26 @@ register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-s
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestRaggedSharedContextAttention(CustomTestCase):
-    def _assert_matches_reference(
-        self, case, *, allow_one_row_groups, stream_k, **forced
-    ):
+    def _assert_matches_reference(self, case, *, stream_k, **forced):
         metadata = build_ragged_metadata(
-            batch=case.batch,
-            req_to_token=case.req_to_token,
-            allow_one_row_groups=allow_one_row_groups,
-            stream_k=stream_k,
+            batch=case.batch, req_to_token=case.req_to_token, stream_k=stream_k
         )
         output = run_ragged(case, metadata, block_m=RAGGED_BLOCK_M, **forced)
         torch.testing.assert_close(output.float(), case.reference, rtol=1e-2, atol=1e-2)
 
     def test_any_split_matches_fp32_reference(self):
         """Mixed widths across the 128-beam tile edge, each group with its own prompt
-        and decode length, leaders apart from their member rows."""
+        (up to 5,000 tokens) and decode length, leaders apart from their member
+        rows."""
         case = ragged_case(
             widths=(2, 3, 127, 128, 129, 256, 300),
-            prompt_lens=(1, 700, 64, 65, 300, 129, 513),
+            prompt_lens=(1, 5000, 64, 65, 300, 129, 513),
             decode_lens=(1, 4, 2, 3, 1, 2, 4),
-        )
-        for stream_k in (False, True):
-            with self.subTest(stream_k=stream_k):
-                self._assert_matches_reference(
-                    case, allow_one_row_groups=False, stream_k=stream_k
-                )
-
-    def test_regular_rows_as_one_row_groups_match_fp32_reference(self):
-        """Regular requests among beam groups attend over their whole KV as one-row
-        groups, up to 5,000 tokens, in the same launch as the beams."""
-        case = ragged_case(
-            widths=(1, 129, 1, 2, 1, 300),
-            prompt_lens=(1, 700, 2048, 64, 5000, 513),
-            decode_lens=(5, 1, 3, 2, 0, 4),
             max_context=8192,
         )
         for stream_k in (False, True):
             with self.subTest(stream_k=stream_k):
-                self._assert_matches_reference(
-                    case, allow_one_row_groups=True, stream_k=stream_k
-                )
+                self._assert_matches_reference(case, stream_k=stream_k)
 
     def test_stream_k_any_cut_of_the_units_matches_fp32_reference(self):
         """Wherever the CTA runs cut the work (inside a prompt, at a decode step,
@@ -82,9 +62,9 @@ class TestRaggedSharedContextAttention(CustomTestCase):
         merge into the same attention; so do whole tiles per CTA."""
         never, always = 1 << 20, -(1 << 20)
         mixed = ragged_case(
-            widths=(1, 129, 2, 300, 1, 7),
+            widths=(2, 129, 2, 300, 3, 7),
             prompt_lens=(1, 700, 64, 513, 2048, 130),
-            decode_lens=(5, 1, 2, 4, 0, 3),
+            decode_lens=(5, 1, 2, 4, 1, 3),
             max_context=4096,
         )
         tiny = ragged_case(widths=(2,), prompt_lens=(1,), decode_lens=(1,))
@@ -100,7 +80,6 @@ class TestRaggedSharedContextAttention(CustomTestCase):
             with self.subTest(run=index, num_ctas=num_ctas, whole=split_cost_units > 0):
                 self._assert_matches_reference(
                     case,
-                    allow_one_row_groups=True,
                     stream_k=True,
                     num_ctas=num_ctas,
                     split_cost_units=split_cost_units,

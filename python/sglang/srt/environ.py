@@ -761,12 +761,6 @@ class Envs:
     # Tokens a fixed-width graph holds per request; required when the model has
     # no trie.
     SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH_MAX_NEW_TOKENS = EnvInt(None)
-    # Also replay decode batches that mix beam and regular requests. Needs the
-    # compact trie head and the width-free graphs.
-    SGLANG_ENABLE_BEAM_DECODE_GRAPH_MIXED_BATCH = EnvBool(False)
-    # Most requests in such a batch; a larger one runs the ordinary decode path.
-    # Arbitrary: 64 kept fp32 rows are 39 MB at 151,936 tokens.
-    SGLANG_BEAM_DECODE_GRAPH_MIXED_BATCH_MAX_REQUESTS = EnvInt(64)
     # Shared-context attention kernel of the width-free graphs: "default" (one
     # CTA per tile and query head) or "stream_k" (prompts split across CTAs).
     SGLANG_BEAM_SHARED_CONTEXT_KERNEL = EnvStr("default")

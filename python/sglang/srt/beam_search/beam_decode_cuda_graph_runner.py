@@ -32,15 +32,13 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 import torch
 
-from sglang.srt.beam_search import mixed_batch, shared_context_attention
+from sglang.srt.beam_search import shared_context_attention
 from sglang.srt.beam_search import shared_context_ragged as ragged
 from sglang.srt.beam_search.decode_graph_settings import (
-    mixed_batch_enabled,
     stream_k_selected,
     width_free_graphs_enabled,
 )
 from sglang.srt.beam_search.forward_inputs import BeamForwardInputs
-from sglang.srt.beam_search.mixed_batch import BeamDenseRows
 from sglang.srt.beam_search.shared_context_attention import (
     BeamAttentionBucket,
     BeamAttentionMetadata,
@@ -302,7 +300,6 @@ class WidthFreeSharedContextInput:
         max_rows: int,
         device,
         req_to_token: torch.Tensor,
-        allow_one_row_groups: bool,
         stream_k: bool,
     ):
         # Capture-time value: all zeros, which is a launch that does no work.
@@ -310,13 +307,12 @@ class WidthFreeSharedContextInput:
             max_rows=max_rows,
             device=device,
             req_to_token=req_to_token,
-            allow_one_row_groups=allow_one_row_groups,
             stream_k=stream_k,
         )
 
     @classmethod
     def create(
-        cls, model_runner: ModelRunner, *, max_rows: int, allow_one_row_groups: bool
+        cls, model_runner: ModelRunner, *, max_rows: int
     ) -> Optional[WidthFreeSharedContextInput]:
         """Returns None, and logs why, when shared-context batches get no graph."""
         if model_runner.lora_manager is not None:
@@ -329,7 +325,6 @@ class WidthFreeSharedContextInput:
             max_rows=max_rows,
             device=model_runner.device,
             req_to_token=model_runner.req_to_token_pool.req_to_token,
-            allow_one_row_groups=allow_one_row_groups,
             stream_k=stream_k_selected(),
         )
 
@@ -351,38 +346,6 @@ class WidthFreeSharedContextInput:
         self._graph_layout.layout[: len(batch_layout)].copy_(batch_layout)
 
 
-class DenseRowsInput:
-    """Graph buffer for the full-vocabulary rows kept for regular requests, with
-    SGLANG_ENABLE_BEAM_DECODE_GRAPH_MIXED_BATCH and the compact trie head.
-
-    - Every graph writes the rows it is told to keep into one buffer of
-      SGLANG_BEAM_DECODE_GRAPH_MIXED_BATCH_MAX_REQUESTS rows.
-    - A batch of beam requests alone carries no rows to keep; it replays with a
-      count of 0.
-    """
-
-    def __init__(self, *, max_rows: int, vocab_size: int, device):
-        self._graph_dense_rows = mixed_batch.allocate_capture_dense_rows(
-            max_rows=max_rows, vocab_size=vocab_size, device=device
-        )
-
-    def can_capture(self, graph_size: int) -> bool:
-        return True
-
-    def prepare_capture_inputs(self, graph_size: int) -> BeamDenseRows:
-        return self._graph_dense_rows
-
-    def can_replay(
-        self, dense_rows: Optional[BeamDenseRows], *, graph_size: int
-    ) -> bool:
-        # A mixed batch on the beam path is within the request cap, so its rows fit.
-        return True
-
-    def load_replay_inputs(self, dense_rows: Optional[BeamDenseRows]) -> None:
-        num_rows = 0 if dense_rows is None else dense_rows.num_rows
-        self._graph_dense_rows.count.fill_(num_rows)
-
-
 class BeamGraphInputs:
     """The buffers the beam graphs read: one input per BeamForwardInputs field.
 
@@ -401,11 +364,9 @@ class BeamGraphInputs:
         shared_context_input: Optional[
             FixedWidthSharedContextInput | WidthFreeSharedContextInput
         ],
-        dense_rows_input: Optional[DenseRowsInput] = None,
     ):
         self.trie_levels_input = trie_levels_input
         self.shared_context_input = shared_context_input
-        self.dense_rows_input = dense_rows_input
         # Sizes, in rows, of the beam graphs captured so far.
         self.captured_sizes: set[int] = set()
 
@@ -413,15 +374,10 @@ class BeamGraphInputs:
         return (
             (self.trie_levels_input, beam.trie_levels),
             (self.shared_context_input, beam.attention_metadata),
-            (self.dense_rows_input, beam.dense_rows),
         )
 
     def can_capture(self, graph_size: int) -> bool:
-        graph_inputs = (
-            self.trie_levels_input,
-            self.shared_context_input,
-            self.dense_rows_input,
-        )
+        graph_inputs = (self.trie_levels_input, self.shared_context_input)
         return all(
             graph_input.can_capture(graph_size)
             for graph_input in graph_inputs
@@ -440,11 +396,6 @@ class BeamGraphInputs:
                 None
                 if self.shared_context_input is None
                 else self.shared_context_input.prepare_capture_inputs(graph_size)
-            ),
-            dense_rows=(
-                None
-                if self.dense_rows_input is None
-                else self.dense_rows_input.prepare_capture_inputs(graph_size)
             ),
         )
 
@@ -472,23 +423,12 @@ def _create_beam_graph_inputs(model_runner: ModelRunner) -> Optional[BeamGraphIn
     """Returns None, and logs why, when no all-beam batch could replay a beam graph."""
     # Rows of the largest decode graph; the shared logits buffer holds as many.
     max_rows = model_runner.max_decode_logits_rows()
-    # A mixed batch keeps regular requests' rows where the compact head streams
-    # them.
-    keeps_dense_rows = model_runner.beam_trie_compact_enabled and mixed_batch_enabled()
-    if mixed_batch_enabled() and not keeps_dense_rows:
-        logger.warning(
-            "SGLANG_ENABLE_BEAM_DECODE_GRAPH_MIXED_BATCH is set, but the compact "
-            "trie output head is off; batches that mix beam and regular requests "
-            "run the ordinary decode path."
-        )
     shared_context_input = None
     if shared_context_attention.enabled() and (
         shared_context_attention.supports_shared_context(model_runner)
     ):
         shared_context_input = (
-            WidthFreeSharedContextInput.create(
-                model_runner, max_rows=max_rows, allow_one_row_groups=keeps_dense_rows
-            )
+            WidthFreeSharedContextInput.create(model_runner, max_rows=max_rows)
             if width_free_graphs_enabled()
             else FixedWidthSharedContextInput.create(model_runner, max_rows=max_rows)
         )
@@ -508,19 +448,8 @@ def _create_beam_graph_inputs(model_runner: ModelRunner) -> Optional[BeamGraphIn
             "ordinary decode graphs."
         )
         return None
-    dense_rows_input = (
-        DenseRowsInput(
-            max_rows=max_rows,
-            vocab_size=model_runner.model_config.vocab_size,
-            device=model_runner.device,
-        )
-        if keeps_dense_rows
-        else None
-    )
     return BeamGraphInputs(
-        trie_levels_input=trie_levels_input,
-        shared_context_input=shared_context_input,
-        dense_rows_input=dense_rows_input,
+        trie_levels_input=trie_levels_input, shared_context_input=shared_context_input
     )
 
 
@@ -545,16 +474,11 @@ class BeamDecodeCudaGraphRunner(DecodeCudaGraphRunner):
         - Requests may differ in beam width.
         - The batch pads to the next captured size like any decode batch.
 
-    With SGLANG_ENABLE_BEAM_DECODE_GRAPH_MIXED_BATCH and the compact trie head, a
-    beam graph also replays a batch that mixes beam and regular requests, up to
-    SGLANG_BEAM_DECODE_GRAPH_MIXED_BATCH_MAX_REQUESTS requests, and keeps the
-    regular requests' full-vocabulary logits.
-
     Every other batch runs as it does on the parent:
 
     - An all-beam batch that fits no beam graph runs eagerly.
-    - Any other batch that mixes beam and regular requests carries no beam inputs
-      and decodes on the ordinary path.
+    - A batch that mixes beam and regular requests carries no beam inputs and
+      decodes on the ordinary path.
     - With neither fast path on, no beam graph is captured.
     """
 

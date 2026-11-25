@@ -23,10 +23,8 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 import torch
 
-from sglang.srt.beam_search import mixed_batch
 from sglang.srt.beam_search import shared_context_ragged as ragged
 from sglang.srt.beam_search.decode_graph_settings import (
-    mixed_batch_enabled,
     stream_k_selected,
     width_free_graphs_enabled,
 )
@@ -129,11 +127,6 @@ def build_metadata(
         return ragged.build_ragged_metadata(
             batch=batch,
             req_to_token=model_runner.req_to_token_pool.req_to_token,
-            # Without the compact head no row keeps full-vocabulary logits, and a
-            # batch with regular requests runs the ordinary decode path.
-            allow_one_row_groups=mixed_batch_enabled()
-            and model_runner.beam_trie_compact_enabled
-            and mixed_batch.runs_beam_path(batch),
             stream_k=stream_k_selected(),
         )
     return _build_width_buckets(batch=batch, model_runner=model_runner)
@@ -253,8 +246,7 @@ def forward(
     k_buffer, v_buffer = kv_layers.read(layer.layer_id).kv()
     if k_buffer.ndim != 3 or v_buffer.ndim != 3:
         raise RuntimeError("Shared-context attention requires 3D MHA K/V cache buffers")
-    # The width-free kernels cover the fixed-width one's steps too; that one stays
-    # as the default path, unchanged, while they are opt-in.
+    # A width-free layout has no buckets; its own kernels read it.
     if isinstance(metadata, ragged.RaggedBeamAttentionMetadata):
         return ragged.forward(
             q=q,

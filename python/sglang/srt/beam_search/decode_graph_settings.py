@@ -20,9 +20,6 @@ With SGLANG_ENABLE_BEAM_DECODE_GRAPH on and shared-context attention:
 - Unset: width-free graphs, for beam requests of any widths. Shared-context
   attention then runs its width-free layout for every beam decode batch, so a
   batch gets the same kernels whether or not a graph replays it.
-
-SGLANG_ENABLE_BEAM_DECODE_GRAPH_MIXED_BATCH also keeps batches that mix beam
-and regular requests on the beam path, and so on the beam graphs.
 """
 
 from __future__ import annotations
@@ -34,10 +31,6 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 _WIDTH_FREE_KERNELS = ("default", "stream_k")
-_WIDTH_FREE_GRAPHS_HOWTO = (
-    "set SGLANG_ENABLE_BEAM_DECODE_GRAPH and leave "
-    "SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH unset"
-)
 
 
 def width_free_graphs_enabled() -> bool:
@@ -52,19 +45,7 @@ def stream_k_selected() -> bool:
     return envs.SGLANG_BEAM_SHARED_CONTEXT_KERNEL.get() == "stream_k"
 
 
-def mixed_batch_enabled() -> bool:
-    return envs.SGLANG_ENABLE_BEAM_DECODE_GRAPH_MIXED_BATCH.get()
-
-
-def max_mixed_batch_requests() -> int:
-    field = envs.SGLANG_BEAM_DECODE_GRAPH_MIXED_BATCH_MAX_REQUESTS
-    value = field.get()
-    if value <= 0:
-        raise ValueError(f"{field.name} must be positive, got {value}")
-    return value
-
-
-def check_settings(*, deterministic_inference: bool) -> None:
+def check_settings() -> None:
     """Startup check: raise on settings that cannot run together, and name a
     setting that has no effect."""
     kernel = envs.SGLANG_BEAM_SHARED_CONTEXT_KERNEL.get()
@@ -77,22 +58,9 @@ def check_settings(*, deterministic_inference: bool) -> None:
     if kernel != "default" and not width_free:
         raise ValueError(
             f"SGLANG_BEAM_SHARED_CONTEXT_KERNEL={kernel!r} is a kernel of the "
-            f"width-free beam decode graphs: {_WIDTH_FREE_GRAPHS_HOWTO}"
+            "width-free beam decode graphs: set SGLANG_ENABLE_BEAM_DECODE_GRAPH "
+            "and leave SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH unset"
         )
-    if mixed_batch_enabled():
-        if not width_free:
-            raise ValueError(
-                "SGLANG_ENABLE_BEAM_DECODE_GRAPH_MIXED_BATCH needs the width-free "
-                f"beam decode graphs: {_WIDTH_FREE_GRAPHS_HOWTO}"
-            )
-        if deterministic_inference:
-            raise ValueError(
-                "SGLANG_ENABLE_BEAM_DECODE_GRAPH_MIXED_BATCH computes a regular "
-                "request's logits on the beam path whenever a beam request shares "
-                "its decode batch, so they vary with the batch: not with "
-                "--enable-deterministic-inference"
-            )
-        max_mixed_batch_requests()
     max_new_tokens = envs.SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH_MAX_NEW_TOKENS
     if width_free and max_new_tokens.is_set():
         logger.warning(

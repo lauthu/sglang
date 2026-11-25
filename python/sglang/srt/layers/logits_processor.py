@@ -38,7 +38,6 @@ from sglang.kernels.ops.sampling.softcap_row_argmax import (
     softcap_row_argmax,
 )
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
-from sglang.srt.beam_search.mixed_batch import BeamDenseRows
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
@@ -268,9 +267,6 @@ class LogitsProcessorOutput:
     # selection; see beam_search.logits_capture.
     beam: Optional[BeamLogitsCapture] = None
     beam_normalizer: Optional[torch.Tensor] = None
-    # Full-vocabulary rows the trie head kept for regular requests; see
-    # beam_search.mixed_batch.
-    beam_dense_logits: Optional[torch.Tensor] = None
 
     ## Part 5: Customized Info
     customized_info: Optional[Dict[str, List[Any]]] = None
@@ -372,7 +368,6 @@ class LogitsMetadata:
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
     beam_trie_levels: Optional[torch.Tensor] = None
-    beam_dense_rows: Optional[BeamDenseRows] = None
 
     # Carried from ForwardBatch so logits pruning can reconstruct the SP gather.
     attn_tp_sequence_sharded: bool = False
@@ -440,9 +435,6 @@ class LogitsMetadata:
             attn_tp_sequence_sharded=forward_batch.attn_tp_sequence_sharded,
             beam_trie_levels=(
                 None if forward_batch.beam is None else forward_batch.beam.trie_levels
-            ),
-            beam_dense_rows=(
-                None if forward_batch.beam is None else forward_batch.beam.dense_rows
             ),
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
             dp_local_start_pos=forward_batch.dp_local_start_pos,
@@ -748,13 +740,13 @@ class LogitsProcessor(nn.Module):
                     mm_input_embeds=logits_metadata.mm_input_embeds,
                 )
             # Compute logits for both input and sampled tokens.
-            beam_normalizer = beam_dense_logits = None
+            beam_normalizer = None
             if self.beam_trie_output_head is None:
                 logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             else:
                 from sglang.srt.beam_search.trie_output_head import beam_trie_logits
 
-                logits, beam_normalizer, beam_dense_logits = beam_trie_logits(
+                logits, beam_normalizer = beam_trie_logits(
                     self, pruned_states, lm_head, logits_metadata
                 )
             sampled_logits = (
@@ -768,7 +760,6 @@ class LogitsProcessor(nn.Module):
                 last_hidden_states=last_hidden_states_to_store,
                 mm_input_embeds=logits_metadata.mm_input_embeds,
                 beam_normalizer=beam_normalizer,
-                beam_dense_logits=beam_dense_logits,
             )
 
         logprobs_result, sampled_logits = self.input_logprob_processor.forward(

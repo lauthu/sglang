@@ -16,10 +16,6 @@
 The sampler rewrites next_token_logits in place (temperature/softmax), and
 the scheduler-side joint selection runs later, at the relay point -- so the
 raw logits it needs are preserved here, before sampling.
-
-When the trie head kept full-vocabulary rows for regular requests in a beam
-decode batch (beam_search.mixed_batch), the sampler reads those, and joint
-selection reads the compact rows.
 """
 
 from __future__ import annotations
@@ -83,18 +79,7 @@ def capture_pre_sample_logits(
         # in-place sampling writes, but the leader rows do not, hence the clone.
         n = batch.beam_tail.num_base_rows
         logits = logits_output.next_token_logits
-        # A beam graph returns its kept-row buffer on every replay, so the batch
-        # says whether this forward filled it; the dense head fallback keeps none.
-        kept_logits = logits_output.beam_dense_logits
-        keeps_dense_rows = (
-            kept_logits is not None
-            and forward_batch.beam is not None
-            and forward_batch.beam.dense_rows is not None
-        )
-        logits_output.next_token_logits = (
-            kept_logits[:n] if keeps_dense_rows else logits[:n]
-        )
-        logits_output.beam_dense_logits = None
+        logits_output.next_token_logits = logits[:n]
         leader_rows = [e.leader_idx for e in batch.beam_tail.entries]
         normalizer = logits_output.beam_normalizer
         logits_output.beam = BeamLogitsCapture(

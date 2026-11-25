@@ -24,9 +24,8 @@ def ragged_case(
     """A decode batch's rows as the scheduler lays them out: one leader row per
     group, then each group's member rows. Members alias the leader's prompt slots
     in their own req_to_token rows and own their decode slots; every row of a
-    group has the leader's length. A width of 1 is a regular request: one base
-    row, outside the beam tail. Returns the batch view the metadata builder reads,
-    the kernel inputs and the FP32 reference."""
+    group has the leader's length. Returns the batch view the metadata builder
+    reads, the kernel inputs and the FP32 reference."""
     torch.manual_seed(seed)
     device = torch.device("cuda")
     num_groups = len(widths)
@@ -52,15 +51,14 @@ def ragged_case(
             ]
             next_slot += decode_len
             seq_lens[row] = prompt_len + decode_len
-        if width > 1:
-            entries.append(
-                BeamTailEntry(
-                    SimpleNamespace(prompt_len=prompt_len),
-                    group,
-                    next_member - num_groups,
-                    next_member - num_groups + width - 1,
-                )
+        entries.append(
+            BeamTailEntry(
+                SimpleNamespace(prompt_len=prompt_len),
+                group,
+                next_member - num_groups,
+                next_member - num_groups + width - 1,
             )
+        )
         group_rows.append(rows)
         next_member += width - 1
 

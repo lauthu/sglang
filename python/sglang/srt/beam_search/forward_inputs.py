@@ -20,11 +20,10 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.beam_search import mixed_batch, shared_context_attention
+from sglang.srt.beam_search import shared_context_attention
 from sglang.srt.beam_search.trie_output_head import build_trie_row_levels
 
 if TYPE_CHECKING:
-    from sglang.srt.beam_search.mixed_batch import BeamDenseRows
     from sglang.srt.beam_search.shared_context_attention import BeamAttentionMetadata
     from sglang.srt.beam_search.shared_context_ragged import (
         RaggedBeamAttentionMetadata,
@@ -41,9 +40,6 @@ class BeamForwardInputs:
     attention_metadata: Optional[
         BeamAttentionMetadata | RaggedBeamAttentionMetadata
     ] = None
-    # Rows whose full-vocabulary logits the trie head keeps, for the regular
-    # requests of a beam decode batch.
-    dense_rows: Optional[BeamDenseRows] = None
 
 
 def build_beam_forward_inputs(
@@ -53,11 +49,4 @@ def build_beam_forward_inputs(
     attention_metadata = shared_context_attention.build_metadata(batch, model_runner)
     if trie_levels is None and attention_metadata is None:
         return None
-    dense_rows = (
-        mixed_batch.build_dense_rows(batch) if trie_levels is not None else None
-    )
-    return BeamForwardInputs(
-        trie_levels=trie_levels,
-        attention_metadata=attention_metadata,
-        dense_rows=dense_rows,
-    )
+    return BeamForwardInputs(trie_levels, attention_metadata)
