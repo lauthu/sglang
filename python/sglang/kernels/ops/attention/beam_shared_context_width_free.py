@@ -27,6 +27,8 @@ Terms:
 - real rows: the rows of the batch. A CUDA graph captured for more rows has
   padding rows after them; they are in no tile and their output is written as
   zeros.
+- work unit: one step of attending a tile for one query head. A tile's work
+  units are its prompt blocks (BLOCK_N tokens each), then its decode steps.
 
 The layout is one int32 tensor that the host writes per batch
 (srt/beam_search/shared_context_width_free.py), its parts back to back:
@@ -71,6 +73,8 @@ _PROGRAMS_PER_SM = 8
 # int32 entries of the layout's header and of one tile.
 LAYOUT_HEADER = 2
 TILE_FIELDS = 5
+# An end of a work unit range that is past any tile's last unit: the whole tile.
+WHOLE_TILE = 1 << 30
 
 
 def header_and_tiles_len(num_tiles: int) -> int:
@@ -208,6 +212,251 @@ def zero_padding_rows(
 
 
 @triton.jit
+def attend_prompt_blocks(
+    q_values,  # [BLOCK_M, BLOCK_D], the tile's queries of one query head
+    k_buffer,  # [kv_slots, kv_heads, HEAD_DIM], the layer's K cache
+    v_buffer,  # [kv_slots, kv_heads, HEAD_DIM], the layer's V cache
+    prompt_slots,  # pointer to the KV slots of the group's prompt tokens
+    prompt_len,
+    first_block,  # prompt blocks to attend: [first_block, end_block)
+    end_block,
+    kv_head,
+    beam_mask,  # [BLOCK_M] bool, the tile's beams that exist
+    max_values,  # the softmax state so far, see empty_softmax_state
+    normalizers,
+    accumulator,
+    softmax_scale_log2,  # softmax_scale * log2(e), for exp2
+    stride_k_slot,  # k_buffer.stride(0); all strides are in elements
+    stride_k_head,  # k_buffer.stride(1)
+    stride_v_slot,  # v_buffer.stride(0)
+    stride_v_head,  # v_buffer.stride(1)
+    HEAD_DIM: tl.constexpr,
+    BLOCK_N: tl.constexpr,  # prompt tokens per block
+    BLOCK_D: tl.constexpr,  # HEAD_DIM rounded up to a power of 2
+    WIDE_KV_OFFSETS: tl.constexpr,  # 64-bit K/V offsets; False needs < 2^31 elements
+):
+    """All beams of a tile attend blocks [first_block, end_block) of their group's
+    prompt, the same BLOCK_N tokens at a time. Returns the softmax state after."""
+    context_offsets = tl.arange(0, BLOCK_N)
+    dim_offsets = tl.arange(0, BLOCK_D)
+    dim_mask = dim_offsets < HEAD_DIM
+    negative_infinity = -float("inf")
+    for block in tl.range(first_block, end_block):
+        tokens = block * BLOCK_N + context_offsets
+        token_mask = tokens < prompt_len
+        slots = tl.load(prompt_slots + tokens, mask=token_mask, other=0)
+        if WIDE_KV_OFFSETS:
+            slots = slots.to(tl.int64)
+        kv_mask = token_mask[:, None] & dim_mask[None, :]
+        k_values = load_kv(
+            buffer=k_buffer,
+            slots=slots,
+            kv_head=kv_head,
+            dim_offsets=dim_offsets,
+            mask=kv_mask,
+            stride_slot=stride_k_slot,
+            stride_head=stride_k_head,
+        )
+        v_values = load_kv(
+            buffer=v_buffer,
+            slots=slots,
+            kv_head=kv_head,
+            dim_offsets=dim_offsets,
+            mask=kv_mask,
+            stride_slot=stride_v_slot,
+            stride_head=stride_v_head,
+        )
+        scores = tl.dot(q_values, tl.trans(k_values))
+        scores = tl.where(
+            beam_mask[:, None] & token_mask[None, :], scores, negative_infinity
+        )
+        max_values, normalizers, accumulator = attend_prompt_block(
+            scores=scores,
+            v_values=v_values,
+            max_values=max_values,
+            normalizers=normalizers,
+            accumulator=accumulator,
+            softmax_scale_log2=softmax_scale_log2,
+        )
+    return max_values, normalizers, accumulator
+
+
+@triton.jit
+def attend_decode_steps(
+    q_values,  # [BLOCK_M, BLOCK_D], the tile's queries of one query head
+    k_buffer,  # [kv_slots, kv_heads, HEAD_DIM], the layer's K cache
+    v_buffer,  # [kv_slots, kv_heads, HEAD_DIM], the layer's V cache
+    decode_slots,  # [BLOCK_M] pointers to the KV slots of each beam's generated tokens
+    first_step,  # decode steps to attend: [first_step, end_step)
+    end_step,
+    kv_head,
+    beam_mask,  # [BLOCK_M] bool, the tile's beams that exist
+    max_values,  # the softmax state so far, see empty_softmax_state
+    normalizers,
+    accumulator,
+    softmax_scale_log2,  # softmax_scale * log2(e), for exp2
+    stride_k_slot,  # k_buffer.stride(0); all strides are in elements
+    stride_k_head,  # k_buffer.stride(1)
+    stride_v_slot,  # v_buffer.stride(0)
+    stride_v_head,  # v_buffer.stride(1)
+    HEAD_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,  # HEAD_DIM rounded up to a power of 2
+    WIDE_KV_OFFSETS: tl.constexpr,  # 64-bit K/V offsets; False needs < 2^31 elements
+):
+    """Each beam of a tile attends the tokens it generated at decode steps
+    [first_step, end_step), one step at a time. Returns the softmax state after."""
+    dim_offsets = tl.arange(0, BLOCK_D)
+    row_mask = beam_mask[:, None] & (dim_offsets < HEAD_DIM)[None, :]
+    negative_infinity = -float("inf")
+    for step in range(first_step, end_step):
+        slots = tl.load(decode_slots + step, mask=beam_mask, other=0)
+        if WIDE_KV_OFFSETS:
+            slots = slots.to(tl.int64)
+        k_values = load_kv(
+            buffer=k_buffer,
+            slots=slots,
+            kv_head=kv_head,
+            dim_offsets=dim_offsets,
+            mask=row_mask,
+            stride_slot=stride_k_slot,
+            stride_head=stride_k_head,
+        )
+        v_values = load_kv(
+            buffer=v_buffer,
+            slots=slots,
+            kv_head=kv_head,
+            dim_offsets=dim_offsets,
+            mask=row_mask,
+            stride_slot=stride_v_slot,
+            stride_head=stride_v_head,
+        )
+        scores = tl.sum(q_values.to(tl.float32) * k_values.to(tl.float32), axis=1)
+        scores = tl.where(beam_mask, scores, negative_infinity)
+        max_values, normalizers, accumulator = attend_beam_token(
+            scores=scores,
+            v_values=v_values,
+            max_values=max_values,
+            normalizers=normalizers,
+            accumulator=accumulator,
+            softmax_scale_log2=softmax_scale_log2,
+        )
+    return max_values, normalizers, accumulator
+
+
+@triton.jit
+def attend_tile(
+    q,  # [rows, q_heads, HEAD_DIM]
+    k_buffer,  # [kv_slots, kv_heads, HEAD_DIM], the layer's K cache
+    v_buffer,  # [kv_slots, kv_heads, HEAD_DIM], the layer's V cache
+    req_to_token,  # [pool rows, max context] int32, the KV slot of each token
+    req_pool_indices,  # [rows] int32 or int64, each row's pool row
+    seq_lens,  # [rows] int32 or int64; only the leaders' are read
+    tiles,  # the layout's tiles
+    tile,  # index of the tile to attend
+    q_head,
+    work_start,  # work units to attend: [work_start, work_end), clipped to the tile's
+    work_end,
+    softmax_scale_log2,  # softmax_scale * log2(e), for exp2
+    stride_q_row,  # q.stride(0); all strides are in elements
+    stride_q_head,  # q.stride(1)
+    stride_k_slot,  # k_buffer.stride(0)
+    stride_k_head,  # k_buffer.stride(1)
+    stride_v_slot,  # v_buffer.stride(0)
+    stride_v_head,  # v_buffer.stride(1)
+    stride_req_to_token,  # req_to_token.stride(0)
+    Q_PER_KV: tl.constexpr,  # query heads per KV head
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,  # beams per tile
+    BLOCK_N: tl.constexpr,  # prompt tokens per block
+    BLOCK_D: tl.constexpr,  # HEAD_DIM rounded up to a power of 2
+    TILE_FIELDS: tl.constexpr,
+    WIDE_KV_OFFSETS: tl.constexpr,  # 64-bit K/V offsets; False needs < 2^31 elements
+):
+    """Attend one tile for one query head over its work units [work_start, work_end).
+
+    Returns (rows, beam_mask, max_values, normalizers, accumulator): the tile's
+    batch rows, which of its beams exist, and the softmax state after the units.
+    The attention output of a whole tile is accumulator / normalizers.
+    """
+    kv_head = q_head // Q_PER_KV
+    beam_offsets = tl.arange(0, BLOCK_M)
+    dim_offsets = tl.arange(0, BLOCK_D)
+
+    rows, beam_mask, leader_row, prompt_len = tile_rows(
+        tiles=tiles, tile=tile, beam_offsets=beam_offsets, TILE_FIELDS=TILE_FIELDS
+    )
+    q_values = load_q(
+        q=q,
+        rows=rows,
+        q_head=q_head,
+        dim_offsets=dim_offsets,
+        mask=beam_mask[:, None] & (dim_offsets < HEAD_DIM)[None, :],
+        stride_q_row=stride_q_row,
+        stride_q_head=stride_q_head,
+    )
+    max_values, normalizers, accumulator = empty_softmax_state(
+        beam_mask=beam_mask, BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D
+    )
+
+    # The first work units: the prompt's blocks. Its KV slots are in the leader's
+    # pool row.
+    num_prompt_blocks = tl.cdiv(prompt_len, BLOCK_N)
+    leader_pool_row = tl.load(req_pool_indices + leader_row).to(tl.int64)
+    max_values, normalizers, accumulator = attend_prompt_blocks(
+        q_values=q_values,
+        k_buffer=k_buffer,
+        v_buffer=v_buffer,
+        prompt_slots=req_to_token + leader_pool_row * stride_req_to_token,
+        prompt_len=prompt_len,
+        first_block=work_start,
+        end_block=tl.minimum(work_end, num_prompt_blocks),
+        kv_head=kv_head,
+        beam_mask=beam_mask,
+        max_values=max_values,
+        normalizers=normalizers,
+        accumulator=accumulator,
+        softmax_scale_log2=softmax_scale_log2,
+        stride_k_slot=stride_k_slot,
+        stride_k_head=stride_k_head,
+        stride_v_slot=stride_v_slot,
+        stride_v_head=stride_v_head,
+        HEAD_DIM=HEAD_DIM,
+        BLOCK_N=BLOCK_N,
+        BLOCK_D=BLOCK_D,
+        WIDE_KV_OFFSETS=WIDE_KV_OFFSETS,
+    )
+
+    # The following work units: the decode steps. Each beam's generated tokens
+    # follow the prompt in the beam's own pool row.
+    decode_len = tl.load(seq_lens + leader_row).to(tl.int32) - prompt_len
+    beam_pool_rows = tl.load(req_pool_indices + rows, mask=beam_mask, other=0).to(
+        tl.int64
+    )
+    max_values, normalizers, accumulator = attend_decode_steps(
+        q_values=q_values,
+        k_buffer=k_buffer,
+        v_buffer=v_buffer,
+        decode_slots=req_to_token + beam_pool_rows * stride_req_to_token + prompt_len,
+        first_step=tl.maximum(work_start - num_prompt_blocks, 0),
+        end_step=tl.minimum(work_end - num_prompt_blocks, decode_len),
+        kv_head=kv_head,
+        beam_mask=beam_mask,
+        max_values=max_values,
+        normalizers=normalizers,
+        accumulator=accumulator,
+        softmax_scale_log2=softmax_scale_log2,
+        stride_k_slot=stride_k_slot,
+        stride_k_head=stride_k_head,
+        stride_v_slot=stride_v_slot,
+        stride_v_head=stride_v_head,
+        HEAD_DIM=HEAD_DIM,
+        BLOCK_D=BLOCK_D,
+        WIDE_KV_OFFSETS=WIDE_KV_OFFSETS,
+    )
+    return rows, beam_mask, max_values, normalizers, accumulator
+
+
+@triton.jit
 def _width_free_shared_context_kernel(
     q,  # [rows, q_heads, HEAD_DIM]; only the real rows are read
     k_buffer,  # [kv_slots, kv_heads, HEAD_DIM], the layer's K cache
@@ -235,132 +484,55 @@ def _width_free_shared_context_kernel(
     BLOCK_D: tl.constexpr,  # HEAD_DIM rounded up to a power of 2
     LAYOUT_HEADER: tl.constexpr,
     TILE_FIELDS: tl.constexpr,
+    WHOLE_TILE: tl.constexpr,
 ):
     """Program (p, q_head) attends tiles p, p + programs_per_head, ... for one
     query head, each from its first prompt token to its last generated token."""
     program = tl.program_id(0)
     q_head = tl.program_id(1)
     programs_per_head = tl.num_programs(0)
-    kv_head = q_head // Q_PER_KV
-
-    beam_offsets = tl.arange(0, BLOCK_M)
-    context_offsets = tl.arange(0, BLOCK_N)
     dim_offsets = tl.arange(0, BLOCK_D)
-    dim_mask = dim_offsets < HEAD_DIM
-    negative_infinity = -float("inf")
     # exp2 is cheaper than exp: fold log2(e) into the scale.
     softmax_scale_log2 = softmax_scale * 1.4426950408889634
 
     num_tiles = tl.load(layout)
     tiles = layout + LAYOUT_HEADER
     for tile in range(program, num_tiles, programs_per_head):
-        rows, beam_mask, leader_row, prompt_len = tile_rows(
-            tiles=tiles, tile=tile, beam_offsets=beam_offsets, TILE_FIELDS=TILE_FIELDS
-        )
-        row_mask = beam_mask[:, None] & dim_mask[None, :]
-        q_values = load_q(
+        rows, beam_mask, max_values, normalizers, accumulator = attend_tile(
             q=q,
-            rows=rows,
+            k_buffer=k_buffer,
+            v_buffer=v_buffer,
+            req_to_token=req_to_token,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            tiles=tiles,
+            tile=tile,
             q_head=q_head,
-            dim_offsets=dim_offsets,
-            mask=row_mask,
+            work_start=0,
+            work_end=WHOLE_TILE,
+            softmax_scale_log2=softmax_scale_log2,
             stride_q_row=stride_q_row,
             stride_q_head=stride_q_head,
+            stride_k_slot=stride_k_slot,
+            stride_k_head=stride_k_head,
+            stride_v_slot=stride_v_slot,
+            stride_v_head=stride_v_head,
+            stride_req_to_token=stride_req_to_token,
+            Q_PER_KV=Q_PER_KV,
+            HEAD_DIM=HEAD_DIM,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_D=BLOCK_D,
+            TILE_FIELDS=TILE_FIELDS,
+            WIDE_KV_OFFSETS=True,
         )
-        max_values, normalizers, accumulator = empty_softmax_state(
-            beam_mask=beam_mask, BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D
-        )
-
-        # The prompt: all beams of the tile attend the same tokens, BLOCK_N at a
-        # time. Their KV slots are in the leader's pool row.
-        leader_pool_row = tl.load(req_pool_indices + leader_row).to(tl.int64)
-        prompt_slots = req_to_token + leader_pool_row * stride_req_to_token
-        for block_start in tl.range(0, prompt_len, BLOCK_N):
-            tokens = block_start + context_offsets
-            token_mask = tokens < prompt_len
-            slots = tl.load(prompt_slots + tokens, mask=token_mask, other=0).to(
-                tl.int64
-            )
-            kv_mask = token_mask[:, None] & dim_mask[None, :]
-            k_values = load_kv(
-                buffer=k_buffer,
-                slots=slots,
-                kv_head=kv_head,
-                dim_offsets=dim_offsets,
-                mask=kv_mask,
-                stride_slot=stride_k_slot,
-                stride_head=stride_k_head,
-            )
-            v_values = load_kv(
-                buffer=v_buffer,
-                slots=slots,
-                kv_head=kv_head,
-                dim_offsets=dim_offsets,
-                mask=kv_mask,
-                stride_slot=stride_v_slot,
-                stride_head=stride_v_head,
-            )
-            scores = tl.dot(q_values, tl.trans(k_values))
-            scores = tl.where(
-                beam_mask[:, None] & token_mask[None, :], scores, negative_infinity
-            )
-            max_values, normalizers, accumulator = attend_prompt_block(
-                scores=scores,
-                v_values=v_values,
-                max_values=max_values,
-                normalizers=normalizers,
-                accumulator=accumulator,
-                softmax_scale_log2=softmax_scale_log2,
-            )
-
-        # The generated tokens: each beam attends its own, one decode step at a
-        # time. Their KV slots follow the prompt in the beam's own pool row.
-        decode_len = tl.load(seq_lens + leader_row).to(tl.int32) - prompt_len
-        beam_pool_rows = tl.load(req_pool_indices + rows, mask=beam_mask, other=0).to(
-            tl.int64
-        )
-        decode_slots = req_to_token + beam_pool_rows * stride_req_to_token + prompt_len
-        for step in range(0, decode_len):
-            slots = tl.load(decode_slots + step, mask=beam_mask, other=0).to(tl.int64)
-            k_values = load_kv(
-                buffer=k_buffer,
-                slots=slots,
-                kv_head=kv_head,
-                dim_offsets=dim_offsets,
-                mask=row_mask,
-                stride_slot=stride_k_slot,
-                stride_head=stride_k_head,
-            )
-            v_values = load_kv(
-                buffer=v_buffer,
-                slots=slots,
-                kv_head=kv_head,
-                dim_offsets=dim_offsets,
-                mask=row_mask,
-                stride_slot=stride_v_slot,
-                stride_head=stride_v_head,
-            )
-            scores = tl.sum(
-                q_values.to(tl.float32) * k_values.to(tl.float32),
-                axis=1,
-            )
-            scores = tl.where(beam_mask, scores, negative_infinity)
-            max_values, normalizers, accumulator = attend_beam_token(
-                scores=scores,
-                v_values=v_values,
-                max_values=max_values,
-                normalizers=normalizers,
-                accumulator=accumulator,
-                softmax_scale_log2=softmax_scale_log2,
-            )
-
         store_output(
             output=output,
             rows=rows,
             q_head=q_head,
             dim_offsets=dim_offsets,
             values=accumulator / normalizers[:, None],
-            mask=row_mask,
+            mask=beam_mask[:, None] & (dim_offsets < HEAD_DIM)[None, :],
             stride_out_row=stride_out_row,
             stride_out_head=stride_out_head,
         )
@@ -497,6 +669,7 @@ def shared_context_attention_width_free(
         BLOCK_D=triton.next_power_of_2(head_dim),
         LAYOUT_HEADER=LAYOUT_HEADER,
         TILE_FIELDS=TILE_FIELDS,
+        WHOLE_TILE=WHOLE_TILE,
         num_warps=_NUM_WARPS,
         num_stages=_NUM_STAGES,
     )
