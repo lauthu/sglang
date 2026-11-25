@@ -157,6 +157,8 @@ def build_metadata(
     entries = batch.beam_tail.entries
     if not entries or batch.seq_lens_cpu is None:
         return None
+    # A width-free graph replays only the width-free layout, so on such a server
+    # every beam decode batch gets it, replayed or not.
     if width_free_graphs_enabled():
         return width_free.build_width_free_metadata(
             batch=batch,

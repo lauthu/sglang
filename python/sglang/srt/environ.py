@@ -757,7 +757,8 @@ class Envs:
     # Replay the trie beam selection step as a CUDA graph.
     SGLANG_ENABLE_BEAM_TRIE_SELECTION_GRAPH = EnvBool(False)
     # Shared-context attention kernel: "default", "split_kv" (prompt split across
-    # CTAs) or "stream_k" (persistent grid). The width-free decode graphs have
+    # CTAs) or "stream_k" (persistent grid). Without
+    # SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH the beam decode graphs take only
     # "default" and "stream_k".
     SGLANG_BEAM_SHARED_CONTEXT_KERNEL = EnvStr("default")
     # Replay decode batches made only of beam requests as CUDA graphs.

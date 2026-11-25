@@ -11,41 +11,47 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Shared-context attention for any split of a decode batch's rows into groups.
+"""Shared-context attention for beam requests of any widths in one batch.
 
-The kernels read the layout the host builds for each batch, so every case goes
-through the real builder: a layout the two sides read differently fails against
-the FP32 reference.
+The kernels read the layout that the host builds for each batch, so every case
+goes through the real builder: if the two sides read a layout differently, the
+output fails against the FP32 reference.
 """
 
 import unittest
 
 import torch
 
-from sglang.srt.beam_search.shared_context_width_free import (
-    WIDTH_FREE_BLOCK_M,
-    build_width_free_metadata,
-)
+from sglang.srt.beam_search.shared_context_width_free import build_width_free_metadata
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kernels.beam_shared_context import run_width_free, width_free_case
+from sglang.test.kernels.beam_shared_context import (
+    run_width_free_attention,
+    width_free_case,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
+# split_cost_units that make the stream-K kernel take whole tasks per CTA, or
+# equal runs of units that split tasks, whatever the batch.
+NEVER_SPLIT = 1 << 20
+ALWAYS_SPLIT = -(1 << 20)
+# The SMs of an RTX PRO 6000, the grid the stream-K kernel was tuned with.
+TUNED_NUM_CTAS = 188
+
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestWidthFreeSharedContextAttention(CustomTestCase):
-    def _assert_matches_reference(self, case, *, stream_k, **forced):
+    def _assert_matches_reference(self, case, *, stream_k, **stream_k_options):
         metadata = build_width_free_metadata(
             batch=case.batch, req_to_token=case.req_to_token, stream_k=stream_k
         )
-        output = run_width_free(case, metadata, block_m=WIDTH_FREE_BLOCK_M, **forced)
+        output = run_width_free_attention(case, metadata, **stream_k_options)
         torch.testing.assert_close(output.float(), case.reference, rtol=1e-2, atol=1e-2)
 
-    def test_any_split_matches_fp32_reference(self):
-        """Mixed widths across the 128-beam tile edge, each group with its own prompt
-        (up to 5,000 tokens) and decode length, leaders apart from their member
-        rows."""
+    def test_any_widths_match_fp32_reference(self):
+        """Beam widths on both sides of the 128-beam tile size in one batch, each
+        request with its own prompt (up to 5,000 tokens) and generated tokens."""
         case = width_free_case(
             widths=(2, 3, 127, 128, 129, 256, 300),
             prompt_lens=(1, 5000, 64, 65, 300, 129, 513),
@@ -57,27 +63,31 @@ class TestWidthFreeSharedContextAttention(CustomTestCase):
                 self._assert_matches_reference(case, stream_k=stream_k)
 
     def test_stream_k_any_cut_of_the_units_matches_fp32_reference(self):
-        """Wherever the CTA runs cut the work (inside a prompt, at a decode step,
-        across heads, tiles and groups, CTAs without units), the partial segments
-        merge into the same attention; so do whole tiles per CTA."""
-        never, always = 1 << 20, -(1 << 20)
+        """Wherever the CTAs' runs cut the work (inside a prompt, at a decode step,
+        between heads, tiles and groups, with CTAs left without units), the
+        segments merge into the same attention; so do whole tasks per CTA."""
         mixed = width_free_case(
             widths=(2, 129, 2, 300, 3, 7),
             prompt_lens=(1, 700, 64, 513, 2048, 130),
             decode_lens=(5, 1, 2, 4, 1, 3),
             max_context=4096,
         )
+        # 4 tasks of 3 units each: most of the 64 CTAs get no unit.
         tiny = width_free_case(widths=(2,), prompt_lens=(1,), decode_lens=(1,))
         runs = (
-            (mixed, 1, always),
-            (mixed, 3, always),
-            (mixed, 7, always),
-            (mixed, 188, always),
-            (mixed, 188, never),
-            (tiny, 64, always),
+            (mixed, 1, ALWAYS_SPLIT),
+            (mixed, 3, ALWAYS_SPLIT),
+            (mixed, 7, ALWAYS_SPLIT),
+            (mixed, TUNED_NUM_CTAS, ALWAYS_SPLIT),
+            (mixed, TUNED_NUM_CTAS, NEVER_SPLIT),
+            (tiny, 64, ALWAYS_SPLIT),
         )
         for index, (case, num_ctas, split_cost_units) in enumerate(runs):
-            with self.subTest(run=index, num_ctas=num_ctas, whole=split_cost_units > 0):
+            with self.subTest(
+                run=index,
+                num_ctas=num_ctas,
+                whole_tasks=split_cost_units == NEVER_SPLIT,
+            ):
                 self._assert_matches_reference(
                     case,
                     stream_k=True,

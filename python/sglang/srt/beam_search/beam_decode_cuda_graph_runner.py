@@ -285,15 +285,15 @@ class WidthFreeSharedContextInput:
     """Graph buffer for shared-context attention with any beam widths, used when
     SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH is unset.
 
-    A batch describes its beam groups in one layout that the kernels read at run
-    time (shared_context_width_free):
+    Nothing about beam widths is captured: a batch describes its beams in one
+    layout that the kernels read at run time (shared_context_width_free). So:
 
     - Every graph size gets a beam graph.
     - A batch pads to the next size like any decode batch.
-    - A batch without a layout, which the layout builder turned away, does not
-      replay.
+    - A batch without a layout (one of its rows belongs to no beam group) does
+      not replay.
 
-    All graph sizes share one layout buffer, sized for the largest graph.
+    All graph sizes share one layout buffer, long enough for the largest graph.
     """
 
     def __init__(
@@ -304,8 +304,7 @@ class WidthFreeSharedContextInput:
         req_to_token: torch.Tensor,
         stream_k: bool,
     ):
-        # Capture-time value: all zeros, which is a launch that does no work.
-        self._graph_layout = width_free.allocate_capture_layout(
+        self._graph_metadata = width_free.allocate_graph_metadata(
             max_rows=max_rows,
             device=device,
             req_to_token=req_to_token,
@@ -334,18 +333,19 @@ class WidthFreeSharedContextInput:
         return True
 
     def prepare_capture_inputs(self, graph_size: int) -> WidthFreeBeamAttentionMetadata:
-        return self._graph_layout
+        return self._graph_metadata
 
     def can_replay(
         self, metadata: Optional[WidthFreeBeamAttentionMetadata], *, graph_size: int
     ) -> bool:
+        # Any layout fits: the buffer holds the largest graph's.
         return metadata is not None
 
     def load_replay_inputs(self, metadata: WidthFreeBeamAttentionMetadata) -> None:
         # Entries past the batch's layout keep an earlier batch's values; the
-        # kernels read none past its tile count.
+        # kernels stop at the tile count in the layout's header.
         batch_layout = metadata.layout
-        self._graph_layout.layout[: len(batch_layout)].copy_(batch_layout)
+        self._graph_metadata.layout[: len(batch_layout)].copy_(batch_layout)
 
 
 class BeamGraphInputs:
@@ -429,11 +429,12 @@ def _create_beam_graph_inputs(model_runner: ModelRunner) -> Optional[BeamGraphIn
     if shared_context_attention.enabled() and (
         shared_context_attention.supports_shared_context(model_runner)
     ):
-        shared_context_input = (
-            WidthFreeSharedContextInput.create(model_runner, max_rows=max_rows)
+        input_class = (
+            WidthFreeSharedContextInput
             if width_free_graphs_enabled()
-            else FixedWidthSharedContextInput.create(model_runner, max_rows=max_rows)
+            else FixedWidthSharedContextInput
         )
+        shared_context_input = input_class.create(model_runner, max_rows=max_rows)
         if shared_context_input is None:
             # Every all-beam batch carries shared-context metadata on this server,
             # so a beam graph without that input would never replay.
@@ -504,7 +505,7 @@ class BeamDecodeCudaGraphRunner(DecodeCudaGraphRunner):
                 "on" if graph_inputs.shared_context_input is not None else "off",
             )
         else:
-            # Only the shared-context input refuses sizes, so it is set here.
+            # Only the fixed-width input refuses sizes, so it is the one set here.
             logger.warning(
                 "SGLANG_ENABLE_BEAM_DECODE_GRAPH is set, but no decode graph size "
                 "in %s holds a beam graph, so all-beam batches run eagerly. %s",

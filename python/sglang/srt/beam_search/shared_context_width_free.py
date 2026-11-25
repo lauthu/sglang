@@ -11,19 +11,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Width-free shared-context attention metadata, for the beam decode graphs that
-take any beam width (decode_graph_settings).
+"""Width-free shared-context attention: the host side.
 
-A decode batch describes its beam groups in one small int32 layout instead of
-per-width buckets of gathered KV slots. One kernel launch then serves every
-width in the batch, and a beam decode graph captured for a row count replays for
-any split of at most that many rows into groups. For the stream-K kernel the
-layout ends with its schedule: each tile's work units.
+The beam decode graphs that take any beam width (decode_graph_settings) cannot
+record a width at capture. So instead of per-width buckets of gathered KV slots,
+a decode batch describes its beams in one small int32 layout that the kernels read
+on the GPU. One kernel launch then serves every beam width in the batch, and a
+graph captured for a row count replays any batch of at most that many rows.
+
+Terms:
+- group: the beams of one request. Its leader is the request's own batch row; its
+  members are rows appended after all requests' rows.
+- tile: up to BEAMS_PER_TILE consecutive beams of one group. The kernels work
+  tile by tile.
+- layout: one int32 tensor that lists a batch's tiles. Its format is in
+  kernels/ops/attention/beam_shared_context_width_free.py.
 """
 
 from __future__ import annotations
 
-import itertools
+import math
 from typing import TYPE_CHECKING, Optional
 
 import msgspec
@@ -34,18 +41,30 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-# Beams per tile, the kernels' M dimension. Arbitrary: the fixed-width kernel's
-# tile for small group counts.
-WIDTH_FREE_BLOCK_M = 128
+# Beams per tile, passed to the kernels as block_m. Not swept for these kernels:
+# it is beam_shared_context.py's tile size for up to 5 groups.
+BEAMS_PER_TILE = 128
 
 
 class WidthFreeBeamAttentionMetadata(msgspec.Struct):
-    # int32 layout of kernels/ops/attention/beam_shared_context_width_free.py: a batch's
-    # own, or a captured buffer sized for the most a graph holds.
+    # One batch's layout, or the graphs' shared buffer, which is long enough for
+    # the largest graph's layout.
     layout: torch.Tensor
+    # The request pool's KV slot table; the kernels look slots up in it on the GPU.
     req_to_token: torch.Tensor
-    # Run the stream-K kernel, which reads the schedule at the layout's end.
+    # Run the stream-K kernel, whose schedule follows the tiles in the layout.
     stream_k: bool = False
+
+
+class _Tile(msgspec.Struct, frozen=True):
+    """One tile's entry in the layout; the field order is the kernels'."""
+
+    leader_row: int
+    first_member_row: int
+    num_members: int
+    prompt_len: int
+    # The beam of its group that the tile starts at; beam 0 is the leader.
+    first_beam: int
 
 
 def _layout_tensor(values: list[int], device) -> torch.Tensor:
@@ -62,96 +81,120 @@ def build_width_free_metadata(
     *,
     stream_k: bool = False,
 ) -> Optional[WidthFreeBeamAttentionMetadata]:
-    """The layout of a beam decode batch, built on the host from the beam tail; None
-    leaves the batch to ordinary attention. Every row must belong to a beam group
-    of at least two rows: a batch with a regular request gets no layout."""
+    """The layout of a beam decode batch, built on the host. Returns None for a
+    batch the kernels do not take; it then runs ordinary attention."""
     num_rows = len(batch.seq_lens)
-    num_base_rows = batch.beam_tail.num_base_rows
-    # Leaders are base rows.
-    base_lens = batch.seq_lens_cpu[:num_base_rows].tolist()
-    # Per group: (leader row, first member row, members, prompt length).
-    groups: list[tuple[int, int, int, int]] = []
+    # Batch rows: one row per request first (a group's leader), then every group's
+    # member rows.
+    num_leader_rows = batch.beam_tail.num_base_rows
+    leader_seq_lens = batch.seq_lens_cpu[:num_leader_rows].tolist()
+
+    tiles: list[_Tile] = []
+    # Per tile: the generated tokens each of its beams attends.
+    decode_lens: list[int] = []
+    rows_in_groups = 0
     for entry in batch.beam_tail.entries:
         num_members = entry.end - entry.start
         prompt_len = int(entry.group.prompt_len)
-        if num_members < 1 or base_lens[entry.leader_idx] <= prompt_len:
+        decode_len = leader_seq_lens[entry.leader_idx] - prompt_len
+        # Ordinary attention takes a group without member rows or generated tokens.
+        if num_members < 1 or decode_len < 1:
             return None
-        groups.append(
-            (entry.leader_idx, num_base_rows + entry.start, num_members, prompt_len)
-        )
-    covered_rows = sum(num_members + 1 for _, _, num_members, _ in groups)
-    if covered_rows != num_rows:
+        beam_width = num_members + 1
+        rows_in_groups += beam_width
+        for first_beam in range(0, beam_width, BEAMS_PER_TILE):
+            tiles.append(
+                _Tile(
+                    leader_row=entry.leader_idx,
+                    first_member_row=num_leader_rows + entry.start,
+                    num_members=num_members,
+                    prompt_len=prompt_len,
+                    first_beam=first_beam,
+                )
+            )
+            decode_lens.append(decode_len)
+    # A row outside every group: a regular request, or a finished group's leader.
+    if rows_in_groups != num_rows:
         return None
 
-    # A tile is WIDTH_FREE_BLOCK_M beams of one group, the leader first. It carries
-    # its group's fields, so a kernel reads a tile without a second lookup.
-    tiles = [
-        (leader, first_member, num_members, prompt_len, first_beam)
-        for leader, first_member, num_members, prompt_len in groups
-        for first_beam in range(0, num_members + 1, WIDTH_FREE_BLOCK_M)
-    ]
-    schedule = _stream_k_schedule(tiles=tiles, base_lens=base_lens) if stream_k else []
+    # Header [tile count, real rows], then each tile's fields, then the stream-K
+    # schedule: the order the kernels read.
+    values = [len(tiles), num_rows]
+    for tile in tiles:
+        values.extend(msgspec.structs.astuple(tile))
+    if stream_k:
+        values.extend(_stream_k_schedule(tiles=tiles, decode_lens=decode_lens))
     return WidthFreeBeamAttentionMetadata(
-        layout=_layout_tensor(
-            values=[
-                len(tiles),
-                num_rows,
-                *itertools.chain.from_iterable(tiles),
-                *schedule,
-            ],
-            device=batch.device,
-        ),
+        layout=_layout_tensor(values=values, device=batch.device),
         req_to_token=req_to_token,
         stream_k=stream_k,
     )
 
 
-def _stream_k_schedule(
-    tiles: list[tuple[int, int, int, int, int]], base_lens: list[int]
-) -> list[int]:
-    """The stream-K kernel's schedule: each tile's work units for one query head, from
-    its group's prompt length and decode depth."""
+def _stream_k_schedule(tiles: list[_Tile], decode_lens: list[int]) -> list[int]:
+    """The stream-K kernel's schedule: how much work each tile is, from its group's
+    prompt length and generated tokens."""
+    # The kernel modules import Triton, so this module imports them where it calls
+    # them.
     from sglang.kernels.ops.attention.beam_shared_context_width_free_stream_k import (
         build_schedule,
-        tile_units,
+        task_units,
     )
 
     return build_schedule(
-        [
-            tile_units(prompt_len=prompt_len, decode_len=base_lens[leader] - prompt_len)
-            for leader, _, _, prompt_len, _ in tiles
+        units_per_task=[
+            task_units(prompt_len=tile.prompt_len, decode_len=decode_len)
+            for tile, decode_len in zip(tiles, decode_lens, strict=True)
         ]
     )
 
 
-def allocate_capture_layout(
+def allocate_graph_metadata(
     max_rows: int,
     device,
     req_to_token: torch.Tensor,
     *,
     stream_k: bool = False,
 ) -> WidthFreeBeamAttentionMetadata:
-    """One layout buffer for every captured row count, sized for any batch of
-    max_rows rows. All zeros, it records a launch with its fixed grid and no work."""
+    """The metadata every beam graph captures: one zeroed layout buffer, long
+    enough for any batch of up to max_rows rows. A zeroed layout has no tiles, so
+    the captured launch does no work."""
     from sglang.kernels.ops.attention.beam_shared_context_width_free import (
-        layout_tables_size,
+        header_and_tiles_len,
     )
     from sglang.kernels.ops.attention.beam_shared_context_width_free_stream_k import (
-        schedule_size,
+        schedule_len,
     )
 
-    # Every beam group has at least two rows.
+    # Upper bound: the rows' full tiles plus one partial tile per group, and a
+    # group has at least two rows.
     max_groups = max(1, max_rows // 2)
-    # Each group adds at most one partial tile to the rows' full tiles.
-    max_tiles = -(-max_rows // WIDTH_FREE_BLOCK_M) + max_groups
-    size = layout_tables_size(num_tiles=max_tiles)
+    max_tiles = math.ceil(max_rows / BEAMS_PER_TILE) + max_groups
+    layout_len = header_and_tiles_len(num_tiles=max_tiles)
     if stream_k:
-        size += schedule_size(max_tiles)
+        layout_len += schedule_len(num_tiles=max_tiles)
     return WidthFreeBeamAttentionMetadata(
-        layout=torch.zeros(size, dtype=torch.int32, device=device),
+        layout=torch.zeros(layout_len, dtype=torch.int32, device=device),
         req_to_token=req_to_token,
         stream_k=stream_k,
     )
+
+
+def attention_kernel(stream_k: bool):
+    """The kernel a layout runs. Two kernels of one contract, chosen by
+    SGLANG_BEAM_SHARED_CONTEXT_KERNEL; the stream-K module says where each is
+    faster."""
+    if stream_k:
+        from sglang.kernels.ops.attention.beam_shared_context_width_free_stream_k import (
+            shared_context_attention_width_free_stream_k,
+        )
+
+        return shared_context_attention_width_free_stream_k
+    from sglang.kernels.ops.attention.beam_shared_context_width_free import (
+        shared_context_attention_width_free,
+    )
+
+    return shared_context_attention_width_free
 
 
 def forward(
@@ -164,16 +207,7 @@ def forward(
 ) -> torch.Tensor:
     q_heads = layer.tp_q_head_num
     head_dim = layer.head_dim
-    # Two kernels of one contract, chosen by SGLANG_BEAM_SHARED_CONTEXT_KERNEL: see
-    # the stream-K module for where each is faster.
-    if metadata.stream_k:
-        from sglang.kernels.ops.attention.beam_shared_context_width_free_stream_k import (
-            shared_context_attention_width_free_stream_k as attention,
-        )
-    else:
-        from sglang.kernels.ops.attention.beam_shared_context_width_free import (
-            shared_context_attention_width_free as attention,
-        )
+    attention = attention_kernel(metadata.stream_k)
     output = attention(
         q=q.reshape(-1, q_heads, head_dim),
         k_buffer=k_buffer,
@@ -182,7 +216,7 @@ def forward(
         req_pool_indices=forward_batch.req_pool_indices,
         seq_lens=forward_batch.seq_lens,
         layout=metadata.layout,
-        block_m=WIDTH_FREE_BLOCK_M,
+        block_m=BEAMS_PER_TILE,
         softmax_scale=layer.scaling,
     )
     return output.view(-1, q_heads * head_dim)

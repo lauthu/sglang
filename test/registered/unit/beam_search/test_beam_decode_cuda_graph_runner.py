@@ -46,7 +46,7 @@ from sglang.srt.beam_search.shared_context_attention import (
     BeamAttentionBucket,
     BeamAttentionMetadata,
 )
-from sglang.srt.beam_search.shared_context_width_free import WIDTH_FREE_BLOCK_M
+from sglang.srt.beam_search.shared_context_width_free import BEAMS_PER_TILE
 from sglang.srt.beam_search.trie_config import TrieOutputHeadConfig
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -293,18 +293,19 @@ def _model_runner(compact_head=True, lora=False):
 
 
 @contextlib.contextmanager
-def _beam_decode_graphs(*, fixed_width=None, **env):
-    """A server with the beam decode graphs on, and shared-context attention on
-    and supported. Without a fixed width its graphs are the width-free ones."""
+def _shared_context_server(*, decode_graphs=True, fixed_width=None, kernel="default"):
+    """The settings of a server with shared-context attention on and supported.
+    With the beam decode graphs on and no fixed width, its graphs are the
+    width-free ones."""
     with contextlib.ExitStack() as stack:
-        overrides = {
-            "SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION": True,
-            "SGLANG_ENABLE_BEAM_DECODE_GRAPH": True,
-            "SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH": fixed_width,
-            **env,
-        }
-        for name, value in overrides.items():
-            stack.enter_context(getattr(envs, name).override(value))
+        overrides = (
+            (envs.SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION, True),
+            (envs.SGLANG_ENABLE_BEAM_DECODE_GRAPH, decode_graphs),
+            (envs.SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH, fixed_width),
+            (envs.SGLANG_BEAM_SHARED_CONTEXT_KERNEL, kernel),
+        )
+        for setting, value in overrides:
+            stack.enter_context(setting.override(value))
         stack.enter_context(
             patch.object(
                 shared_context_attention, "supports_shared_context", return_value=True
@@ -318,24 +319,38 @@ def _beam_decode_graphs(*, fixed_width=None, **env):
         yield
 
 
+# Entries of _decode_batch's `widths` that are not a live beam group.
+REGULAR_REQUEST = 1
+FINISHED_GROUP = 0
+
+
 def _decode_batch(widths, prompt_len=7, decode_len=2):
-    """A decode batch with one base row per request, in order, then each live beam
-    group's member rows. A width of 1 is a regular request with its own KV; 0 is
-    a finished group's leader, which has no member rows left."""
-    reqs, entries, base_lens, member_lens = [], [], [], []
+    """A decode batch of one request per entry of `widths`: a beam width, or
+    REGULAR_REQUEST (a request with its own KV), or FINISHED_GROUP (the leader of
+    a beam group that has no member rows left).
+
+    Rows are laid out as the scheduler does: one row per request, in order, then
+    each live beam group's member rows.
+    """
+    reqs, entries, leader_lens, member_lens = [], [], [], []
     for row, width in enumerate(widths):
-        if width == 1:
+        if width == REGULAR_REQUEST:
             reqs.append(SimpleNamespace(beam_group=None))
-            base_lens.append(40 + row)
+            leader_lens.append(40 + row)
             continue
         group = SimpleNamespace(prompt_len=prompt_len, num_generated=decode_len - 1)
         reqs.append(SimpleNamespace(beam_group=group))
-        base_lens.append(prompt_len + decode_len)
-        if width > 1:
+        leader_lens.append(prompt_len + decode_len)
+        if width != FINISHED_GROUP:
+            num_members = width - 1
             start = len(member_lens)
-            entries.append(BeamTailEntry(group, row, start, start + width - 1))
-            member_lens.extend([prompt_len + decode_len] * (width - 1))
-    seq_lens = torch.tensor(base_lens + member_lens, dtype=torch.int64)
+            entries.append(
+                BeamTailEntry(
+                    group=group, leader_idx=row, start=start, end=start + num_members
+                )
+            )
+            member_lens.extend([prompt_len + decode_len] * num_members)
+    seq_lens = torch.tensor(leader_lens + member_lens, dtype=torch.int64)
     return SimpleNamespace(
         reqs=reqs,
         seq_lens=seq_lens,
@@ -346,7 +361,7 @@ def _decode_batch(widths, prompt_len=7, decode_len=2):
     )
 
 
-def _width_free_inputs(max_rows, *, trie_head=True):
+def _width_free_graph_inputs(max_rows, *, trie_head=True):
     return BeamGraphInputs(
         trie_levels_input=(
             TrieLevelsInput(max_rows=max_rows, device="cpu") if trie_head else None
@@ -360,45 +375,47 @@ def _width_free_inputs(max_rows, *, trie_head=True):
     )
 
 
-def _tiles(layout):
-    """A layout buffer's real row count and its loaded tile table: a header of
-    [tiles, real rows], then (leader row, first member row, members, prompt
-    length, first beam) per tile."""
-    num_tiles, num_rows = layout[:2].tolist()
-    return num_rows, layout[2:][: 5 * num_tiles].view(-1, 5).tolist()
+def _read_layout(layout):
+    """What a layout buffer holds: (real rows, tiles). The format the kernels
+    read is a header of [tiles, real rows], then per tile (leader row, first
+    member row, members, prompt length, first beam)."""
+    header_len, tile_fields = 2, 5
+    num_tiles, num_real_rows = layout[:header_len].tolist()
+    tiles = layout[header_len : header_len + tile_fields * num_tiles]
+    return num_real_rows, tiles.view(num_tiles, tile_fields).tolist()
 
 
 def _rows_in_tiles(layout):
-    """Every row the loaded tiles cover, tile by tile."""
-    _, tiles = _tiles(layout)
+    """The row of every beam of every tile of a layout, tile by tile."""
+    _, tiles = _read_layout(layout)
     rows = []
-    for leader, first_member, members, _, first_beam in tiles:
-        for beam in range(
-            first_beam, min(first_beam + WIDTH_FREE_BLOCK_M, members + 1)
-        ):
-            rows.append(leader if beam == 0 else first_member + beam - 1)
+    for leader_row, first_member_row, num_members, _, first_beam in tiles:
+        beam_width = num_members + 1
+        for beam in range(first_beam, min(first_beam + BEAMS_PER_TILE, beam_width)):
+            rows.append(leader_row if beam == 0 else first_member_row + beam - 1)
     return rows
 
 
 class TestWidthFreeBeamGraphInputs(CustomTestCase):
     def test_settings_decide_what_the_graphs_hold(self):
-        """Graphs hold the fixed-width shared-context input, which limits them to
-        whole groups of that width, only when a width is set; otherwise they hold
-        the width-free one and take every size. LoRA, whose graph key slot the beam
-        label takes, leaves a shared-context server without beam graphs."""
-        # (fixed width, compact head, LoRA): shared-context input, None for no graphs
+        """With a fixed width set, graphs hold the fixed-width shared-context
+        input, which limits them to whole groups of that width. Without one they
+        hold the width-free input and are captured at every size. A LoRA server
+        gets no beam graphs: the beam label takes LoRA's slot of the graph key."""
+        # (fixed width, compact head, LoRA) -> the shared-context input's class,
+        # or None for a server without beam graphs.
         cases = {
             (2, True, False): FixedWidthSharedContextInput,
             (None, True, False): WidthFreeSharedContextInput,
             (None, False, False): WidthFreeSharedContextInput,
             (None, True, True): None,
         }
-        for (fixed_width, compact_head, lora), shared_context in cases.items():
+        for (fixed_width, compact_head, lora), input_class in cases.items():
             with self.subTest(
                 fixed_width=fixed_width, compact_head=compact_head, lora=lora
             ):
                 with (
-                    _beam_decode_graphs(fixed_width=fixed_width),
+                    _shared_context_server(fixed_width=fixed_width),
                     patch.object(
                         beam_decode_cuda_graph_runner,
                         "get_beam_trie_config",
@@ -408,11 +425,12 @@ class TestWidthFreeBeamGraphInputs(CustomTestCase):
                     inputs = _create_beam_graph_inputs(
                         _model_runner(compact_head=compact_head, lora=lora)
                     )
-                if shared_context is None:
+                if input_class is None:
                     self.assertIsNone(inputs)
                     continue
-                self.assertIs(type(inputs.shared_context_input), shared_context)
+                self.assertIsInstance(inputs.shared_context_input, input_class)
                 self.assertEqual(inputs.trie_levels_input is not None, compact_head)
+                # 3 rows are not whole groups of 2 beams.
                 self.assertEqual(inputs.can_capture(3), fixed_width is None)
 
     def test_only_graphs_without_a_fixed_width_run_the_width_free_layout(self):
@@ -420,31 +438,32 @@ class TestWidthFreeBeamGraphInputs(CustomTestCase):
         its beam decode graphs take any width: with the graphs off, or with a
         fixed width, a batch must not get the width-free layout."""
         batch, runner = _decode_batch((4, 4)), _model_runner()
-        buckets = object()
+        width_buckets = object()
+        # Server settings -> whether a batch gets the width-free layout.
         cases = (
-            ({"SGLANG_ENABLE_BEAM_DECODE_GRAPH": False}, False),
+            ({"decode_graphs": False}, False),
             ({"fixed_width": 4}, False),
             ({}, True),
         )
-        for settings, width_free in cases:
+        for settings, expects_width_free in cases:
             with (
                 self.subTest(settings=settings),
-                _beam_decode_graphs(**settings),
+                _shared_context_server(**settings),
                 patch.object(
                     shared_context_attention,
                     "_build_width_buckets",
-                    return_value=buckets,
+                    return_value=width_buckets,
                 ),
             ):
                 metadata = shared_context_attention.build_metadata(batch, runner)
-                self.assertEqual(metadata is not buckets, width_free)
+                self.assertEqual(metadata is not width_buckets, expects_width_free)
 
-    def test_any_split_loads_into_a_larger_graph(self):
-        """Width-free graphs take a batch of any widths and fewer rows than they
-        hold: over a larger earlier batch's tables, the loaded tiles must cover
-        each of its rows exactly once."""
-        with _beam_decode_graphs():
-            inputs = _width_free_inputs(max_rows=600)
+    def test_any_widths_load_into_a_larger_graph(self):
+        """Width-free graphs take a batch of any widths and of fewer rows than
+        they hold. Loaded over a larger earlier batch's layout, the batch's tiles
+        must cover each of its rows exactly once."""
+        with _shared_context_server():
+            inputs = _width_free_graph_inputs(max_rows=600)
             self.assertTrue(inputs.can_capture(431))
             captured = inputs.prepare_capture_inputs(512)
             runner = _model_runner()
@@ -457,16 +476,16 @@ class TestWidthFreeBeamGraphInputs(CustomTestCase):
             inputs.load_replay_inputs(beam)
 
             layout = captured.attention_metadata.layout
-            num_rows, tiles = _tiles(layout)
-            leaders = {leader for leader, _, _, _, _ in tiles}
-            self.assertEqual((num_rows, len(leaders)), (431, 3))
+            num_real_rows, tiles = _read_layout(layout)
+            leader_rows = {leader_row for leader_row, _, _, _, _ in tiles}
+            self.assertEqual((num_real_rows, len(leader_rows)), (431, 3))
             self.assertEqual(sorted(_rows_in_tiles(layout)), list(range(431)))
 
     def test_dense_head_batch_replays_without_trie_levels(self):
-        """With the compact trie head off a beam batch carries its width-free
+        """With the compact trie head off, a beam batch carries its width-free
         layout and no trie levels; a graph captured without levels replays it."""
-        with _beam_decode_graphs():
-            inputs = _width_free_inputs(max_rows=600, trie_head=False)
+        with _shared_context_server():
+            inputs = _width_free_graph_inputs(max_rows=600, trie_head=False)
             captured = inputs.prepare_capture_inputs(512)
             self.assertIsNone(captured.trie_levels)
             beam = build_beam_forward_inputs(
@@ -481,42 +500,39 @@ class TestWidthFreeBeamGraphInputs(CustomTestCase):
             )
 
     def test_width_free_graph_takes_no_ordinary_attention_batch(self):
-        """A batch the layout builder turned away (here a finished group's leader
-        still in it) carries no tables; replaying it would attend the previous
-        batch's groups. A batch with a regular request carries no beam inputs at
-        all, so it decodes on the ordinary path."""
-        with _beam_decode_graphs():
-            inputs = _width_free_inputs(max_rows=600)
+        """A batch that the layout builder turned away (here: a finished group's
+        leader is still in it) carries no layout; replaying it would attend the
+        previous batch's groups. A batch with a regular request carries no beam
+        inputs at all, so it decodes on the ordinary path."""
+        with _shared_context_server():
+            inputs = _width_free_graph_inputs(max_rows=600)
             inputs.prepare_capture_inputs(512)
             beam = build_beam_forward_inputs(
-                _decode_batch((129, 0, 300)), _model_runner()
+                _decode_batch((129, FINISHED_GROUP, 300)), _model_runner()
             )
             self.assertIsNotNone(beam.trie_levels)
             self.assertIsNone(beam.attention_metadata)
             self.assertFalse(inputs.can_replay(beam, graph_size=512))
+            with_regular_request = _decode_batch((129, REGULAR_REQUEST, 300))
             self.assertIsNone(
-                build_beam_forward_inputs(_decode_batch((129, 1, 300)), _model_runner())
+                build_beam_forward_inputs(with_regular_request, _model_runner())
             )
 
     def test_startup_rejects_settings_that_cannot_run_together(self):
         """The width-free graphs have no split-KV kernel: selecting it there must
         not silently run another kernel. With a fixed width, or with the graphs
-        off, the fixed-width layout takes all three."""
+        off, the server keeps the kernels that take all three names."""
         check = decode_graph_settings.check_settings
-        with _beam_decode_graphs(SGLANG_BEAM_SHARED_CONTEXT_KERNEL="stream_k"):
+        with _shared_context_server(kernel="stream_k"):
             check()
-        with _beam_decode_graphs(SGLANG_BEAM_SHARED_CONTEXT_KERNEL="split_kv"):
-            with self.assertRaisesRegex(ValueError, "not a kernel of the width-free"):
+        with _shared_context_server(kernel="split_kv"):
+            with self.assertRaisesRegex(
+                ValueError, "'split_kv' is not available when .* any beam width"
+            ):
                 check()
-        for without_width_free_graphs in (
-            {"fixed_width": 2},
-            {"SGLANG_ENABLE_BEAM_DECODE_GRAPH": False},
-        ):
+        for without_width_free_graphs in ({"fixed_width": 2}, {"decode_graphs": False}):
             for kernel in ("split_kv", "stream_k"):
-                with _beam_decode_graphs(
-                    SGLANG_BEAM_SHARED_CONTEXT_KERNEL=kernel,
-                    **without_width_free_graphs,
-                ):
+                with _shared_context_server(kernel=kernel, **without_width_free_graphs):
                     check()
 
 

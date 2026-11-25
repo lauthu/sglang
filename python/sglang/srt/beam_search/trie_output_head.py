@@ -55,8 +55,8 @@ def configure_model_trie_output_heads(
 ) -> bool:
     """Install the compact head on the model's LogitsProcessors when the setup
     allows it; returns whether it is on."""
-    # Reject beam decode graph settings that cannot run together at startup, not
-    # at the first beam decode batch.
+    # This runs once at model load on every server, with or without a trie, so a
+    # bad combination of beam decode graph settings fails at startup here.
     decode_graph_settings.check_settings()
     config = get_beam_trie_config(model_config)
     if config is None:
