@@ -69,7 +69,7 @@ def build_width_free_metadata(
     num_base_rows = batch.beam_tail.num_base_rows
     # Leaders are base rows.
     base_lens = batch.seq_lens_cpu[:num_base_rows].tolist()
-    # Rows of the group table: (leader row, first member row, members, prompt length).
+    # Per group: (leader row, first member row, members, prompt length).
     groups: list[tuple[int, int, int, int]] = []
     for entry in batch.beam_tail.entries:
         num_members = entry.end - entry.start
@@ -83,24 +83,19 @@ def build_width_free_metadata(
     if covered_rows != num_rows:
         return None
 
-    # A tile is WIDTH_FREE_BLOCK_M beams of one group, the leader first.
+    # A tile is WIDTH_FREE_BLOCK_M beams of one group, the leader first. It carries
+    # its group's fields, so a kernel reads a tile without a second lookup.
     tiles = [
-        (group, first_beam)
-        for group, (_, _, num_members, _) in enumerate(groups)
+        (leader, first_member, num_members, prompt_len, first_beam)
+        for leader, first_member, num_members, prompt_len in groups
         for first_beam in range(0, num_members + 1, WIDTH_FREE_BLOCK_M)
     ]
-    schedule = (
-        _stream_k_schedule(groups=groups, tiles=tiles, base_lens=base_lens)
-        if stream_k
-        else []
-    )
+    schedule = _stream_k_schedule(tiles=tiles, base_lens=base_lens) if stream_k else []
     return WidthFreeBeamAttentionMetadata(
         layout=_layout_tensor(
             values=[
-                len(groups),
                 len(tiles),
                 num_rows,
-                *itertools.chain.from_iterable(groups),
                 *itertools.chain.from_iterable(tiles),
                 *schedule,
             ],
@@ -112,9 +107,7 @@ def build_width_free_metadata(
 
 
 def _stream_k_schedule(
-    groups: list[tuple[int, int, int, int]],
-    tiles: list[tuple[int, int]],
-    base_lens: list[int],
+    tiles: list[tuple[int, int, int, int, int]], base_lens: list[int]
 ) -> list[int]:
     """The stream-K kernel's schedule: each tile's work units for one query head, from
     its group's prompt length and decode depth."""
@@ -123,11 +116,12 @@ def _stream_k_schedule(
         tile_units,
     )
 
-    group_units = [
-        tile_units(prompt_len=prompt_len, decode_len=base_lens[leader] - prompt_len)
-        for leader, _, _, prompt_len in groups
-    ]
-    return build_schedule([group_units[group] for group, _ in tiles])
+    return build_schedule(
+        [
+            tile_units(prompt_len=prompt_len, decode_len=base_lens[leader] - prompt_len)
+            for leader, _, _, prompt_len, _ in tiles
+        ]
+    )
 
 
 def allocate_capture_layout(
@@ -150,7 +144,7 @@ def allocate_capture_layout(
     max_groups = max(1, max_rows // 2)
     # Each group adds at most one partial tile to the rows' full tiles.
     max_tiles = -(-max_rows // WIDTH_FREE_BLOCK_M) + max_groups
-    size = layout_tables_size(num_groups=max_groups, num_tiles=max_tiles)
+    size = layout_tables_size(num_tiles=max_tiles)
     if stream_k:
         size += schedule_size(max_tiles)
     return WidthFreeBeamAttentionMetadata(

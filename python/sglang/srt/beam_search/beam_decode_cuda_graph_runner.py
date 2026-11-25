@@ -342,8 +342,8 @@ class WidthFreeSharedContextInput:
         return metadata is not None
 
     def load_replay_inputs(self, metadata: WidthFreeBeamAttentionMetadata) -> None:
-        # Entries past the batch's counts keep an earlier batch's values; the
-        # kernels read none past the counts.
+        # Entries past the batch's layout keep an earlier batch's values; the
+        # kernels read none past its tile count.
         batch_layout = metadata.layout
         self._graph_layout.layout[: len(batch_layout)].copy_(batch_layout)
 

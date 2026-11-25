@@ -18,13 +18,12 @@ Groups may have any width, so one launch serves every width in a batch and a
 CUDA graph captured for a row count replays for any split of those rows.
 
 The per-batch layout is one int32 tensor, read on the GPU, its parts back to back:
-- counts: [groups, tiles, real rows]
-- groups: 4 per group, (leader row, first member row, members, prompt length);
+- header: [tiles, real rows]
+- tiles: 5 per tile, (leader row, first member row, members, prompt length, first
+  beam); a tile covers block_m beams of one group, beam 0 is the leader, and
   member rows are contiguous
-- tiles: 2 per tile, (group, first beam); beam 0 is the leader and a tile covers
-  block_m beams of one group
 - for the stream-K kernel, its schedule (beam_shared_context_width_free_stream_k.py)
-A buffer may be longer than its batch's layout: the counts bound what is read.
+A buffer may be longer than its batch's layout: the tile count bounds what is read.
 
 KV slots come from req_to_token: the prompt through the leader's pool row and
 each beam's decode tokens through its own pool row, up to its sequence length.
@@ -46,9 +45,71 @@ _NUM_STAGES = 3
 _WAVES = 8
 
 
-def layout_tables_size(num_groups: int, num_tiles: int) -> int:
-    """int32 entries of a layout's counts, group table and tile table."""
-    return 3 + 4 * num_groups + 2 * num_tiles
+# int32 entries of the layout's header and of one tile.
+LAYOUT_HEADER = 2
+TILE_FIELDS = 5
+
+
+def layout_tables_size(num_tiles: int) -> int:
+    """int32 entries of a layout's header and tile table."""
+    return LAYOUT_HEADER + TILE_FIELDS * num_tiles
+
+
+@triton.jit
+def tile_rows(tiles, tile, lanes, TILE_FIELDS: tl.constexpr):
+    """Rows of a tile's beams and their mask, then its group's leader row and
+    prompt length."""
+    entry = tiles + TILE_FIELDS * tile
+    leader = tl.load(entry)
+    first_member = tl.load(entry + 1)
+    num_members = tl.load(entry + 2)
+    prompt_len = tl.load(entry + 3)
+    beams = tl.load(entry + 4) + lanes
+    beam_mask = beams <= num_members
+    rows = tl.where(beams == 0, leader, first_member + beams - 1)
+    rows = tl.where(beam_mask, rows, leader)
+    return rows, beam_mask, leader, prompt_len
+
+
+@triton.jit
+def load_kv(buffer, slots, kv_head, dims, mask, stride_slot, stride_head):
+    """K or V of the given cache slots for one KV head, 0 where masked."""
+    return tl.load(
+        buffer + slots[:, None] * stride_slot + kv_head * stride_head + dims[None, :],
+        mask=mask,
+        other=0.0,
+    )
+
+
+@triton.jit
+def zero_padded_rows(
+    output,
+    num_real_rows,
+    num_rows,
+    cta,
+    num_ctas,
+    q_head,
+    stride_out_row,
+    stride_out_head,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Zero one query head of the rows past the real ones, which pad a captured row
+    count: no tile writes them, and the output buffer starts uninitialized. Program
+    cta takes every num_ctas-th block of BLOCK_M rows."""
+    lanes = tl.arange(0, BLOCK_M)
+    dims = tl.arange(0, BLOCK_D)
+    for row_start in range(num_real_rows + cta * BLOCK_M, num_rows, num_ctas * BLOCK_M):
+        pad_rows = row_start + lanes
+        tl.store(
+            output
+            + pad_rows[:, None] * stride_out_row
+            + q_head * stride_out_head
+            + dims[None, :],
+            tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32),
+            mask=(pad_rows < num_rows)[:, None] & (dims < HEAD_DIM)[None, :],
+        )
 
 
 @triton.jit
@@ -132,6 +193,8 @@ def _width_free_shared_context_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    LAYOUT_HEADER: tl.constexpr,
+    TILE_FIELDS: tl.constexpr,
 ):
     cta = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -146,22 +209,10 @@ def _width_free_shared_context_kernel(
     # exp2 is cheaper than exp: fold log2(e) into the scale.
     softmax_scale_log2 = softmax_scale * 1.4426950408889634
 
-    # The layout's parts: 3 counts, 4 fields per group, 2 per tile.
-    num_tiles = tl.load(layout + 1)
-    groups = layout + 3
-    tiles = groups + 4 * tl.load(layout)
+    num_tiles = tl.load(layout)
+    tiles = layout + LAYOUT_HEADER
     for tile in range(cta, num_tiles, num_ctas):
-        group = tl.load(tiles + 2 * tile)
-        first_beam = tl.load(tiles + 2 * tile + 1)
-        leader = tl.load(groups + 4 * group)
-        first_member = tl.load(groups + 4 * group + 1)
-        num_members = tl.load(groups + 4 * group + 2)
-        prompt_len = tl.load(groups + 4 * group + 3)
-
-        beams = first_beam + lanes
-        beam_mask = beams <= num_members
-        rows = tl.where(beams == 0, leader, first_member + beams - 1)
-        rows = tl.where(beam_mask, rows, leader)
+        rows, beam_mask, leader, prompt_len = tile_rows(tiles, tile, lanes, TILE_FIELDS)
         row_mask = beam_mask[:, None] & dim_mask[None, :]
 
         q_values = tl.load(
@@ -182,21 +233,11 @@ def _width_free_shared_context_kernel(
                 tl.int64
             )
             kv_mask = token_mask[:, None] & dim_mask[None, :]
-            k_values = tl.load(
-                k_buffer
-                + slots[:, None] * stride_k_slot
-                + kv_head * stride_k_head
-                + dims[None, :],
-                mask=kv_mask,
-                other=0.0,
+            k_values = load_kv(
+                k_buffer, slots, kv_head, dims, kv_mask, stride_k_slot, stride_k_head
             )
-            v_values = tl.load(
-                v_buffer
-                + slots[:, None] * stride_v_slot
-                + kv_head * stride_v_head
-                + dims[None, :],
-                mask=kv_mask,
-                other=0.0,
+            v_values = load_kv(
+                v_buffer, slots, kv_head, dims, kv_mask, stride_v_slot, stride_v_head
             )
             scores = tl.dot(q_values, tl.trans(k_values))
             scores = tl.where(
@@ -219,21 +260,11 @@ def _width_free_shared_context_kernel(
         decode_slots = req_to_token + row_pools * stride_req_to_token + prompt_len
         for step in range(0, decode_len):
             slots = tl.load(decode_slots + step, mask=beam_mask, other=0).to(tl.int64)
-            k_values = tl.load(
-                k_buffer
-                + slots[:, None] * stride_k_slot
-                + kv_head * stride_k_head
-                + dims[None, :],
-                mask=row_mask,
-                other=0.0,
+            k_values = load_kv(
+                k_buffer, slots, kv_head, dims, row_mask, stride_k_slot, stride_k_head
             )
-            v_values = tl.load(
-                v_buffer
-                + slots[:, None] * stride_v_slot
-                + kv_head * stride_v_head
-                + dims[None, :],
-                mask=row_mask,
-                other=0.0,
+            v_values = load_kv(
+                v_buffer, slots, kv_head, dims, row_mask, stride_v_slot, stride_v_head
             )
             scores = tl.sum(
                 q_values.to(tl.float32) * k_values.to(tl.float32),
@@ -258,18 +289,19 @@ def _width_free_shared_context_kernel(
             mask=row_mask,
         )
 
-    # Rows past the real ones pad a captured row count; zero them.
-    num_real_rows = tl.load(layout + 2)
-    for row_start in range(num_real_rows + cta * BLOCK_M, num_rows, num_ctas * BLOCK_M):
-        pad_rows = row_start + lanes
-        tl.store(
-            output
-            + pad_rows[:, None] * stride_out_row
-            + q_head * stride_out_head
-            + dims[None, :],
-            tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32),
-            mask=(pad_rows < num_rows)[:, None] & dim_mask[None, :],
-        )
+    zero_padded_rows(
+        output,
+        tl.load(layout + 1),
+        num_rows,
+        cta,
+        num_ctas,
+        q_head,
+        stride_out_row,
+        stride_out_head,
+        HEAD_DIM,
+        BLOCK_M,
+        BLOCK_D,
+    )
 
 
 def width_free_num_ctas(device_index: int, q_heads: int) -> int:
@@ -307,8 +339,8 @@ def check_width_free_inputs(
         raise ValueError(f"Q heads {q_heads} must be divisible by KV heads {kv_heads}")
     if req_to_token.dtype != torch.int32 or req_to_token.stride(1) != 1:
         raise ValueError("req_to_token must be int32 with a unit token stride")
-    if layout.dtype != torch.int32 or layout.ndim != 1 or len(layout) < 3:
-        raise ValueError("The group layout must be a 1-D int32 tensor with its counts")
+    if layout.dtype != torch.int32 or layout.ndim != 1 or len(layout) < LAYOUT_HEADER:
+        raise ValueError("The layout must be a 1-D int32 tensor with its header")
     if req_pool_indices.shape[0] < num_rows or seq_lens.shape[0] < num_rows:
         raise ValueError("req_pool_indices and seq_lens must cover every row of Q")
     if any(
@@ -380,6 +412,8 @@ def shared_context_attention_width_free(
         BLOCK_M=block_m,
         BLOCK_N=_BLOCK_N,
         BLOCK_D=triton.next_power_of_2(head_dim),
+        LAYOUT_HEADER=LAYOUT_HEADER,
+        TILE_FIELDS=TILE_FIELDS,
         num_warps=_NUM_WARPS,
         num_stages=_NUM_STAGES,
     )

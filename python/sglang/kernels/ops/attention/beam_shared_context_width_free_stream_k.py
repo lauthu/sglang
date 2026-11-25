@@ -46,11 +46,16 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.beam_shared_context_width_free import (
+    LAYOUT_HEADER,
+    TILE_FIELDS,
     attend_beam_token,
     attend_prompt_block,
     check_width_free_inputs,
     empty_softmax_state,
+    load_kv,
     num_sms,
+    tile_rows,
+    zero_padded_rows,
 )
 
 # Measured on RTX PRO 6000 (SM120), Qwen3-0.6B heads, 1-8 groups of 1-2,000 beams.
@@ -156,23 +161,6 @@ def _find_tile(unit_starts, num_tiles, key, TILE_SEARCH: tl.constexpr):
 
 
 @triton.jit
-def _tile_rows(groups, tiles, tile, lanes):
-    """Rows of a tile's beams and their mask, then its group's leader row and prompt
-    length, as beam_shared_context_width_free.py reads the tables."""
-    group = tl.load(tiles + 2 * tile)
-    first_beam = tl.load(tiles + 2 * tile + 1)
-    leader = tl.load(groups + 4 * group)
-    first_member = tl.load(groups + 4 * group + 1)
-    num_members = tl.load(groups + 4 * group + 2)
-    prompt_len = tl.load(groups + 4 * group + 3)
-    beams = first_beam + lanes
-    beam_mask = beams <= num_members
-    rows = tl.where(beams == 0, leader, first_member + beams - 1)
-    rows = tl.where(beam_mask, rows, leader)
-    return rows, beam_mask, leader, prompt_len
-
-
-@triton.jit
 def _attend_tile_head(
     q,
     k_buffer,
@@ -180,7 +168,6 @@ def _attend_tile_head(
     req_to_token,
     req_pool_indices,
     seq_lens,
-    groups,
     tiles,
     tile,
     q_head,
@@ -199,6 +186,7 @@ def _attend_tile_head(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    TILE_FIELDS: tl.constexpr,
 ):
     """Softmax state of a tile and query head over its work units
     [work_start, work_end): prompt blocks first, then decode steps."""
@@ -209,7 +197,7 @@ def _attend_tile_head(
     dim_mask = dims < HEAD_DIM
     negative_infinity = -float("inf")
 
-    rows, beam_mask, leader, prompt_len = _tile_rows(groups, tiles, tile, lanes)
+    rows, beam_mask, leader, prompt_len = tile_rows(tiles, tile, lanes, TILE_FIELDS)
     row_mask = beam_mask[:, None] & dim_mask[None, :]
     q_values = tl.load(
         q + rows[:, None] * stride_q_row + q_head * stride_q_head + dims[None, :],
@@ -228,21 +216,11 @@ def _attend_tile_head(
         token_mask = tokens < prompt_len
         slots = tl.load(prompt_slots + tokens, mask=token_mask, other=0)
         kv_mask = token_mask[:, None] & dim_mask[None, :]
-        k_values = tl.load(
-            k_buffer
-            + slots[:, None] * stride_k_slot
-            + kv_head * stride_k_head
-            + dims[None, :],
-            mask=kv_mask,
-            other=0.0,
+        k_values = load_kv(
+            k_buffer, slots, kv_head, dims, kv_mask, stride_k_slot, stride_k_head
         )
-        v_values = tl.load(
-            v_buffer
-            + slots[:, None] * stride_v_slot
-            + kv_head * stride_v_head
-            + dims[None, :],
-            mask=kv_mask,
-            other=0.0,
+        v_values = load_kv(
+            v_buffer, slots, kv_head, dims, kv_mask, stride_v_slot, stride_v_head
         )
         scores = tl.dot(q_values, tl.trans(k_values))
         scores = tl.where(
@@ -266,21 +244,11 @@ def _attend_tile_head(
         tl.minimum(work_end - num_blocks, decode_len),
     ):
         slots = tl.load(decode_slots + step, mask=beam_mask, other=0)
-        k_values = tl.load(
-            k_buffer
-            + slots[:, None] * stride_k_slot
-            + kv_head * stride_k_head
-            + dims[None, :],
-            mask=row_mask,
-            other=0.0,
+        k_values = load_kv(
+            k_buffer, slots, kv_head, dims, row_mask, stride_k_slot, stride_k_head
         )
-        v_values = tl.load(
-            v_buffer
-            + slots[:, None] * stride_v_slot
-            + kv_head * stride_v_head
-            + dims[None, :],
-            mask=row_mask,
-            other=0.0,
+        v_values = load_kv(
+            v_buffer, slots, kv_head, dims, row_mask, stride_v_slot, stride_v_head
         )
         scores = tl.sum(q_values.to(tl.float32) * k_values.to(tl.float32), axis=1)
         scores = tl.where(beam_mask, scores, negative_infinity)
@@ -331,6 +299,8 @@ def _width_free_stream_k_kernel(
     TILE_SEARCH: tl.constexpr,
     SCHEDULE_HEADER: tl.constexpr,
     MERGE_FIELDS: tl.constexpr,
+    LAYOUT_HEADER: tl.constexpr,
+    TILE_FIELDS: tl.constexpr,
 ):
     """Program c attends the units of its run and lists the tile and head it leaves
     unfinished, if any, for the merge kernel."""
@@ -340,11 +310,10 @@ def _width_free_stream_k_kernel(
     dim_mask = dims < HEAD_DIM
     # exp2 is cheaper than exp: fold log2(e) into the scale.
     softmax_scale_log2 = softmax_scale * 1.4426950408889634
-    # The layout's parts: 3 counts, 4 fields per group, 2 per tile, the schedule.
-    num_tiles = tl.load(layout + 1)
-    groups = layout + 3
-    tiles = groups + 4 * tl.load(layout)
-    schedule = tiles + 2 * num_tiles
+    # The layout's parts: the header, the tile table, the schedule.
+    num_tiles = tl.load(layout)
+    tiles = layout + LAYOUT_HEADER
+    schedule = tiles + TILE_FIELDS * num_tiles
     unit_starts = schedule + SCHEDULE_HEADER
 
     run_start, run_end, active, total = _cta_run(
@@ -402,7 +371,6 @@ def _width_free_stream_k_kernel(
                 req_to_token,
                 req_pool_indices,
                 seq_lens,
-                groups,
                 tiles,
                 tile_head // Q_HEADS,
                 q_head,
@@ -421,6 +389,7 @@ def _width_free_stream_k_kernel(
                 BLOCK_M,
                 BLOCK_N,
                 BLOCK_D,
+                TILE_FIELDS,
             )
             row_mask = beam_mask[:, None] & dim_mask[None, :]
             if (work_start == 0) & (run_end >= head_end):
@@ -446,19 +415,21 @@ def _width_free_stream_k_kernel(
                     mask=beam_mask,
                 )
 
-    # Rows past the real ones pad a captured row count; zero them.
-    num_real_rows = tl.load(layout + 2)
-    for row_start in range(num_real_rows + cta * BLOCK_M, num_rows, num_ctas * BLOCK_M):
-        pad_rows = row_start + lanes
-        for pad_head in range(0, Q_HEADS):
-            tl.store(
-                output
-                + pad_rows[:, None] * stride_out_row
-                + pad_head * stride_out_head
-                + dims[None, :],
-                tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32),
-                mask=(pad_rows < num_rows)[:, None] & dim_mask[None, :],
-            )
+    num_real_rows = tl.load(layout + 1)
+    for pad_head in range(0, Q_HEADS):
+        zero_padded_rows(
+            output,
+            num_real_rows,
+            num_rows,
+            cta,
+            num_ctas,
+            pad_head,
+            stride_out_row,
+            stride_out_head,
+            HEAD_DIM,
+            BLOCK_M,
+            BLOCK_D,
+        )
 
 
 @triton.jit
@@ -475,6 +446,8 @@ def _width_free_merge_kernel(
     BLOCK_D: tl.constexpr,
     MERGE_ROWS: tl.constexpr,
     MERGE_FIELDS: tl.constexpr,
+    LAYOUT_HEADER: tl.constexpr,
+    TILE_FIELDS: tl.constexpr,
 ):
     """Program (c, chunk) merges MERGE_ROWS rows of the tile and head CTA c listed:
     its slot, then slot 2 * c' of every later CTA c' up to the listed last one."""
@@ -486,9 +459,8 @@ def _width_free_merge_kernel(
         last_cta = tl.load(entry + 2)
         first_slot = tl.load(entry + 3)
         lanes = tl.program_id(1) * MERGE_ROWS + tl.arange(0, MERGE_ROWS)
-        groups = layout + 3
-        tiles = groups + 4 * tl.load(layout)
-        rows, beam_mask, _, _ = _tile_rows(groups, tiles, tile, lanes)
+        tiles = layout + LAYOUT_HEADER
+        rows, beam_mask, _, _ = tile_rows(tiles, tile, lanes, TILE_FIELDS)
         beam_mask = beam_mask & (lanes < BLOCK_M)
         if tl.sum(beam_mask.to(tl.int32)) > 0:
             dims = tl.arange(0, BLOCK_D)
@@ -620,6 +592,8 @@ def shared_context_attention_width_free_stream_k(
         TILE_SEARCH=_TILE_SEARCH,
         SCHEDULE_HEADER=_SCHEDULE_HEADER,
         MERGE_FIELDS=_MERGE_FIELDS,
+        LAYOUT_HEADER=LAYOUT_HEADER,
+        TILE_FIELDS=TILE_FIELDS,
         num_warps=_NUM_WARPS,
         num_stages=_NUM_STAGES,
     )
@@ -636,6 +610,8 @@ def shared_context_attention_width_free_stream_k(
         BLOCK_D=block_d,
         MERGE_ROWS=_MERGE_ROWS,
         MERGE_FIELDS=_MERGE_FIELDS,
+        LAYOUT_HEADER=LAYOUT_HEADER,
+        TILE_FIELDS=TILE_FIELDS,
         # Triton's default; an 8-row merge program has no use for more.
         num_warps=4,
     )

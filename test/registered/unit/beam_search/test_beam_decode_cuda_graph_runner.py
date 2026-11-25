@@ -360,20 +360,19 @@ def _width_free_inputs(max_rows, *, trie_head=True):
     )
 
 
-def _tables(layout):
-    """A layout buffer's counts and its loaded group and tile tables."""
-    num_groups, num_tiles, num_rows = layout[:3].tolist()
-    groups = layout[3 : 3 + 4 * num_groups].view(-1, 4).tolist()
-    tiles = layout[3 + 4 * num_groups :][: 2 * num_tiles].view(-1, 2).tolist()
-    return num_rows, groups, tiles
+def _tiles(layout):
+    """A layout buffer's real row count and its loaded tile table: a header of
+    [tiles, real rows], then (leader row, first member row, members, prompt
+    length, first beam) per tile."""
+    num_tiles, num_rows = layout[:2].tolist()
+    return num_rows, layout[2:][: 5 * num_tiles].view(-1, 5).tolist()
 
 
 def _rows_in_tiles(layout):
     """Every row the loaded tiles cover, tile by tile."""
-    _, groups, tiles = _tables(layout)
+    _, tiles = _tiles(layout)
     rows = []
-    for group, first_beam in tiles:
-        leader, first_member, members, _ = groups[group]
+    for leader, first_member, members, _, first_beam in tiles:
         for beam in range(
             first_beam, min(first_beam + WIDTH_FREE_BLOCK_M, members + 1)
         ):
@@ -458,8 +457,9 @@ class TestWidthFreeBeamGraphInputs(CustomTestCase):
             inputs.load_replay_inputs(beam)
 
             layout = captured.attention_metadata.layout
-            num_rows, groups, _ = _tables(layout)
-            self.assertEqual((num_rows, len(groups)), (431, 3))
+            num_rows, tiles = _tiles(layout)
+            leaders = {leader for leader, _, _, _, _ in tiles}
+            self.assertEqual((num_rows, len(leaders)), (431, 3))
             self.assertEqual(sorted(_rows_in_tiles(layout)), list(range(431)))
 
     def test_dense_head_batch_replays_without_trie_levels(self):
