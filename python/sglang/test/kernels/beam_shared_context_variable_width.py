@@ -30,6 +30,36 @@ def stream_k_split_cost(split_cost_units):
     )
 
 
+def _kv_buffers(*, num_slots, first_slot, kv_heads, head_dim, device):
+    """Random K and V for the cache's slots [first_slot, first_slot + num_slots)."""
+    used_slots = torch.randn(
+        num_slots, kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    if not first_slot:
+        return used_slots, torch.randn_like(used_slots)
+    # One tensor serves as both K and V, to halve what the unused slots take.
+    kv_buffer = torch.empty(
+        (first_slot + num_slots, kv_heads, head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    kv_buffer[first_slot:] = used_slots
+    return kv_buffer, kv_buffer
+
+
+def _fp32_reference(q, k_buffer, v_buffer, row_slots, softmax_scale):
+    """Per row, plain softmax attention in FP32 over the KV slots of the row's
+    tokens; row_slots[row] lists them."""
+    q_per_kv = q.shape[1] // k_buffer.shape[1]
+    reference = torch.empty(q.shape, dtype=torch.float32, device=q.device)
+    for row, slots in enumerate(row_slots):
+        k = k_buffer[slots.long()].repeat_interleave(q_per_kv, dim=1).float()
+        v = v_buffer[slots.long()].repeat_interleave(q_per_kv, dim=1).float()
+        scores = torch.einsum("hd,thd->ht", q[row].float(), k) * softmax_scale
+        reference[row] = torch.einsum("ht,thd->hd", scores.softmax(dim=-1), v)
+    return reference
+
+
 def variable_width_case(
     widths,
     prompt_lens,
@@ -90,30 +120,24 @@ def variable_width_case(
         next_member_row = member_rows.stop
 
     q = torch.randn(num_rows, q_heads, head_dim, dtype=torch.bfloat16, device=device)
-    used_slots = torch.randn(
-        num_slots, kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    k_buffer, v_buffer = _kv_buffers(
+        num_slots=num_slots,
+        first_slot=first_slot,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        device=device,
     )
-    if first_slot:
-        # One tensor serves as both K and V, to halve what the unused slots take.
-        k_buffer = torch.empty(
-            (first_slot + num_slots, kv_heads, head_dim),
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        k_buffer[first_slot:] = used_slots
-        v_buffer = k_buffer
-    else:
-        k_buffer = used_slots
-        v_buffer = torch.randn_like(k_buffer)
     softmax_scale = 1.0 / math.sqrt(head_dim)
-    q_per_kv = q_heads // kv_heads
-    reference = torch.empty(q.shape, dtype=torch.float32, device=device)
-    for row in range(num_rows):
-        row_slots = req_to_token[pool_rows[row], : int(seq_lens[row])].long()
-        k = k_buffer[row_slots].repeat_interleave(q_per_kv, dim=1).float()
-        v = v_buffer[row_slots].repeat_interleave(q_per_kv, dim=1).float()
-        scores = torch.einsum("hd,thd->ht", q[row].float(), k) * softmax_scale
-        reference[row] = torch.einsum("ht,thd->hd", scores.softmax(dim=-1), v)
+    reference = _fp32_reference(
+        q=q,
+        k_buffer=k_buffer,
+        v_buffer=v_buffer,
+        row_slots=[
+            req_to_token[pool_rows[row], : int(seq_lens[row])]
+            for row in range(num_rows)
+        ],
+        softmax_scale=softmax_scale,
+    )
 
     batch = SimpleNamespace(
         seq_lens=seq_lens,
