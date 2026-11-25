@@ -233,6 +233,7 @@ def attend_prompt_blocks(
     HEAD_DIM: tl.constexpr,
     BLOCK_N: tl.constexpr,  # prompt tokens per block
     BLOCK_D: tl.constexpr,  # HEAD_DIM rounded up to a power of 2
+    PROMPT_LOOP_STEP: tl.constexpr,  # BLOCK_N or 1: the loop counts tokens or blocks
     WIDE_KV_OFFSETS: tl.constexpr,  # 64-bit K/V offsets; False needs < 2^31 elements
 ):
     """All beams of a tile attend blocks [first_block, end_block) of their group's
@@ -241,12 +242,16 @@ def attend_prompt_blocks(
     dim_offsets = tl.arange(0, BLOCK_D)
     dim_mask = dim_offsets < HEAD_DIM
     negative_infinity = -float("inf")
-    # The loop steps by tokens, as the default kernel's own loop did before the two
-    # kernels shared this one.
-    first_token = first_block * BLOCK_N
-    end_token = tl.minimum(end_block * BLOCK_N, prompt_len)
-    for block_start in tl.range(first_token, end_token, BLOCK_N):
-        tokens = block_start + context_offsets
+    # The loop variable counts tokens (PROMPT_LOOP_STEP is BLOCK_N) or blocks (1);
+    # the blocks and their order are the same. The two kernels are each faster with
+    # another one, measured per launch on SM120: the default kernel by 4% counting
+    # tokens, stream-K by 5% counting blocks.
+    tokens_per_count = BLOCK_N // PROMPT_LOOP_STEP
+    first_count = first_block * PROMPT_LOOP_STEP
+    # Counted in tokens, the last block ends at the prompt's length.
+    end_count = tl.minimum(end_block * PROMPT_LOOP_STEP, prompt_len)
+    for count in tl.range(first_count, end_count, PROMPT_LOOP_STEP):
+        tokens = count * tokens_per_count + context_offsets
         token_mask = tokens < prompt_len
         slots = tl.load(prompt_slots + tokens, mask=token_mask, other=0)
         if WIDE_KV_OFFSETS:
@@ -374,6 +379,7 @@ def attend_tile(
     BLOCK_N: tl.constexpr,  # prompt tokens per block
     BLOCK_D: tl.constexpr,  # HEAD_DIM rounded up to a power of 2
     TILE_FIELDS: tl.constexpr,
+    PROMPT_LOOP_STEP: tl.constexpr,  # BLOCK_N or 1, see attend_prompt_blocks
     WIDE_KV_OFFSETS: tl.constexpr,  # 64-bit K/V offsets; False needs < 2^31 elements
 ):
     """Attend one tile for one query head over its work units [work_start, work_end).
@@ -427,6 +433,7 @@ def attend_tile(
         HEAD_DIM=HEAD_DIM,
         BLOCK_N=BLOCK_N,
         BLOCK_D=BLOCK_D,
+        PROMPT_LOOP_STEP=PROMPT_LOOP_STEP,
         WIDE_KV_OFFSETS=WIDE_KV_OFFSETS,
     )
 
@@ -528,6 +535,7 @@ def _variable_width_shared_context_kernel(
             BLOCK_N=BLOCK_N,
             BLOCK_D=BLOCK_D,
             TILE_FIELDS=TILE_FIELDS,
+            PROMPT_LOOP_STEP=BLOCK_N,
             WIDE_KV_OFFSETS=True,
         )
         store_output(
