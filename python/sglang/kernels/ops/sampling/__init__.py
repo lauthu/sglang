@@ -181,3 +181,11 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="sampling.beam_radix_select",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.sampling.beam_radix_select:radix_select_trie_beams",
+        capabilities=CUDA_ONLY,
+    )
+)
