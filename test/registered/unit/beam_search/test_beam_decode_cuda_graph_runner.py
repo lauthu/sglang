@@ -25,7 +25,7 @@ import torch
 from sglang.srt.beam_search import beam_decode_cuda_graph_runner
 from sglang.srt.beam_search.beam_decode_cuda_graph_runner import (
     BeamGraphInputs,
-    FixedWidthAttentionInput,
+    FixedWidthSharedContextInput,
     FixedWidthCapacity,
     TrieLevelsInput,
 )
@@ -48,8 +48,10 @@ def _inputs(max_rows, *, trie_head=True, shared_context=True) -> BeamGraphInputs
         trie_levels_input=(
             TrieLevelsInput(max_rows=max_rows, device="cpu") if trie_head else None
         ),
-        attention_input=(
-            FixedWidthAttentionInput(max_rows=max_rows, device="cpu", capacity=CAPACITY)
+        shared_context_input=(
+            FixedWidthSharedContextInput(
+                max_rows=max_rows, device="cpu", capacity=CAPACITY
+            )
             if shared_context
             else None
         ),
@@ -179,22 +181,22 @@ class TestBeamGraphInputs(CustomTestCase):
         )
 
 
-class TestFixedWidthAttentionInput(CustomTestCase):
+class TestFixedWidthSharedContextInput(CustomTestCase):
     def test_a_smaller_graph_captures_on_its_own_values(self):
         """Graphs of every size share the buffers, and a graph of fewer groups
         reads them at other offsets. What a larger graph's batch left there is
         no valid input: a length past the capacity reads outside the buffers."""
-        attention_input = FixedWidthAttentionInput(
+        shared_context_input = FixedWidthSharedContextInput(
             max_rows=8, device="cpu", capacity=CAPACITY
         )
-        attention_input.prepare_capture_inputs(8)
-        attention_input.load_replay_inputs(
+        shared_context_input.prepare_capture_inputs(8)
+        shared_context_input.load_replay_inputs(
             _metadata(
                 prompt_lens=[CAPACITY.max_context_len] * 4,
                 decode_lens=[CAPACITY.max_decode_len] * 4,
             )
         )
-        bucket = attention_input.prepare_capture_inputs(4).buckets[0]
+        bucket = shared_context_input.prepare_capture_inputs(4).buckets[0]
         self.assertEqual(sorted(bucket.row_indices.flatten().tolist()), [0, 1, 2, 3])
         prompt_offsets = bucket.context_cu_seqlens.tolist()
         self.assertEqual(prompt_offsets[0], 0)
@@ -239,7 +241,7 @@ class TestFixedWidthAttentionInput(CustomTestCase):
                     max_new_tokens
                 ),
             ):
-                attention = FixedWidthAttentionInput.create(runner, max_rows=8)
+                attention = FixedWidthSharedContextInput.create(runner, max_rows=8)
                 if max_decode_len is None:
                     self.assertIsNone(attention)
                 else:

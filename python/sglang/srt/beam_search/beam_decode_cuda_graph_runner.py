@@ -94,7 +94,7 @@ class FixedWidthCapacity(msgspec.Struct, frozen=True):
     max_decode_len: int
 
 
-class FixedWidthAttentionInput:
+class FixedWidthSharedContextInput:
     """Graph buffers for shared-context attention with one beam width.
 
     A graph serves several requests at once when each has that beam width: a
@@ -125,7 +125,7 @@ class FixedWidthAttentionInput:
     @classmethod
     def create(
         cls, model_runner: ModelRunner, *, max_rows: int
-    ) -> Optional[FixedWidthAttentionInput]:
+    ) -> Optional[FixedWidthSharedContextInput]:
         """Returns None, and logs why, when shared-context batches get no graph."""
         beam_width = cls._read_beam_width()
         max_new_tokens = cls._read_max_new_tokens(model_runner.model_config)
@@ -288,21 +288,21 @@ class BeamGraphInputs:
         self,
         *,
         trie_levels_input: Optional[TrieLevelsInput],
-        attention_input: Optional[FixedWidthAttentionInput],
+        shared_context_input: Optional[FixedWidthSharedContextInput],
     ):
         self.trie_levels_input = trie_levels_input
-        self.attention_input = attention_input
+        self.shared_context_input = shared_context_input
         # Sizes, in rows, of the beam graphs captured so far.
         self.captured_sizes: set[int] = set()
 
     def _inputs_with_batch_values(self, beam: BeamForwardInputs):
         return (
             (self.trie_levels_input, beam.trie_levels),
-            (self.attention_input, beam.attention_metadata),
+            (self.shared_context_input, beam.attention_metadata),
         )
 
     def can_capture(self, graph_size: int) -> bool:
-        graph_inputs = (self.trie_levels_input, self.attention_input)
+        graph_inputs = (self.trie_levels_input, self.shared_context_input)
         return all(
             graph_input.can_capture(graph_size)
             for graph_input in graph_inputs
@@ -319,8 +319,8 @@ class BeamGraphInputs:
             ),
             attention_metadata=(
                 None
-                if self.attention_input is None
-                else self.attention_input.prepare_capture_inputs(graph_size)
+                if self.shared_context_input is None
+                else self.shared_context_input.prepare_capture_inputs(graph_size)
             ),
         )
 
@@ -348,14 +348,14 @@ def _create_beam_graph_inputs(model_runner: ModelRunner) -> Optional[BeamGraphIn
     """Returns None, and logs why, when no all-beam batch could replay a beam graph."""
     # Rows of the largest decode graph; the shared logits buffer holds as many.
     max_rows = model_runner.max_decode_logits_rows()
-    attention_input = None
+    shared_context_input = None
     if shared_context_attention.enabled() and (
         shared_context_attention.supports_shared_context(model_runner)
     ):
-        attention_input = FixedWidthAttentionInput.create(
+        shared_context_input = FixedWidthSharedContextInput.create(
             model_runner, max_rows=max_rows
         )
-        if attention_input is None:
+        if shared_context_input is None:
             # Every all-beam batch carries shared-context metadata on this server,
             # so a beam graph without that input would never replay.
             return None
@@ -364,7 +364,7 @@ def _create_beam_graph_inputs(model_runner: ModelRunner) -> Optional[BeamGraphIn
         if model_runner.beam_trie_compact_enabled
         else None
     )
-    if trie_levels_input is None and attention_input is None:
+    if trie_levels_input is None and shared_context_input is None:
         logger.info(
             "No beam decode graphs captured; all-beam batches run neither the "
             "compact trie head nor shared-context attention and replay the "
@@ -372,7 +372,7 @@ def _create_beam_graph_inputs(model_runner: ModelRunner) -> Optional[BeamGraphIn
         )
         return None
     return BeamGraphInputs(
-        trie_levels_input=trie_levels_input, attention_input=attention_input
+        trie_levels_input=trie_levels_input, shared_context_input=shared_context_input
     )
 
 
@@ -422,15 +422,15 @@ class BeamDecodeCudaGraphRunner(DecodeCudaGraphRunner):
                 "shared-context attention %s).",
                 sorted(graph_inputs.captured_sizes),
                 "on" if graph_inputs.trie_levels_input is not None else "off",
-                "on" if graph_inputs.attention_input is not None else "off",
+                "on" if graph_inputs.shared_context_input is not None else "off",
             )
         else:
-            # Only the attention input refuses sizes, so it is set here.
+            # Only the shared-context input refuses sizes, so it is set here.
             logger.warning(
                 "SGLANG_ENABLE_BEAM_DECODE_GRAPH is set, but no decode graph size "
                 "in %s holds a beam graph, so all-beam batches run eagerly. %s",
                 self.capture_bs,
-                graph_inputs.attention_input.describe_size_requirement(),
+                graph_inputs.shared_context_input.describe_size_requirement(),
             )
 
     def capture_one_shape(

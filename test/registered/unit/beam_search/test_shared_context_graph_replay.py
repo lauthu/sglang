@@ -20,7 +20,7 @@ import torch
 from sglang.kernels.ops.attention.beam_shared_context import shared_context_attention
 from sglang.srt.beam_search.beam_decode_cuda_graph_runner import (
     BeamGraphInputs,
-    FixedWidthAttentionInput,
+    FixedWidthSharedContextInput,
     FixedWidthCapacity,
 )
 from sglang.srt.beam_search.forward_inputs import BeamForwardInputs
@@ -86,7 +86,7 @@ class TestSharedContextGraphReplay(CustomTestCase):
         v = torch.randn_like(k)
         inputs = BeamGraphInputs(
             trie_levels_input=None,
-            attention_input=FixedWidthAttentionInput(
+            shared_context_input=FixedWidthSharedContextInput(
                 max_rows=2 * WIDTH, device="cuda", capacity=CAPACITY
             ),
         )
