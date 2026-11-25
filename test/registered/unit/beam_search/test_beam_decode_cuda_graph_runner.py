@@ -31,7 +31,6 @@ from sglang.kernels.ops.attention.beam_shared_context_variable_width_stream_k im
 )
 from sglang.srt.beam_search import (
     beam_decode_cuda_graph_runner,
-    decode_graph_settings,
     shared_context_attention,
     trie_output_head,
 )
@@ -54,11 +53,18 @@ from sglang.srt.beam_search.shared_context_attention import (
 )
 from sglang.srt.beam_search.shared_context_variable_width import (
     BEAMS_PER_TILE,
+    StreamKGrid,
     VariableWidthBeamAttentionMetadata,
+    build_variable_width_metadata,
 )
 from sglang.srt.beam_search.trie_config import TrieOutputHeadConfig
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.kernels.beam_shared_context_variable_width import (
+    ALWAYS_SPLIT,
+    NEVER_SPLIT,
+    stream_k_split_cost,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -228,11 +234,11 @@ class TestFixedWidthSharedContextInput(CustomTestCase):
         for decode_len in bucket.decode_lens.tolist():
             self.assertIn(decode_len, range(1, CAPACITY.max_decode_len + 1))
 
-    def test_graphs_need_a_width_and_a_token_budget(self):
-        """The graph is captured for one beam width and a fixed number of decode
-        steps. Nothing but the operator knows the width, and without a trie
-        nothing bounds the steps, so a server that sets neither captures no graph.
-        A step attends the tokens generated before it: one fewer than the budget."""
+    def test_graphs_need_a_token_budget(self):
+        """The graph is captured for a fixed number of decode steps. Without a trie
+        nothing bounds the steps, so a server that sets no budget captures no
+        graph. A step attends the tokens generated before it: one fewer than the
+        budget."""
         runner = SimpleNamespace(
             lora_manager=None,
             device="cpu",
@@ -240,7 +246,6 @@ class TestFixedWidthSharedContextInput(CustomTestCase):
         )
         cases = (
             # (width, max new tokens, trie codebooks) -> max_decode_len, or None for no graph
-            ((None, 4, None), None),
             ((2, None, None), None),
             ((2, 4, None), 3),
             ((2, None, 3), 2),
@@ -379,7 +384,7 @@ def _variable_width_graph_inputs(max_rows, *, trie_head=True):
             max_rows=max_rows,
             device="cpu",
             req_to_token=torch.zeros(4, 8, dtype=torch.int32),
-            stream_k=None,
+            stream_k_grid=None,
         ),
     )
 
@@ -448,10 +453,13 @@ class TestVariableWidthBeamGraphInputs(CustomTestCase):
         fixed width, a batch must not get the variable-width layout."""
         batch, runner = _decode_batch((4, 4)), _model_runner()
         width_buckets = object()
-        # Server settings -> whether a batch gets the variable-width layout.
+        # Server settings -> whether a batch gets the variable-width layout. The
+        # per-width buckets have a split-KV kernel.
         cases = (
             ({"decode_graphs": False}, False),
+            ({"decode_graphs": False, "kernel": "split_kv"}, False),
             ({"fixed_width": 4}, False),
+            ({"fixed_width": 4, "kernel": "split_kv"}, False),
             ({}, True),
         )
         for settings, expects_variable_width in cases:
@@ -530,32 +538,43 @@ class TestVariableWidthBeamGraphInputs(CustomTestCase):
                 build_beam_forward_inputs(with_regular_request, _model_runner())
             )
 
-    def test_startup_rejects_settings_that_cannot_run_together(self):
-        """The variable-width graphs have no split-KV kernel: selecting it there must
-        not silently run another kernel. With a fixed width, or with the graphs
-        off, the server keeps the kernels that take all three names."""
-        check = decode_graph_settings.check_settings
-        with _shared_context_server(kernel="stream_k"):
-            check()
+    def test_variable_width_graphs_refuse_a_kernel_they_lack(self):
+        """The variable-width layout has no split-KV kernel, and selecting it must
+        not silently run another one: the server fails when it creates its beam
+        graphs, and a batch fails on a server that captures none."""
+        runner = _model_runner()
         with _shared_context_server(kernel="split_kv"):
-            with self.assertRaisesRegex(
-                ValueError, "'split_kv' is not available when .* any beam width"
-            ):
-                check()
-        for without_variable_width_graphs in (
-            {"fixed_width": 2},
-            {"decode_graphs": False},
-        ):
-            for kernel in ("split_kv", "stream_k"):
-                with _shared_context_server(
-                    kernel=kernel, **without_variable_width_graphs
-                ):
-                    check()
+            with self.assertRaisesRegex(ValueError, "'split_kv', not one of"):
+                _create_beam_graph_inputs(runner)
+            with self.assertRaisesRegex(ValueError, "'split_kv', not one of"):
+                shared_context_attention.build_metadata(_decode_batch((4, 4)), runner)
+
+    def test_layout_buffer_holds_the_most_tiles_of_the_largest_graph(self):
+        """A graph's rows hold the most tiles when every group has two beams. The
+        layout of that batch, with a stream-K plan after its tiles, fills the
+        buffer that the graphs captured."""
+        max_rows = 64
+        grid = StreamKGrid(q_heads=1, num_ctas=7)
+        req_to_token = torch.zeros(4, 8, dtype=torch.int32)
+        shared_context_input = VariableWidthSharedContextInput(
+            max_rows=max_rows,
+            device="cpu",
+            req_to_token=req_to_token,
+            stream_k_grid=grid,
+        )
+        graph_layout = shared_context_input.prepare_capture_inputs(max_rows).layout
+        metadata = build_variable_width_metadata(
+            batch=_decode_batch((2,) * (max_rows // 2)),
+            req_to_token=req_to_token,
+            stream_k_grid=grid,
+        )
+        self.assertEqual(len(metadata.host_layout), len(graph_layout))
+        shared_context_input.load_replay_inputs(metadata)
+        self.assertEqual(graph_layout.tolist(), metadata.host_layout.tolist())
 
 
-# split_cost_units that force the stream-K plan's choice, whatever the batch.
-NEVER_SPLIT = 1 << 20
-ALWAYS_SPLIT = -(1 << 20)
+# Tokens of a prompt block in the stream-K kernel.
+PROMPT_BLOCK = 64
 
 
 class TestStreamKPlan(CustomTestCase):
@@ -572,34 +591,42 @@ class TestStreamKPlan(CustomTestCase):
             "uneven tiles": [(1, 1), (11, 3), (1, 5), (32, 1), (8, 2), (3, 1)],
             "one tiny tile": [(1, 1)],
         }
+        # None: the plan chooses between whole tasks and equal runs, as in serving.
         for (name, tiles), q_heads, num_ctas, split_cost_units in itertools.product(
             batches.items(),
             (1, 16),
             (1, 3, 7, 64, 188),
             (None, NEVER_SPLIT, ALWAYS_SPLIT),
         ):
-            with self.subTest(
-                batch=name, q_heads=q_heads, num_ctas=num_ctas, split=split_cost_units
-            ):
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(
+                    self.subTest(
+                        batch=name,
+                        q_heads=q_heads,
+                        num_ctas=num_ctas,
+                        split=split_cost_units,
+                    )
+                )
+                if split_cost_units is not None:
+                    stack.enter_context(stream_k_split_cost(split_cost_units))
                 split_tasks = self._check_plan(
-                    tiles, q_heads=q_heads, num_ctas=num_ctas, split=split_cost_units
+                    tiles, q_heads=q_heads, num_ctas=num_ctas
                 )
                 if split_cost_units == NEVER_SPLIT:
                     self.assertEqual(split_tasks, 0)
                 if split_cost_units == ALWAYS_SPLIT and num_ctas == 188:
                     self.assertGreater(split_tasks, 0)
 
-    def _check_plan(self, tiles, *, q_heads, num_ctas, split):
+    def _check_plan(self, tiles, *, q_heads, num_ctas):
         """Check one plan as the kernels read it; returns its number of split tasks."""
         work_units = [blocks + steps for blocks, steps in tiles for _ in range(q_heads)]
         plan = build_stream_k_plan(
-            units_per_task=[
-                task_units(prompt_len=64 * blocks, decode_len=steps)
+            task_units_per_tile=[
+                task_units(prompt_len=PROMPT_BLOCK * blocks, decode_len=steps)
                 for blocks, steps in tiles
             ],
             q_heads=q_heads,
             num_ctas=num_ctas,
-            split_cost_units=split,
         ).tolist()
         self.assertEqual(len(plan), num_ctas)
 

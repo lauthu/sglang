@@ -137,11 +137,6 @@ class FixedWidthSharedContextInput:
         reason = None
         if model_runner.lora_manager is not None:
             reason = "LoRA is enabled"
-        elif beam_width is None:
-            reason = (
-                "SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH is not set; set it to the "
-                "requests' beam width"
-            )
         elif max_new_tokens is None:
             reason = (
                 "the model bundles no trie and "
@@ -163,9 +158,10 @@ class FixedWidthSharedContextInput:
         return cls(max_rows=max_rows, device=model_runner.device, capacity=capacity)
 
     @staticmethod
-    def _read_beam_width() -> Optional[int]:
+    def _read_beam_width() -> int:
+        """The fixed width; a server without one gets the variable-width input."""
         beam_width = envs.SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH.get()
-        if beam_width is not None and beam_width < 2:
+        if beam_width < 2:
             raise ValueError(
                 "SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH must be at least 2 (a beam "
                 f"request has a beam width above 1), got {beam_width}."
@@ -299,13 +295,13 @@ class VariableWidthSharedContextInput:
         max_rows: int,
         device,
         req_to_token: torch.Tensor,
-        stream_k: Optional[variable_width.StreamKGrid],
+        stream_k_grid: Optional[variable_width.StreamKGrid],
     ):
         self._graph_metadata = variable_width.allocate_graph_metadata(
             max_rows=max_rows,
             device=device,
             req_to_token=req_to_token,
-            stream_k=stream_k,
+            stream_k_grid=stream_k_grid,
         )
 
     @classmethod
@@ -319,11 +315,20 @@ class VariableWidthSharedContextInput:
                 "batches get no decode graph (LoRA is enabled); they run eagerly."
             )
             return None
+        max_new_tokens_setting = (
+            envs.SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH_MAX_NEW_TOKENS
+        )
+        if max_new_tokens_setting.is_set():
+            logger.warning(
+                "%s has no effect without SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH: the "
+                "beam decode graphs for any beam width have no token limit.",
+                max_new_tokens_setting.name,
+            )
         return cls(
             max_rows=max_rows,
             device=model_runner.device,
             req_to_token=model_runner.req_to_token_pool.req_to_token,
-            stream_k=variable_width.stream_k_grid(model_runner),
+            stream_k_grid=variable_width.get_stream_k_grid(model_runner),
         )
 
     def can_capture(self, graph_size: int) -> bool:

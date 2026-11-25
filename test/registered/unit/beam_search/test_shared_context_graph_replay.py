@@ -32,9 +32,10 @@ from sglang.srt.beam_search.shared_context_attention import (
     BeamAttentionMetadata,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kernels.beam_shared_context import (
+from sglang.test.kernels.beam_shared_context_variable_width import (
+    assert_rows_match_reference,
     build_case_metadata,
-    run_variable_width_attention,
+    forward_variable_width_attention,
     variable_width_case,
 )
 from sglang.test.test_utils import CustomTestCase
@@ -135,8 +136,8 @@ class TestVariableWidthGraphReplay(CustomTestCase):
     def test_graph_captured_once_replays_any_widths(self):
         """Capture records no beam width, group count or length: one beam graph
         replays every batch loaded into its layout, and the padding rows after
-        a batch's read 0. With stream-K, the batches alternate between splitting tasks and
-        whole tasks per CTA (the batch of 40 groups)."""
+        a batch's read 0. With stream-K, the batches alternate between splitting
+        tasks and whole tasks per CTA (the batch of 40 groups)."""
         batches = (
             dict(widths=(256, 256), prompt_lens=(2048, 7), decode_lens=(2, 1)),
             dict(
@@ -182,17 +183,19 @@ class TestVariableWidthGraphReplay(CustomTestCase):
                 device=req_to_token.device,
                 req_to_token=req_to_token,
                 # The grid every batch's stream-K plan is built for.
-                stream_k=build_case_metadata(first, stream_k=stream_k).stream_k,
+                stream_k_grid=build_case_metadata(
+                    first, stream_k=stream_k
+                ).stream_k_grid,
             ),
         )
         graph_metadata = beam_graph_inputs.prepare_capture_inputs(
             graph_size
         ).attention_metadata
         # Compile the kernels outside the capture.
-        run_variable_width_attention(graph_tensors, graph_metadata)
+        forward_variable_width_attention(graph_tensors, graph_metadata)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            output = run_variable_width_attention(graph_tensors, graph_metadata)
+            output = forward_variable_width_attention(graph_tensors, graph_metadata)
 
         for index, case in enumerate(cases):
             with self.subTest(batch=index):
@@ -213,11 +216,8 @@ class TestVariableWidthGraphReplay(CustomTestCase):
                 beam_graph_inputs.load_replay_inputs(batch_inputs)
                 graph.replay()
                 torch.cuda.synchronize()
-                torch.testing.assert_close(
-                    output[:num_rows].float(), case.reference, rtol=1e-2, atol=1e-2
-                )
-                padding_rows = output[num_rows:]
-                self.assertEqual(int(padding_rows.abs().sum()), 0)
+                assert_rows_match_reference(output[:num_rows], case.reference)
+                self.assertEqual(int(torch.count_nonzero(output[num_rows:])), 0)
 
 
 if __name__ == "__main__":

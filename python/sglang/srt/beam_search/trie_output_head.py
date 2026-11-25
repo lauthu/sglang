@@ -22,7 +22,6 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.activation.softcap import softcap_inplace_logits
-from sglang.srt.beam_search import decode_graph_settings
 from sglang.srt.beam_search.trie_config import (
     TrieOutputHeadConfig,
     get_beam_trie_config,
@@ -54,13 +53,7 @@ def configure_model_trie_output_heads(
     lora_enabled: bool,
 ) -> bool:
     """Install the compact head on the model's LogitsProcessors when the setup
-    allows it; returns whether it is on.
-
-    It is also the one beam search step that every server runs at model load,
-    with or without a trie, so it first checks the beam decode graph settings: a
-    bad combination fails at startup.
-    """
-    decode_graph_settings.check_settings()
+    allows it; returns whether it is on."""
     config = get_beam_trie_config(model_config)
     if config is None:
         return False

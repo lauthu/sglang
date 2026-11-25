@@ -7,7 +7,8 @@
 - TestBeamParityDecodeGraph: the same acceptance on a server that replays
   all-beam decode batches as CUDA graphs.
 - TestBeamParityVariableWidthDecodeGraph: the same on graphs that take any beam
-  width (no SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH).
+  width (no SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH); TestBeamParityVariableWidthStreamK
+  with their stream-K kernel.
 
 Manual test (GPU host): python3 test_beam_parity.py
 """
@@ -198,8 +199,8 @@ class TestBeamParityVariableWidthDecodeGraph(TestBeamParity):
     budget set."""
 
     # At 2 beams this prompt's search sits on a near-tie between two prefixes, which
-    # attention implementations resolve differently by rounding; see the class above.
-    parity_beam_widths = (GRAPH_BEAM_WIDTH,)
+    # attention implementations resolve differently by rounding.
+    parity_beam_widths = (10,)
     server_env = {
         "SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION": "1",
         "SGLANG_ENABLE_BEAM_DECODE_GRAPH": "1",
@@ -214,12 +215,21 @@ class TestBeamParityVariableWidthDecodeGraph(TestBeamParity):
             "(compact trie head off, shared-context attention on)",
             self.server_log.getvalue(),
         )
-        for beam_width in (2, GRAPH_BEAM_WIDTH):
+        for beam_width in (2, 10):
             before = _decode_passes(self.base_url)
             self._generate_beams(beam_width)
             after = _decode_passes(self.base_url)
             self.assertGreater(after["decode_cuda_graph"], before["decode_cuda_graph"])
             self.assertEqual(after["decode_none"], before["decode_none"])
+
+
+class TestBeamParityVariableWidthStreamK(TestBeamParityVariableWidthDecodeGraph):
+    """The same with the variable-width graphs' stream-K kernel."""
+
+    server_env = {
+        **TestBeamParityVariableWidthDecodeGraph.server_env,
+        "SGLANG_BEAM_SHARED_CONTEXT_KERNEL": "stream_k",
+    }
 
 
 if __name__ == "__main__":

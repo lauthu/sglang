@@ -156,13 +156,13 @@ def build_metadata(
     entries = batch.beam_tail.entries
     if not entries or batch.seq_lens_cpu is None:
         return None
-    # A variable-width graph replays only the variable-width layout, so on such a server
-    # every beam decode batch gets it, replayed or not.
+    # A variable-width graph replays only the variable-width layout, so on such a
+    # server every beam decode batch gets it, replayed or not.
     if variable_width_graphs_enabled():
         return variable_width.build_variable_width_metadata(
             batch=batch,
             req_to_token=model_runner.req_to_token_pool.req_to_token,
-            stream_k=variable_width.stream_k_grid(model_runner),
+            stream_k_grid=variable_width.get_stream_k_grid(model_runner),
         )
     return _build_width_buckets(batch=batch, model_runner=model_runner)
 

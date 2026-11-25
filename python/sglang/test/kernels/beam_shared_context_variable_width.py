@@ -3,17 +3,31 @@ FP32 reference: per row, plain softmax attention over the row's own KV slots."""
 
 import math
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.kernels.ops.attention import beam_shared_context_variable_width_stream_k
+from sglang.srt.beam_search import shared_context_attention
 from sglang.srt.beam_search.batch_tail import BeamTailEntry
 from sglang.srt.beam_search.shared_context_variable_width import (
-    BEAMS_PER_TILE,
     StreamKGrid,
-    attention_kernel,
     build_variable_width_metadata,
-    device_layout,
 )
+
+# Split costs that force the stream-K plan's choice, whatever the batch: whole
+# tasks per CTA, or equal runs of units, which split tasks.
+NEVER_SPLIT = 1 << 20
+ALWAYS_SPLIT = -(1 << 20)
+
+
+def stream_k_split_cost(split_cost_units):
+    """Build stream-K plans with this split cost instead of the measured one."""
+    return patch.object(
+        beam_shared_context_variable_width_stream_k,
+        "_SPLIT_COST_UNITS",
+        split_cost_units,
+    )
 
 
 def variable_width_case(
@@ -25,6 +39,7 @@ def variable_width_case(
     kv_heads=2,
     head_dim=64,
     num_slots=1 << 15,
+    first_slot=0,
     max_context=1024,
     seed=0,
 ):
@@ -33,8 +48,9 @@ def variable_width_case(
     Rows are laid out as the scheduler does: one leader row per group, then each
     group's member rows. A member's req_to_token row repeats the leader's prompt
     slots and holds its own decode slots; every row of a group has the leader's
-    length. Returns the batch view the metadata builder reads, the kernel inputs
-    and the FP32 reference.
+    length. The KV slots are `num_slots` slots of the cache from `first_slot` on.
+    Returns the batch view the metadata builder reads, the kernel inputs and the
+    FP32 reference.
     """
     torch.manual_seed(seed)
     device = torch.device("cuda")
@@ -45,7 +61,7 @@ def variable_width_case(
     req_to_token = torch.zeros(
         (num_rows + 16, max_context), dtype=torch.int32, device=device
     )
-    kv_slots = torch.randperm(num_slots, device=device).to(torch.int32)
+    kv_slots = first_slot + torch.randperm(num_slots, device=device).to(torch.int32)
     seq_lens = torch.zeros(num_rows, dtype=torch.int64, device=device)
     entries = []
     next_member_row, next_slot = num_groups, 0
@@ -74,10 +90,21 @@ def variable_width_case(
         next_member_row = member_rows.stop
 
     q = torch.randn(num_rows, q_heads, head_dim, dtype=torch.bfloat16, device=device)
-    k_buffer = torch.randn(
+    used_slots = torch.randn(
         num_slots, kv_heads, head_dim, dtype=torch.bfloat16, device=device
     )
-    v_buffer = torch.randn_like(k_buffer)
+    if first_slot:
+        # One tensor serves as both K and V, to halve what the unused slots take.
+        k_buffer = torch.empty(
+            (first_slot + num_slots, kv_heads, head_dim),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        k_buffer[first_slot:] = used_slots
+        v_buffer = k_buffer
+    else:
+        k_buffer = used_slots
+        v_buffer = torch.randn_like(k_buffer)
     softmax_scale = 1.0 / math.sqrt(head_dim)
     q_per_kv = q_heads // kv_heads
     reference = torch.empty(q.shape, dtype=torch.float32, device=device)
@@ -107,41 +134,66 @@ def variable_width_case(
     )
 
 
-def build_case_metadata(case, *, stream_k, num_ctas=None, split_cost_units=None):
+def build_case_metadata(case, *, stream_k, num_ctas=None):
     """A case's layout from the host's builder, as serving builds it. With
-    `stream_k`, `num_ctas` and `split_cost_units` force the grid size of the
-    kernel and its plan's choice between whole tasks and equal runs."""
+    `stream_k` the layout carries the stream-K plan, for a grid of `num_ctas` CTAs
+    (default: the device's)."""
     grid = None
     if stream_k:
-        from sglang.kernels.ops.attention.beam_shared_context_variable_width_stream_k import (
-            default_num_ctas,
-        )
-
         grid = StreamKGrid(
             q_heads=case.q.shape[1],
-            num_ctas=num_ctas or default_num_ctas(case.q.device.index),
-            split_cost_units=split_cost_units,
+            num_ctas=num_ctas
+            or beam_shared_context_variable_width_stream_k.default_num_ctas(
+                case.q.device.index
+            ),
         )
     return build_variable_width_metadata(
-        batch=case.batch, req_to_token=case.req_to_token, stream_k=grid
+        batch=case.batch, req_to_token=case.req_to_token, stream_k_grid=grid
     )
 
 
-def run_variable_width_attention(case, metadata):
-    """Launch the kernel a layout selects, as serving does, on a case's tensors
-    (or on a graph's own, which carry the same fields)."""
-    grid = metadata.stream_k
-    attention = attention_kernel(stream_k=grid is not None)
-    grid_options = {} if grid is None else {"num_ctas": grid.num_ctas}
-    return attention(
-        q=case.q,
-        k_buffer=case.k_buffer,
-        v_buffer=case.v_buffer,
-        req_to_token=metadata.req_to_token,
-        req_pool_indices=case.req_pool_indices,
-        seq_lens=case.seq_lens,
-        layout=device_layout(metadata, device=case.q.device),
-        block_m=BEAMS_PER_TILE,
-        softmax_scale=case.softmax_scale,
-        **grid_options,
+def forward_variable_width_attention(tensors, metadata):
+    """One layer's shared-context attention through serving's entry point, on a
+    case's tensors (or on a graph's own, which carry the same fields). Returns
+    [rows, q_heads, head_dim]."""
+    num_rows, q_heads, head_dim = tensors.q.shape
+    layer = SimpleNamespace(
+        layer_id=0,
+        tp_q_head_num=q_heads,
+        head_dim=head_dim,
+        scaling=tensors.softmax_scale,
+        logit_cap=0,
     )
+    kv_layers = SimpleNamespace(
+        read=lambda layer_id: SimpleNamespace(
+            kv=lambda: (tensors.k_buffer, tensors.v_buffer)
+        )
+    )
+    forward_batch = SimpleNamespace(
+        beam=SimpleNamespace(attention_metadata=metadata),
+        req_pool_indices=tensors.req_pool_indices,
+        seq_lens=tensors.seq_lens,
+    )
+    output = shared_context_attention.forward(
+        tensors.q.view(num_rows, q_heads * head_dim), layer, forward_batch, kv_layers
+    )
+    return output.view(num_rows, q_heads, head_dim)
+
+
+def assert_rows_match_reference(output, reference, max_row_error=0.01):
+    """Every row's error against the FP32 reference stays below max_row_error of
+    the row, both taken as the RMS over the row's heads and dims.
+
+    Measured on the batches of these tests (prompts of 1 to 5,000 tokens, both
+    kernels): 0.16% to 0.27% of a row, from the kernels' bf16 arithmetic. A
+    row's magnitude falls with its prompt's length, which an absolute tolerance
+    cannot follow.
+    """
+    error = (output.float() - reference).flatten(1).square().mean(dim=1).sqrt()
+    scale = reference.flatten(1).square().mean(dim=1).sqrt()
+    worst = int((error / scale).argmax())
+    if error[worst] > max_row_error * scale[worst]:
+        raise AssertionError(
+            f"Row {worst}: RMS error {float(error[worst]):.3e} against a reference "
+            f"of RMS {float(scale[worst]):.3e}, more than {max_row_error:.0%}"
+        )

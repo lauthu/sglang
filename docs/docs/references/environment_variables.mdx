@@ -1743,7 +1743,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH_MAX_NEW_TOKENS</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Tokens a fixed-width graph holds per beam request when the model bundles no trie. It is the graph's capacity, not a limit on requests: a longer request decodes eagerly from the next token on. Such a model gets fixed-width graphs only when this is set. Every replay pays for this many decode steps, so set it to the requests' <code>max_new_tokens</code>. A model with a trie uses its codebook count. Unused without <code>SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH</code>: the graphs for any width read each row's length.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Tokens a fixed-width graph holds per beam request when the model bundles no trie. It is the graph's capacity, not a limit on requests: a longer request decodes eagerly from the next token on. Such a model gets fixed-width graphs only when this is set. Every replay pays for this many decode steps, so set it to the requests' <code>max_new_tokens</code>. A model with a trie uses its codebook count. Unused without <code>SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH</code>: the graphs for any width have no token limit.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
     </tr>
     <tr>
