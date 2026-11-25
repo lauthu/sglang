@@ -31,11 +31,9 @@ from sglang.srt.beam_search.shared_context_attention import (
     BeamAttentionBucket,
     BeamAttentionMetadata,
 )
-from sglang.srt.beam_search.shared_context_variable_width import (
-    build_variable_width_metadata,
-)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.beam_shared_context import (
+    build_case_metadata,
     run_variable_width_attention,
     variable_width_case,
 )
@@ -183,7 +181,8 @@ class TestVariableWidthGraphReplay(CustomTestCase):
                 max_rows=graph_size,
                 device=req_to_token.device,
                 req_to_token=req_to_token,
-                stream_k=stream_k,
+                # The grid every batch's stream-K plan is built for.
+                stream_k=build_case_metadata(first, stream_k=stream_k).stream_k,
             ),
         )
         graph_metadata = beam_graph_inputs.prepare_capture_inputs(
@@ -206,11 +205,7 @@ class TestVariableWidthGraphReplay(CustomTestCase):
                 req_to_token[: len(case.req_to_token)].copy_(case.req_to_token)
                 batch_inputs = BeamForwardInputs(
                     trie_levels=torch.zeros(num_rows, dtype=torch.int64, device="cuda"),
-                    attention_metadata=build_variable_width_metadata(
-                        batch=case.batch,
-                        req_to_token=case.req_to_token,
-                        stream_k=stream_k,
-                    ),
+                    attention_metadata=build_case_metadata(case, stream_k=stream_k),
                 )
                 self.assertTrue(
                     beam_graph_inputs.can_replay(batch_inputs, graph_size=graph_size)

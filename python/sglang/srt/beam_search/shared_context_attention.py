@@ -24,10 +24,7 @@ import msgspec
 import torch
 
 from sglang.srt.beam_search import shared_context_variable_width as variable_width
-from sglang.srt.beam_search.decode_graph_settings import (
-    stream_k_selected,
-    variable_width_graphs_enabled,
-)
+from sglang.srt.beam_search.decode_graph_settings import variable_width_graphs_enabled
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -165,7 +162,7 @@ def build_metadata(
         return variable_width.build_variable_width_metadata(
             batch=batch,
             req_to_token=model_runner.req_to_token_pool.req_to_token,
-            stream_k=stream_k_selected(),
+            stream_k=variable_width.stream_k_grid(model_runner),
         )
     return _build_width_buckets(batch=batch, model_runner=model_runner)
 

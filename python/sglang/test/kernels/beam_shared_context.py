@@ -9,7 +9,10 @@ import torch
 from sglang.srt.beam_search.batch_tail import BeamTailEntry
 from sglang.srt.beam_search.shared_context_variable_width import (
     BEAMS_PER_TILE,
+    StreamKGrid,
     attention_kernel,
+    build_variable_width_metadata,
+    device_layout,
 )
 
 
@@ -104,11 +107,32 @@ def variable_width_case(
     )
 
 
-def run_variable_width_attention(case, metadata, **stream_k_options):
+def build_case_metadata(case, *, stream_k, num_ctas=None, split_cost_units=None):
+    """A case's layout from the host's builder, as serving builds it. With
+    `stream_k`, `num_ctas` and `split_cost_units` force the grid size of the
+    kernel and its plan's choice between whole tasks and equal runs."""
+    grid = None
+    if stream_k:
+        from sglang.kernels.ops.attention.beam_shared_context_variable_width_stream_k import (
+            default_num_ctas,
+        )
+
+        grid = StreamKGrid(
+            q_heads=case.q.shape[1],
+            num_ctas=num_ctas or default_num_ctas(case.q.device.index),
+            split_cost_units=split_cost_units,
+        )
+    return build_variable_width_metadata(
+        batch=case.batch, req_to_token=case.req_to_token, stream_k=grid
+    )
+
+
+def run_variable_width_attention(case, metadata):
     """Launch the kernel a layout selects, as serving does, on a case's tensors
-    (or on a graph's own, which carry the same fields). `stream_k_options` force
-    the stream-K kernel's grid size and its choice of splitting tasks."""
-    attention = attention_kernel(metadata.stream_k)
+    (or on a graph's own, which carry the same fields)."""
+    grid = metadata.stream_k
+    attention = attention_kernel(stream_k=grid is not None)
+    grid_options = {} if grid is None else {"num_ctas": grid.num_ctas}
     return attention(
         q=case.q,
         k_buffer=case.k_buffer,
@@ -116,8 +140,8 @@ def run_variable_width_attention(case, metadata, **stream_k_options):
         req_to_token=metadata.req_to_token,
         req_pool_indices=case.req_pool_indices,
         seq_lens=case.seq_lens,
-        layout=metadata.layout,
+        layout=device_layout(metadata, device=case.q.device),
         block_m=BEAMS_PER_TILE,
         softmax_scale=case.softmax_scale,
-        **stream_k_options,
+        **grid_options,
     )

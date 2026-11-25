@@ -26,32 +26,32 @@ that module):
 - task: one tile attended for one query head. Tasks are numbered tile by tile,
   then head by head: task = tile * Q_HEADS + q_head. (The fixed-width
   beam_shared_context_stream_k.py calls this a tile; here a tile has no head.)
-- unit: the measure of work that the schedule counts and the CTAs share. A task
-  is SETUP_UNITS for starting it, then its tile's work units. The units of a
-  batch are numbered task by task.
+- unit: the measure of work that the plan shares over the CTAs. A task is
+  SETUP_UNITS for starting it, then its tile's work units. The units of a batch
+  are numbered task by task.
 - run: the consecutive units [run_start, run_end) that one CTA executes.
-- segment: the part of a task that lies in one run.
-- schedule: what the host appends to the layout (build_schedule), counted for
-  one query head: [units of the longest task, units of all tiles, unit_starts[0],
-  ..., unit_starts[tiles]], where unit_starts[t] is the units of the tiles
-  before tile t.
+- segment: the work units of a task that lie in one run.
+- plan: what the host appends to the layout (build_stream_k_plan), one row per
+  CTA: the tasks the CTA attends, over which work units, and the split task it
+  lists for the merge kernel.
 
-The grid is persistent: one CTA per SM for any batch. Each CTA takes an equal run
-of the batch's units, so a run may start and end inside a task. When whole tasks
-load the busiest CTA no more than an equal run plus the cost of a split, the runs
-end at task bounds instead (_cta_run).
+The grid is persistent: one CTA per SM for any batch. The plan gives each CTA an
+equal run of the batch's units, so a run may start and end inside a task. When
+whole tasks load the busiest CTA no more than an equal run plus the cost of a
+split, the runs end at task bounds instead.
 
 A task that lies in one run is written to the output directly. A task split over
 several runs leaves one partial result per segment, which the merge kernel
 combines:
 - partial slots: two per CTA, so the workspace has one size for any batch. Slot
-  2 * c holds the segment that CTA c's run starts with, slot 2 * c + 1 a segment
-  that starts later in the run; only a run's first and last segments can be
-  partial.
-- merge list: one entry per CTA, (tile or -1, query head, last CTA, first
-  segment's slot). The CTA whose run holds the first work unit of a split task
-  lists it: the task, the CTA that runs the task's last unit, and the partial
-  slot (2 * c or 2 * c + 1) of the listing CTA's own segment.
+  2 * c holds the segment of the first task of CTA c's run, slot 2 * c + 1 the
+  segment of its last task; only those two can be partial.
+- A split task is listed once, in the row of the CTA whose run holds its first
+  work unit, with the last CTA that has a segment of it.
+
+The host builds the plan once per decode step and every layer's launch reads it.
+A zeroed plan gives every CTA no task and nothing to merge, so a graph captured
+on a zeroed layout attends nothing.
 
 Against the default kernel, per launch on SM120 with 2,048-token prompts: 2.7x to
 3.8x faster for one request of 16 to 256 beams, 1.2x for 4 or 8 requests of 256
@@ -62,9 +62,9 @@ more here (2 pipeline stages against 3).
 
 from __future__ import annotations
 
-import itertools
-from typing import Sequence
+from typing import Optional, Sequence
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -73,6 +73,7 @@ from sglang.kernels.ops.attention.beam_shared_context import num_sms
 from sglang.kernels.ops.attention.beam_shared_context_variable_width import (
     LAYOUT_HEADER,
     TILE_FIELDS,
+    WHOLE_TILE,
     attend_tile,
     check_variable_width_inputs,
     store_output,
@@ -95,16 +96,26 @@ _SETUP_UNITS = 1
 _SPLIT_COST_UNITS = 2
 # Measured: 8-row merge programs are fastest at 1-4 groups (8-64 tried).
 _MERGE_ROWS = 8
-# Tiles read per step of the tile search; one step covers most decode batches.
-_TILE_SEARCH = 128
-# Schedule fields before unit_starts.
-_SCHEDULE_HEADER = 2
-# Merge list fields per CTA: tile (-1: none), query head, last CTA, first
-# segment's slot.
-_MERGE_FIELDS = 4
 # K/V offsets are computed in 32 bits (attend_tile's WIDE_KV_OFFSETS is off), which
 # saves registers: 64-bit offsets take as many as a third pipeline stage would.
 _MAX_OFFSET = 2**31
+
+# int32 fields of a plan row, in the order the kernels read them:
+#   0 first task, 1 end task: the CTA attends tasks [first task, end task)
+#   2 the work unit its first task starts at, 3 the work unit its last task ends at
+#   4 whether its first task's segment is partial, 5 the same for its last task
+#   6 tile + 1 of the split task it lists for the merge kernel, 0 for none
+#   7 that task's query head, 8 the last CTA with a segment of it,
+#   9 the partial slot of this CTA's own segment of it
+PLAN_FIELDS = 10
+# Index of a row's first merge field.
+_PLAN_MERGE_FIELD = 6
+
+
+def default_num_ctas(device_index: int) -> int:
+    """The grid of the stream-K kernel on a device: one CTA per SM. 8 warps of
+    this kernel fill an SM's register file."""
+    return num_sms(device_index)
 
 
 def task_units(prompt_len: int, decode_len: int) -> int:
@@ -113,197 +124,140 @@ def task_units(prompt_len: int, decode_len: int) -> int:
     return _SETUP_UNITS + triton.cdiv(prompt_len, _BLOCK_N) + decode_len
 
 
-def build_schedule(units_per_task: Sequence[int]) -> list[int]:
-    """The schedule of a batch; units_per_task[t] is the `task_units` of tile t."""
-    unit_starts = [0, *itertools.accumulate(units_per_task)]
-    return [max(units_per_task), unit_starts[-1], *unit_starts]
+def plan_len(num_ctas: int) -> int:
+    """int32 entries of the plan of a grid of num_ctas CTAs."""
+    return PLAN_FIELDS * num_ctas
 
 
-def schedule_len(num_tiles: int) -> int:
-    """int32 entries of the schedule of a batch of num_tiles tiles."""
-    return _SCHEDULE_HEADER + num_tiles + 1
-
-
-@triton.jit
-def _task_first_unit(
-    unit_starts,  # [tiles + 1] int32, from the schedule
-    task,  # in [0, tasks]
-    Q_HEADS: tl.constexpr,
-):
-    """The first unit of a task. For the number past the last task, the units of
-    the batch, which is where that task would start."""
-    tile = task // Q_HEADS
-    q_head = task % Q_HEADS
-    tile_start = tl.load(unit_starts + tile)
-    # Query head 0 does not need the next entry, which the number past the last
-    # task does not have.
-    units_per_task = (
-        tl.load(unit_starts + tile + 1, mask=q_head > 0, other=tile_start) - tile_start
-    )
-    return tile_start * Q_HEADS + q_head * units_per_task
-
-
-@triton.jit
-def _find_tile(
-    unit_starts,  # [tiles + 1] int32, increasing
-    num_tiles,
-    head_unit,  # a unit number // Q_HEADS: a position on unit_starts' scale
-    TILE_SEARCH: tl.constexpr,
-):
-    """The last tile t with unit_starts[t] <= head_unit; -1 without tiles.
-    Counts the tiles that start by then, TILE_SEARCH of them per step."""
-    found = -1
-    for base in range(0, num_tiles, TILE_SEARCH):
-        candidates = base + tl.arange(0, TILE_SEARCH)
-        valid = candidates < num_tiles
-        starts = tl.load(unit_starts + candidates, mask=valid, other=0)
-        found += tl.sum(((starts <= head_unit) & valid).to(tl.int32))
-    return found
-
-
-@triton.jit
-def _task_of_unit(
-    unit_starts,  # [tiles + 1] int32, from the schedule
-    num_tiles,
-    unit,
-    Q_HEADS: tl.constexpr,
-    TILE_SEARCH: tl.constexpr,
-):
-    """The task that holds a unit."""
-    # Tile t holds units [unit_starts[t] * Q_HEADS, unit_starts[t + 1] * Q_HEADS).
-    tile = tl.maximum(
-        _find_tile(
-            unit_starts=unit_starts,
-            num_tiles=num_tiles,
-            head_unit=unit // Q_HEADS,
-            TILE_SEARCH=TILE_SEARCH,
-        ),
-        0,
-    )
-    tile_start = tl.load(unit_starts + tile)
-    # At least 1: a zeroed layout, which a graph is captured with, has no units.
-    units_per_task = tl.maximum(tl.load(unit_starts + tile + 1) - tile_start, 1)
-    return tile * Q_HEADS + (unit - tile_start * Q_HEADS) // units_per_task
-
-
-@triton.jit
-def _unit_owner(unit, total_units, num_ctas):
-    """The CTA whose equal run holds a unit: CTA c runs units
-    [c * total_units // num_ctas, (c + 1) * total_units // num_ctas)."""
-    # unit < (c + 1) * total // n  <=>  c >= ((unit + 1) * n - 1) // total.
-    # The divisor is at least 1 for a zeroed layout, which has no units.
-    owner = ((unit + 1).to(tl.int64) * num_ctas - 1) // tl.maximum(total_units, 1)
-    return owner.to(tl.int32)
-
-
-@triton.jit
-def _cta_run(
-    schedule,  # the layout's schedule
-    unit_starts,  # [tiles + 1] int32, from the schedule
-    num_tiles,
-    cta,
-    num_ctas,
-    Q_HEADS: tl.constexpr,
-    SPLIT_COST_UNITS: tl.constexpr,
-):
-    """This CTA's run, [run_start, run_end), and the units of the batch.
+def _runs(
+    task_starts: np.ndarray,
+    longest_task_units: int,
+    num_ctas: int,
+    split_cost_units: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Every CTA's run, as (run_start, run_end), [num_ctas] each.
 
     Two ways to share a batch's units, compared by the units of the busiest CTA:
     - whole tasks: CTA c takes tasks [c * n, (c + 1) * n), n = ceil(tasks / CTAs);
       the last CTAs get fewer or none, and no task is split;
     - equal runs: every CTA takes the same number of units, and a task that is
-      split costs SPLIT_COST_UNITS more.
+      split costs split_cost_units more.
     Whole tasks win when splitting would save the busiest CTA at most
-    SPLIT_COST_UNITS units: the tasks are short, or their count is at or just
+    split_cost_units units: the tasks are short, or their count is at or just
     under a multiple of the CTA count.
     """
-    longest_task_units = tl.load(schedule)
-    total_units = tl.load(schedule + 1) * Q_HEADS
-    num_tasks = num_tiles * Q_HEADS
-    tasks_per_cta = tl.maximum(tl.cdiv(num_tasks, num_ctas), 1)
+    num_tasks = len(task_starts) - 1
+    total_units = int(task_starts[-1])
+    ctas = np.arange(num_ctas, dtype=np.int64)
+    tasks_per_cta = max(triton.cdiv(num_tasks, num_ctas), 1)
 
     whole_tasks_cost = tasks_per_cta * longest_task_units
-    equal_runs_cost = tl.cdiv(total_units, num_ctas) + SPLIT_COST_UNITS
+    equal_runs_cost = triton.cdiv(total_units, num_ctas) + split_cost_units
     if whole_tasks_cost <= equal_runs_cost:
-        first_task = tl.minimum(cta * tasks_per_cta, num_tasks)
-        end_task = tl.minimum(first_task + tasks_per_cta, num_tasks)
-        run_start = _task_first_unit(
-            unit_starts=unit_starts, task=first_task, Q_HEADS=Q_HEADS
-        )
-        run_end = _task_first_unit(
-            unit_starts=unit_starts, task=end_task, Q_HEADS=Q_HEADS
-        )
-    else:
-        run_start = ((cta.to(tl.int64) * total_units) // num_ctas).to(tl.int32)
-        run_end = (((cta + 1).to(tl.int64) * total_units) // num_ctas).to(tl.int32)
-    return run_start, run_end, total_units
+        first_task = np.minimum(ctas * tasks_per_cta, num_tasks)
+        end_task = np.minimum(first_task + tasks_per_cta, num_tasks)
+        return task_starts[first_task], task_starts[end_task]
+    return ctas * total_units // num_ctas, (ctas + 1) * total_units // num_ctas
 
 
-@triton.jit
-def _segment_slot(cta, run_start, task_start):
-    """The partial slot for a run's segment of a task: 2 * cta if the run starts
-    with it, 2 * cta + 1 if the task starts later in the run."""
-    return 2 * cta + (run_start < task_start).to(tl.int32)
+def build_stream_k_plan(
+    units_per_task: Sequence[int],
+    *,
+    q_heads: int,
+    num_ctas: int,
+    split_cost_units: Optional[int] = None,
+) -> np.ndarray:
+    """The plan of a batch, [num_ctas, PLAN_FIELDS] int32.
 
-
-@triton.jit
-def _write_merge_entry(
-    merge_list,  # [num_ctas, MERGE_FIELDS] int32
-    unit_starts,  # [tiles + 1] int32, from the schedule
-    cta,
-    num_ctas,
-    run_start,
-    run_end,
-    total_units,
-    last_task,  # the task of the run's last unit
-    Q_HEADS: tl.constexpr,
-    SETUP_UNITS: tl.constexpr,
-    MERGE_FIELDS: tl.constexpr,
-):
-    """Write this CTA's merge list entry: the split task to merge, or tile -1.
-
-    A split task is listed once, by the CTA whose run holds its first work unit.
-    Only the run's last task can be one: an earlier task of the run ends in it.
+    units_per_task[t] is the `task_units` of tile t; each tile has q_heads tasks.
+    split_cost_units defaults to the measured value; tests pass a very large one
+    to force whole tasks and a negative one to force equal runs.
     """
-    task_start = _task_first_unit(
-        unit_starts=unit_starts, task=last_task, Q_HEADS=Q_HEADS
-    )
-    task_end = _task_first_unit(
-        unit_starts=unit_starts, task=last_task + 1, Q_HEADS=Q_HEADS
-    )
-    first_work_unit = task_start + SETUP_UNITS
-    holds_first_work_unit = (run_start <= first_work_unit) & (first_work_unit < run_end)
-    finished_later = run_end < task_end
-    listed = holds_first_work_unit & finished_later
+    if split_cost_units is None:
+        split_cost_units = _SPLIT_COST_UNITS
+    units = np.asarray(units_per_task, dtype=np.int64)
+    num_tasks = len(units) * q_heads
 
-    entry = merge_list + MERGE_FIELDS * cta
-    tl.store(entry, tl.where(listed, last_task // Q_HEADS, -1))
-    tl.store(entry + 1, last_task % Q_HEADS)
-    # The merge reads the segments up to the CTA that runs the task's last unit.
-    last_cta = _unit_owner(
-        unit=task_end - 1, total_units=total_units, num_ctas=num_ctas
-    )
-    tl.store(entry + 2, last_cta)
-    first_segment_slot = _segment_slot(
-        cta=cta, run_start=run_start, task_start=task_start
-    )
-    tl.store(entry + 3, first_segment_slot)
+    # The first unit of every task, in task order, then the units of the batch.
+    tile_starts = np.concatenate(([0], np.cumsum(units)))
+    task_starts = tile_starts[:-1, None] * q_heads + np.arange(q_heads) * units[:, None]
+    total_units = int(tile_starts[-1]) * q_heads
+    task_starts = np.append(task_starts.reshape(-1), total_units)
+    task_ends = task_starts[1:]
+    # Work units are counted from a task's first one, after its setup units.
+    first_work_units = task_starts[:-1] + _SETUP_UNITS
 
+    run_start, run_end = _runs(
+        task_starts=task_starts,
+        longest_task_units=int(units.max()),
+        num_ctas=num_ctas,
+        split_cost_units=split_cost_units,
+    )
 
-@triton.jit
-def _work_range(
-    run_start,
-    run_end,
-    task_start,
-    task_end,
-    SETUP_UNITS: tl.constexpr,
-):
-    """The work units of a task that lie in a run, [work_start, work_end), counted
-    from the task's first work unit. Empty if the run holds only setup units."""
-    first_work_unit = task_start + SETUP_UNITS
-    work_start = tl.maximum(run_start, first_work_unit) - first_work_unit
-    work_end = tl.minimum(run_end, task_end) - first_work_unit
-    return work_start, work_end
+    # The tasks of a run's first and last unit. An empty run gets some valid task
+    # here and no task at the end.
+    first_task = np.searchsorted(task_starts, run_start, side="right") - 1
+    last_task = (
+        np.searchsorted(task_starts, np.maximum(run_end - 1, 0), side="right") - 1
+    )
+    first_task = np.minimum(first_task, num_tasks - 1)
+    last_task = np.minimum(last_task, num_tasks - 1)
+
+    # The segments of the first and the last task; the tasks between are whole.
+    first_work_start = np.maximum(run_start - first_work_units[first_task], 0)
+    last_work_start = np.where(last_task == first_task, first_work_start, 0)
+    last_work_end = (
+        np.minimum(run_end, task_ends[last_task]) - first_work_units[last_task]
+    )
+
+    # A run that ends in its last task's setup units has no work for that task: the
+    # task before it is then the run's last one, attended to its end.
+    last_has_work = last_work_end > last_work_start
+    end_task = np.where(last_has_work, last_task + 1, last_task)
+    last_work_end = np.where(
+        last_has_work,
+        last_work_end,
+        task_ends[end_task - 1] - first_work_units[end_task - 1],
+    )
+    has_tasks = (run_start < run_end) & (first_task < end_task)
+
+    # A segment is partial when another run has work units of its task.
+    first_is_partial = (first_work_start > 0) | (run_end < task_ends[first_task])
+    last_is_partial = np.where(
+        end_task - 1 == first_task,
+        first_is_partial,
+        last_has_work & (run_end < task_ends[last_task]),
+    )
+
+    # A split task is listed by the run that holds its first work unit; only a
+    # run's last task can be one. The merge reads its segments up to the CTA that
+    # runs its last unit: CTA c runs units [c * total // n, (c + 1) * total // n).
+    lists_task = (
+        (run_start <= first_work_units[last_task])
+        & (first_work_units[last_task] < run_end)
+        & (run_end < task_ends[last_task])
+    )
+    merge_last_cta = (task_ends[last_task] * num_ctas - 1) // max(total_units, 1)
+    starts_with_task = run_start >= task_starts[last_task]
+    merge_first_slot = 2 * np.arange(num_ctas) + np.where(starts_with_task, 0, 1)
+
+    # The kernels' field order (PLAN_FIELDS).
+    plan = np.stack(
+        [
+            np.where(has_tasks, first_task, 0),
+            np.where(has_tasks, end_task, 0),
+            np.where(has_tasks, first_work_start, 0),
+            np.where(has_tasks, last_work_end, 0),
+            has_tasks & first_is_partial,
+            has_tasks & last_is_partial,
+            np.where(lists_task, last_task // q_heads + 1, 0),
+            np.where(lists_task, last_task % q_heads, 0),
+            np.where(lists_task, merge_last_cta, 0),
+            np.where(lists_task, merge_first_slot, 0),
+        ],
+        axis=1,
+    )
+    return plan.astype(np.int32)
 
 
 @triton.jit
@@ -314,14 +268,13 @@ def _variable_width_stream_k_kernel(
     req_to_token,  # [pool rows, max context] int32, the KV slot of each token
     req_pool_indices,  # [rows] int32 or int64, each row's pool row
     seq_lens,  # [rows] int32 or int64; only the leaders' are read
-    layout,  # int32: header, tiles, schedule
+    layout,  # int32: header, tiles, plan
     output,  # like q; whole tasks and the padding rows are written here
     partial_output,  # [2 * num_ctas, BLOCK_M, HEAD_DIM] fp32, the segments' outputs
     partial_lse,  # [2 * num_ctas, BLOCK_M] fp32, log2 of the segments' softmax sums
-    merge_list,  # [num_ctas, MERGE_FIELDS] int32, written for the merge kernel
     softmax_scale,  # float, scales q.k before the softmax
     num_rows,  # q.shape[0]
-    num_ctas,  # the grid size
+    num_ctas,  # the grid size, which the plan was built for
     stride_q_row,  # q.stride(0); all strides are in elements
     stride_q_head,  # q.stride(1)
     stride_k_slot,  # k_buffer.stride(0)
@@ -337,150 +290,101 @@ def _variable_width_stream_k_kernel(
     BLOCK_M: tl.constexpr,  # beams per tile, the value the layout was built with
     BLOCK_N: tl.constexpr,  # prompt tokens per block
     BLOCK_D: tl.constexpr,  # HEAD_DIM rounded up to a power of 2
-    SETUP_UNITS: tl.constexpr,
-    SPLIT_COST_UNITS: tl.constexpr,
-    TILE_SEARCH: tl.constexpr,
-    SCHEDULE_HEADER: tl.constexpr,
-    MERGE_FIELDS: tl.constexpr,
     LAYOUT_HEADER: tl.constexpr,
     TILE_FIELDS: tl.constexpr,
+    PLAN_FIELDS: tl.constexpr,
+    WHOLE_TILE: tl.constexpr,
 ):
-    """CTA c attends the units of its run. A task that lies in the run goes to the
-    output; a segment of a split task goes to a partial slot, and the merge list
-    names the split task for the merge kernel."""
+    """CTA c attends the tasks of its plan row. A task that lies in its run goes to
+    the output; a segment of a split task goes to a partial slot, for the merge
+    kernel."""
     cta = tl.program_id(0)
     beam_offsets = tl.arange(0, BLOCK_M)
     dim_offsets = tl.arange(0, BLOCK_D)
     dim_mask = dim_offsets < HEAD_DIM
     # exp2 is cheaper than exp: fold log2(e) into the scale.
     softmax_scale_log2 = softmax_scale * 1.4426950408889634
-    # The layout's parts: the header, the tiles, the schedule.
+    # The layout's parts: the header, the tiles, the plan.
     num_tiles = tl.load(layout)
     tiles = layout + LAYOUT_HEADER
-    schedule = tiles + TILE_FIELDS * num_tiles
-    unit_starts = schedule + SCHEDULE_HEADER
+    plan_row = tiles + TILE_FIELDS * num_tiles + PLAN_FIELDS * cta
+    first_task = tl.load(plan_row)
+    end_task = tl.load(plan_row + 1)
+    first_work_start = tl.load(plan_row + 2)
+    last_work_end = tl.load(plan_row + 3)
+    first_is_partial = tl.load(plan_row + 4) != 0
+    last_is_partial = tl.load(plan_row + 5) != 0
 
-    run_start, run_end, total_units = _cta_run(
-        schedule=schedule,
-        unit_starts=unit_starts,
-        num_tiles=num_tiles,
-        cta=cta,
-        num_ctas=num_ctas,
-        Q_HEADS=Q_HEADS,
-        SPLIT_COST_UNITS=SPLIT_COST_UNITS,
-    )
-    first_task = _task_of_unit(
-        unit_starts=unit_starts,
-        num_tiles=num_tiles,
-        unit=run_start,
-        Q_HEADS=Q_HEADS,
-        TILE_SEARCH=TILE_SEARCH,
-    )
-    last_task = _task_of_unit(
-        unit_starts=unit_starts,
-        num_tiles=num_tiles,
-        unit=tl.maximum(run_end - 1, 0),
-        Q_HEADS=Q_HEADS,
-        TILE_SEARCH=TILE_SEARCH,
-    )
-    _write_merge_entry(
-        merge_list=merge_list,
-        unit_starts=unit_starts,
-        cta=cta,
-        num_ctas=num_ctas,
-        run_start=run_start,
-        run_end=run_end,
-        total_units=total_units,
-        last_task=last_task,
-        Q_HEADS=Q_HEADS,
-        SETUP_UNITS=SETUP_UNITS,
-        MERGE_FIELDS=MERGE_FIELDS,
-    )
-    if run_start == run_end:
-        # This CTA has no units: the batch has fewer units, or tasks, than CTAs.
+    if first_task == end_task:
+        # No task for this CTA: the batch has fewer units, or tasks, than CTAs.
         # The merge of a task split around it still reads its slot 2 * cta.
         tl.store(
             partial_lse + 2 * cta * BLOCK_M + beam_offsets,
             tl.full((BLOCK_M,), -float("inf"), tl.float32),
         )
-        # No task to attend: the loop below is empty.
-        last_task = first_task - 1
 
-    for task in range(first_task, last_task + 1):
-        task_start = _task_first_unit(
-            unit_starts=unit_starts, task=task, Q_HEADS=Q_HEADS
+    for task in range(first_task, end_task):
+        is_first = task == first_task
+        is_last = task == end_task - 1
+        q_head = task % Q_HEADS
+        rows, beam_mask, max_values, normalizers, accumulator = attend_tile(
+            q=q,
+            k_buffer=k_buffer,
+            v_buffer=v_buffer,
+            req_to_token=req_to_token,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            tiles=tiles,
+            tile=task // Q_HEADS,
+            q_head=q_head,
+            work_start=tl.where(is_first, first_work_start, 0),
+            work_end=tl.where(is_last, last_work_end, WHOLE_TILE),
+            softmax_scale_log2=softmax_scale_log2,
+            stride_q_row=stride_q_row,
+            stride_q_head=stride_q_head,
+            stride_k_slot=stride_k_slot,
+            stride_k_head=stride_k_head,
+            stride_v_slot=stride_v_slot,
+            stride_v_head=stride_v_head,
+            stride_req_to_token=stride_req_to_token,
+            Q_PER_KV=Q_PER_KV,
+            HEAD_DIM=HEAD_DIM,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_D=BLOCK_D,
+            TILE_FIELDS=TILE_FIELDS,
+            WIDE_KV_OFFSETS=False,
         )
-        task_end = _task_first_unit(
-            unit_starts=unit_starts, task=task + 1, Q_HEADS=Q_HEADS
-        )
-        work_start, work_end = _work_range(
-            run_start=run_start,
-            run_end=run_end,
-            task_start=task_start,
-            task_end=task_end,
-            SETUP_UNITS=SETUP_UNITS,
-        )
-        if work_start < work_end:
-            q_head = task % Q_HEADS
-            rows, beam_mask, max_values, normalizers, accumulator = attend_tile(
-                q=q,
-                k_buffer=k_buffer,
-                v_buffer=v_buffer,
-                req_to_token=req_to_token,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                tiles=tiles,
-                tile=task // Q_HEADS,
-                q_head=q_head,
-                work_start=work_start,
-                work_end=work_end,
-                softmax_scale_log2=softmax_scale_log2,
-                stride_q_row=stride_q_row,
-                stride_q_head=stride_q_head,
-                stride_k_slot=stride_k_slot,
-                stride_k_head=stride_k_head,
-                stride_v_slot=stride_v_slot,
-                stride_v_head=stride_v_head,
-                stride_req_to_token=stride_req_to_token,
-                Q_PER_KV=Q_PER_KV,
-                HEAD_DIM=HEAD_DIM,
-                BLOCK_M=BLOCK_M,
-                BLOCK_N=BLOCK_N,
-                BLOCK_D=BLOCK_D,
-                TILE_FIELDS=TILE_FIELDS,
-                WIDE_KV_OFFSETS=False,
+        row_mask = beam_mask[:, None] & dim_mask[None, :]
+        is_partial = (is_first & first_is_partial) | (is_last & last_is_partial)
+        if is_partial:
+            # Slot 2 * cta for the run's first task, 2 * cta + 1 for its last.
+            slot = 2 * cta + tl.where(is_first, 0, 1)
+            slot_beams = slot * BLOCK_M + beam_offsets
+            tl.store(
+                partial_output
+                + (slot_beams * HEAD_DIM)[:, None]
+                + dim_offsets[None, :],
+                accumulator / normalizers[:, None],
+                mask=row_mask,
             )
-            row_mask = beam_mask[:, None] & dim_mask[None, :]
-            covers_whole_task = (work_start == 0) & (run_end >= task_end)
-            if covers_whole_task:
-                store_output(
-                    output=output,
-                    rows=rows,
-                    q_head=q_head,
-                    dim_offsets=dim_offsets,
-                    values=accumulator / normalizers[:, None],
-                    mask=row_mask,
-                    stride_out_row=stride_out_row,
-                    stride_out_head=stride_out_head,
-                )
-            else:
-                slot = _segment_slot(
-                    cta=cta, run_start=run_start, task_start=task_start
-                )
-                slot_beams = slot * BLOCK_M + beam_offsets
-                tl.store(
-                    partial_output
-                    + (slot_beams * HEAD_DIM)[:, None]
-                    + dim_offsets[None, :],
-                    accumulator / normalizers[:, None],
-                    mask=row_mask,
-                )
-                # Every work unit holds a token, so every segment has softmax mass.
-                tl.store(
-                    partial_lse + slot_beams,
-                    max_values * softmax_scale_log2 + tl.log2(normalizers),
-                    mask=beam_mask,
-                )
+            # Every work unit holds a token, so every segment has softmax mass.
+            tl.store(
+                partial_lse + slot_beams,
+                max_values * softmax_scale_log2 + tl.log2(normalizers),
+                mask=beam_mask,
+            )
+        else:
+            store_output(
+                output=output,
+                rows=rows,
+                q_head=q_head,
+                dim_offsets=dim_offsets,
+                values=accumulator / normalizers[:, None],
+                mask=row_mask,
+                stride_out_row=stride_out_row,
+                stride_out_head=stride_out_head,
+            )
 
     num_real_rows = tl.load(layout + 1)
     for q_head in range(0, Q_HEADS):
@@ -503,8 +407,7 @@ def _variable_width_stream_k_kernel(
 def _variable_width_merge_kernel(
     partial_output,  # [2 * num_ctas, BLOCK_M, HEAD_DIM] fp32, the segments' outputs
     partial_lse,  # [2 * num_ctas, BLOCK_M] fp32, log2 of the segments' softmax sums
-    merge_list,  # [num_ctas, MERGE_FIELDS] int32, from the stream-K kernel
-    layout,  # int32: header, tiles, schedule
+    layout,  # int32: header, tiles, plan
     output,  # [rows, q_heads, HEAD_DIM]; the rows of split tasks are written
     stride_out_row,  # output.stride(0); in elements
     stride_out_head,  # output.stride(1)
@@ -512,25 +415,30 @@ def _variable_width_merge_kernel(
     BLOCK_M: tl.constexpr,  # beams per tile
     BLOCK_D: tl.constexpr,  # HEAD_DIM rounded up to a power of 2
     MERGE_ROWS: tl.constexpr,  # beams per program
-    MERGE_FIELDS: tl.constexpr,
     LAYOUT_HEADER: tl.constexpr,
     TILE_FIELDS: tl.constexpr,
+    PLAN_FIELDS: tl.constexpr,
+    PLAN_MERGE_FIELD: tl.constexpr,
 ):
-    """Program (c, chunk) writes MERGE_ROWS beams of the split task CTA c listed.
+    """Program (c, chunk) writes MERGE_ROWS beams of the split task that CTA c's
+    plan row lists.
 
-    The task's segments are in the slot that CTA c listed, then in slot 2 * c' of
-    every later CTA c' up to the listed last one. The output is their mean,
+    The task's segments are in the slot that the row names, then in slot 2 * c' of
+    every later CTA c' up to the row's last CTA. The output is their mean,
     weighted by each segment's softmax sum.
     """
     cta = tl.program_id(0)
-    entry = merge_list + MERGE_FIELDS * cta
-    tile = tl.load(entry)
+    num_tiles = tl.load(layout)
+    tiles = layout + LAYOUT_HEADER
+    merge_fields = (
+        tiles + TILE_FIELDS * num_tiles + PLAN_FIELDS * cta + PLAN_MERGE_FIELD
+    )
+    tile = tl.load(merge_fields) - 1
     if tile >= 0:
-        q_head = tl.load(entry + 1)
-        last_cta = tl.load(entry + 2)
-        first_segment_slot = tl.load(entry + 3)
+        q_head = tl.load(merge_fields + 1)
+        last_cta = tl.load(merge_fields + 2)
+        first_segment_slot = tl.load(merge_fields + 3)
         beam_offsets = tl.program_id(1) * MERGE_ROWS + tl.arange(0, MERGE_ROWS)
-        tiles = layout + LAYOUT_HEADER
         rows, beam_mask, _, _ = tile_rows(
             tiles=tiles, tile=tile, beam_offsets=beam_offsets, TILE_FIELDS=TILE_FIELDS
         )
@@ -591,21 +499,16 @@ def shared_context_attention_variable_width_stream_k(
     layout: torch.Tensor,
     *,
     block_m: int,
+    num_ctas: int,
     output: torch.Tensor | None = None,
     softmax_scale: float,
-    num_ctas: int | None = None,
-    split_cost_units: int = _SPLIT_COST_UNITS,
 ) -> torch.Tensor:
     """shared_context_attention_variable_width on a persistent stream-K grid.
 
-    Same inputs and output; `layout` must carry the schedule of its tiles
-    (`build_schedule`) after them. Rejects K/V buffers of 2^31 elements or more.
-    Tuned on SM120 only.
-
-    For tests and benchmarks:
-    - `num_ctas`: the grid size; one CTA per SM when None.
-    - `split_cost_units`: a very large value forces whole tasks, a negative one
-      equal runs.
+    Same inputs and output, and:
+    - `layout` must carry the plan of its tiles (`build_stream_k_plan`) after them.
+    - `num_ctas`: the grid size; it must be the one the plan was built for.
+    Rejects K/V buffers of 2^31 elements or more. Tuned on SM120 only.
     """
     output = check_variable_width_inputs(
         q=q,
@@ -625,18 +528,12 @@ def shared_context_attention_variable_width_stream_k(
     num_rows, q_heads, head_dim = q.shape
     kv_heads = k_buffer.shape[1]
 
-    if num_ctas is None:
-        # One CTA per SM: 8 warps of this kernel fill an SM's register file.
-        num_ctas = num_sms(q.device.index)
-    # Two partial slots per CTA and one merge list entry.
+    # Two partial slots per CTA.
     partial_output = torch.empty(
         (2 * num_ctas, block_m, head_dim), dtype=torch.float32, device=q.device
     )
     partial_lse = torch.empty(
         (2 * num_ctas, block_m), dtype=torch.float32, device=q.device
-    )
-    merge_list = torch.empty(
-        (num_ctas, _MERGE_FIELDS), dtype=torch.int32, device=q.device
     )
     block_d = triton.next_power_of_2(head_dim)
     _variable_width_stream_k_kernel[(num_ctas,)](
@@ -650,7 +547,6 @@ def shared_context_attention_variable_width_stream_k(
         output,
         partial_output,
         partial_lse,
-        merge_list,
         softmax_scale,
         num_rows,
         num_ctas,
@@ -669,20 +565,16 @@ def shared_context_attention_variable_width_stream_k(
         BLOCK_M=block_m,
         BLOCK_N=_BLOCK_N,
         BLOCK_D=block_d,
-        SETUP_UNITS=_SETUP_UNITS,
-        SPLIT_COST_UNITS=split_cost_units,
-        TILE_SEARCH=_TILE_SEARCH,
-        SCHEDULE_HEADER=_SCHEDULE_HEADER,
-        MERGE_FIELDS=_MERGE_FIELDS,
         LAYOUT_HEADER=LAYOUT_HEADER,
         TILE_FIELDS=TILE_FIELDS,
+        PLAN_FIELDS=PLAN_FIELDS,
+        WHOLE_TILE=WHOLE_TILE,
         num_warps=_NUM_WARPS,
         num_stages=_NUM_STAGES,
     )
     _variable_width_merge_kernel[(num_ctas, triton.cdiv(block_m, _MERGE_ROWS))](
         partial_output,
         partial_lse,
-        merge_list,
         layout,
         output,
         output.stride(0),
@@ -691,9 +583,10 @@ def shared_context_attention_variable_width_stream_k(
         BLOCK_M=block_m,
         BLOCK_D=block_d,
         MERGE_ROWS=_MERGE_ROWS,
-        MERGE_FIELDS=_MERGE_FIELDS,
         LAYOUT_HEADER=LAYOUT_HEADER,
         TILE_FIELDS=TILE_FIELDS,
+        PLAN_FIELDS=PLAN_FIELDS,
+        PLAN_MERGE_FIELD=_PLAN_MERGE_FIELD,
         # Triton's default; an 8-row merge program has no use for more.
         num_warps=4,
     )

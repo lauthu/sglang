@@ -24,36 +24,60 @@ Terms:
   members are rows appended after all requests' rows.
 - tile: up to BEAMS_PER_TILE consecutive beams of one group. The kernels work
   tile by tile.
-- layout: one int32 tensor that lists a batch's tiles. Its format is in
-  kernels/ops/attention/beam_shared_context_variable_width.py.
+- layout: one int32 tensor that lists a batch's tiles and, for the stream-K
+  kernel, its plan: which tiles each of the kernel's programs attends. Its format
+  is in kernels/ops/attention/beam_shared_context_variable_width.py.
+
+The layout is built on the host once per decode step and uploaded once: into the
+graph's buffer when a graph replays the batch, into a tensor of its own otherwise.
+Every layer of the step reads that one upload.
 """
 
 from __future__ import annotations
 
 import math
+import weakref
 from typing import TYPE_CHECKING, Optional
 
 import msgspec
+import numpy as np
 import torch
+
+from sglang.srt.beam_search.decode_graph_settings import stream_k_selected
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 # Beams per tile, passed to the kernels as block_m. Not swept for these kernels:
 # it is beam_shared_context.py's tile size for up to 5 groups.
 BEAMS_PER_TILE = 128
 
 
+class StreamKGrid(msgspec.Struct, frozen=True):
+    """What a stream-K plan is built for; fixed for a server's model and GPU."""
+
+    # Query heads of an attention layer on this rank.
+    q_heads: int
+    # Programs of the kernel's grid: one per SM of the GPU.
+    num_ctas: int
+    # None for the kernel module's measured value; tests force the plan's choice.
+    split_cost_units: Optional[int] = None
+
+
 class VariableWidthBeamAttentionMetadata(msgspec.Struct):
-    # One batch's layout, or the graphs' shared buffer, which is long enough for
-    # the largest graph's layout.
-    layout: torch.Tensor
+    # The layout on the host: a batch's own. None for the graphs' buffer.
+    host_layout: Optional[torch.Tensor]
+    # The layout on the GPU, which the kernels read: the graphs' shared buffer
+    # (long enough for the largest graph's layout), or a batch's once a forward
+    # outside a graph has uploaded it.
+    layout: Optional[torch.Tensor]
     # The request pool's KV slot table; the kernels look slots up in it on the GPU.
     req_to_token: torch.Tensor
-    # Run the stream-K kernel, whose schedule follows the tiles in the layout.
-    stream_k: bool = False
+    # Set to run the stream-K kernel; its plan follows the tiles in the layout.
+    stream_k: Optional[StreamKGrid] = None
 
 
 class _Tile(msgspec.Struct, frozen=True):
@@ -67,19 +91,40 @@ class _Tile(msgspec.Struct, frozen=True):
     first_beam: int
 
 
-def _layout_tensor(values: list[int], device) -> torch.Tensor:
-    if torch.device(device).type == "cuda":
-        return torch.tensor(values, dtype=torch.int32, pin_memory=True).to(
-            device, non_blocking=True
+_stream_k_grids: weakref.WeakKeyDictionary[ModelRunner, StreamKGrid] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def stream_k_grid(model_runner: ModelRunner) -> Optional[StreamKGrid]:
+    """The stream-K kernel's grid on this server; None when the default kernel
+    runs. Evaluated once per runner."""
+    if not stream_k_selected():
+        return None
+    grid = _stream_k_grids.get(model_runner)
+    if grid is None:
+        from sglang.kernels.ops.attention.beam_shared_context_variable_width_stream_k import (
+            default_num_ctas,
         )
-    return torch.tensor(values, dtype=torch.int32, device=device)
+        from sglang.srt.layers.radix_attention import RadixAttention
+
+        # Every attention layer of a model has the same number of query heads.
+        q_heads = next(
+            module.tp_q_head_num
+            for module in model_runner.model.modules()
+            if isinstance(module, RadixAttention)
+        )
+        device = model_runner.req_to_token_pool.req_to_token.device
+        grid = StreamKGrid(q_heads=q_heads, num_ctas=default_num_ctas(device.index))
+        _stream_k_grids[model_runner] = grid
+    return grid
 
 
 def build_variable_width_metadata(
     batch: ScheduleBatch,
     req_to_token: torch.Tensor,
     *,
-    stream_k: bool = False,
+    stream_k: Optional[StreamKGrid] = None,
 ) -> Optional[VariableWidthBeamAttentionMetadata]:
     """The layout of a beam decode batch, built on the host. Returns None for a
     batch the kernels do not take; it then runs ordinary attention."""
@@ -118,34 +163,51 @@ def build_variable_width_metadata(
         return None
 
     # Header [tile count, real rows], then each tile's fields, then the stream-K
-    # schedule: the order the kernels read.
-    values = [len(tiles), num_rows]
-    for tile in tiles:
-        values.extend(msgspec.structs.astuple(tile))
-    if stream_k:
-        values.extend(_stream_k_schedule(tiles=tiles, decode_lens=decode_lens))
+    # plan: the order the kernels read.
+    parts = [
+        np.array([len(tiles), num_rows], dtype=np.int32),
+        np.array([msgspec.structs.astuple(tile) for tile in tiles], dtype=np.int32),
+    ]
+    if stream_k is not None:
+        parts.append(
+            _stream_k_plan(tiles=tiles, decode_lens=decode_lens, grid=stream_k)
+        )
+    layout = np.concatenate([part.reshape(-1) for part in parts])
     return VariableWidthBeamAttentionMetadata(
-        layout=_layout_tensor(values=values, device=batch.device),
+        host_layout=_host_tensor(layout, device=batch.device),
+        layout=None,
         req_to_token=req_to_token,
         stream_k=stream_k,
     )
 
 
-def _stream_k_schedule(tiles: list[_Tile], decode_lens: list[int]) -> list[int]:
-    """The stream-K kernel's schedule: how much work each tile is, from its group's
-    prompt length and generated tokens."""
+def _host_tensor(values: np.ndarray, device) -> torch.Tensor:
+    """The values as a host tensor; pinned for a GPU, so that the upload does not
+    wait for the copy."""
+    tensor = torch.from_numpy(values)
+    return tensor.pin_memory() if torch.device(device).type == "cuda" else tensor
+
+
+def _stream_k_plan(
+    tiles: list[_Tile], decode_lens: list[int], grid: StreamKGrid
+) -> np.ndarray:
+    """The stream-K kernel's plan: how the batch's work is shared over the kernel's
+    programs, from each tile's prompt length and generated tokens."""
     # The kernel modules import Triton, so this module imports them where it calls
     # them.
     from sglang.kernels.ops.attention.beam_shared_context_variable_width_stream_k import (
-        build_schedule,
+        build_stream_k_plan,
         task_units,
     )
 
-    return build_schedule(
+    return build_stream_k_plan(
         units_per_task=[
             task_units(prompt_len=tile.prompt_len, decode_len=decode_len)
             for tile, decode_len in zip(tiles, decode_lens, strict=True)
-        ]
+        ],
+        q_heads=grid.q_heads,
+        num_ctas=grid.num_ctas,
+        split_cost_units=grid.split_cost_units,
     )
 
 
@@ -154,7 +216,7 @@ def allocate_graph_metadata(
     device,
     req_to_token: torch.Tensor,
     *,
-    stream_k: bool = False,
+    stream_k: Optional[StreamKGrid] = None,
 ) -> VariableWidthBeamAttentionMetadata:
     """The metadata every beam graph captures: one zeroed layout buffer, long
     enough for any batch of up to max_rows rows. A zeroed layout has no tiles and
@@ -164,7 +226,7 @@ def allocate_graph_metadata(
         header_and_tiles_len,
     )
     from sglang.kernels.ops.attention.beam_shared_context_variable_width_stream_k import (
-        schedule_len,
+        plan_len,
     )
 
     # Upper bound: the rows' full tiles plus one partial tile per group, and a
@@ -172,13 +234,23 @@ def allocate_graph_metadata(
     max_groups = max(1, max_rows // 2)
     max_tiles = math.ceil(max_rows / BEAMS_PER_TILE) + max_groups
     layout_len = header_and_tiles_len(num_tiles=max_tiles)
-    if stream_k:
-        layout_len += schedule_len(num_tiles=max_tiles)
+    if stream_k is not None:
+        layout_len += plan_len(num_ctas=stream_k.num_ctas)
     return VariableWidthBeamAttentionMetadata(
+        host_layout=None,
         layout=torch.zeros(layout_len, dtype=torch.int32, device=device),
         req_to_token=req_to_token,
         stream_k=stream_k,
     )
+
+
+def device_layout(metadata: VariableWidthBeamAttentionMetadata, device) -> torch.Tensor:
+    """The layout on the GPU. The graphs' buffer is there already. A batch's is
+    uploaded by the first layer that runs it outside a graph, and kept for the
+    step's other layers."""
+    if metadata.layout is None:
+        metadata.layout = metadata.host_layout.to(device, non_blocking=True)
+    return metadata.layout
 
 
 def attention_kernel(stream_k: bool):
@@ -208,7 +280,10 @@ def forward(
 ) -> torch.Tensor:
     q_heads = layer.tp_q_head_num
     head_dim = layer.head_dim
-    attention = attention_kernel(metadata.stream_k)
+    grid = metadata.stream_k
+    attention = attention_kernel(stream_k=grid is not None)
+    # The stream-K kernel's grid is the one its plan was built for.
+    grid_options = {} if grid is None else {"num_ctas": grid.num_ctas}
     output = attention(
         q=q.reshape(-1, q_heads, head_dim),
         k_buffer=k_buffer,
@@ -216,8 +291,9 @@ def forward(
         req_to_token=metadata.req_to_token,
         req_pool_indices=forward_batch.req_pool_indices,
         seq_lens=forward_batch.seq_lens,
-        layout=metadata.layout,
+        layout=device_layout(metadata, device=q.device),
         block_m=BEAMS_PER_TILE,
         softmax_scale=layer.scaling,
+        **grid_options,
     )
     return output.view(-1, q_heads * head_dim)

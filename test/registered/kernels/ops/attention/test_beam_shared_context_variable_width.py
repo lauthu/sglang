@@ -22,11 +22,9 @@ import unittest
 
 import torch
 
-from sglang.srt.beam_search.shared_context_variable_width import (
-    build_variable_width_metadata,
-)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.beam_shared_context import (
+    build_case_metadata,
     run_variable_width_attention,
     variable_width_case,
 )
@@ -34,8 +32,8 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
-# split_cost_units that make the stream-K kernel take whole tasks per CTA, or
-# equal runs of units that split tasks, whatever the batch.
+# split_cost_units that make the stream-K plan give each CTA whole tasks, or equal
+# runs of units that split tasks, whatever the batch.
 NEVER_SPLIT = 1 << 20
 ALWAYS_SPLIT = -(1 << 20)
 # The SMs of an RTX PRO 6000, the grid the stream-K kernel was tuned with.
@@ -45,10 +43,8 @@ TUNED_NUM_CTAS = 188
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestVariableWidthSharedContextAttention(CustomTestCase):
     def _assert_matches_reference(self, case, *, stream_k, **stream_k_options):
-        metadata = build_variable_width_metadata(
-            batch=case.batch, req_to_token=case.req_to_token, stream_k=stream_k
-        )
-        output = run_variable_width_attention(case, metadata, **stream_k_options)
+        metadata = build_case_metadata(case, stream_k=stream_k, **stream_k_options)
+        output = run_variable_width_attention(case, metadata)
         torch.testing.assert_close(output.float(), case.reference, rtol=1e-2, atol=1e-2)
 
     def test_any_widths_match_fp32_reference(self):

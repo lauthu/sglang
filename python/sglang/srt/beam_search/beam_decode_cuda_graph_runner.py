@@ -34,10 +34,7 @@ import torch
 
 from sglang.srt.beam_search import shared_context_attention
 from sglang.srt.beam_search import shared_context_variable_width as variable_width
-from sglang.srt.beam_search.decode_graph_settings import (
-    stream_k_selected,
-    variable_width_graphs_enabled,
-)
+from sglang.srt.beam_search.decode_graph_settings import variable_width_graphs_enabled
 from sglang.srt.beam_search.forward_inputs import BeamForwardInputs
 from sglang.srt.beam_search.shared_context_attention import (
     BeamAttentionBucket,
@@ -302,7 +299,7 @@ class VariableWidthSharedContextInput:
         max_rows: int,
         device,
         req_to_token: torch.Tensor,
-        stream_k: bool,
+        stream_k: Optional[variable_width.StreamKGrid],
     ):
         self._graph_metadata = variable_width.allocate_graph_metadata(
             max_rows=max_rows,
@@ -326,7 +323,7 @@ class VariableWidthSharedContextInput:
             max_rows=max_rows,
             device=model_runner.device,
             req_to_token=model_runner.req_to_token_pool.req_to_token,
-            stream_k=stream_k_selected(),
+            stream_k=variable_width.stream_k_grid(model_runner),
         )
 
     def can_capture(self, graph_size: int) -> bool:
@@ -344,10 +341,13 @@ class VariableWidthSharedContextInput:
         return metadata is not None
 
     def load_replay_inputs(self, metadata: VariableWidthBeamAttentionMetadata) -> None:
-        # Entries past the batch's layout keep an earlier batch's values; the
-        # kernels stop at the tile count in the layout's header.
-        batch_layout = metadata.layout
-        self._graph_metadata.layout[: len(batch_layout)].copy_(batch_layout)
+        # The batch's one upload, straight into the buffer the graphs read. Entries
+        # past the batch's layout keep an earlier batch's values; the kernels read
+        # only the tiles that the layout's header counts and the plan after them.
+        batch_layout = metadata.host_layout
+        self._graph_metadata.layout[: len(batch_layout)].copy_(
+            batch_layout, non_blocking=True
+        )
 
 
 class BeamGraphInputs:

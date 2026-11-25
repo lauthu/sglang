@@ -12,8 +12,10 @@
 # limitations under the License.
 # ==============================================================================
 """What a beam decode graph replays: the batch loaded into its buffers, and only
-a batch that fits them."""
+a batch that fits them. Also the stream-K plan that the host adds to a
+variable-width batch's layout."""
 
+import collections
 import contextlib
 import itertools
 import unittest
@@ -23,6 +25,10 @@ from unittest.mock import patch
 import msgspec
 import torch
 
+from sglang.kernels.ops.attention.beam_shared_context_variable_width_stream_k import (
+    build_stream_k_plan,
+    task_units,
+)
 from sglang.srt.beam_search import (
     beam_decode_cuda_graph_runner,
     decode_graph_settings,
@@ -373,7 +379,7 @@ def _variable_width_graph_inputs(max_rows, *, trie_head=True):
             max_rows=max_rows,
             device="cpu",
             req_to_token=torch.zeros(4, 8, dtype=torch.int32),
-            stream_k=False,
+            stream_k=None,
         ),
     )
 
@@ -545,6 +551,111 @@ class TestVariableWidthBeamGraphInputs(CustomTestCase):
                     kernel=kernel, **without_variable_width_graphs
                 ):
                     check()
+
+
+# split_cost_units that force the stream-K plan's choice, whatever the batch.
+NEVER_SPLIT = 1 << 20
+ALWAYS_SPLIT = -(1 << 20)
+
+
+class TestStreamKPlan(CustomTestCase):
+    def test_plan_attends_every_work_unit_once_and_lists_every_split_task(self):
+        """What the stream-K kernels rely on, for any batch, grid and choice of
+        splitting: the segments of a task cover its work units once and in order;
+        a task in one piece is written directly; a split task is listed once, by
+        the CTA with its first segment, up to the CTA with its last, and its later
+        segments are where the merge kernel reads them."""
+        # (prompt blocks, decode steps) of each tile's tasks.
+        batches = {
+            "one request": [(32, 2)] * 2,
+            "eight requests": [(32, 2)] * 16,
+            "uneven tiles": [(1, 1), (11, 3), (1, 5), (32, 1), (8, 2), (3, 1)],
+            "one tiny tile": [(1, 1)],
+        }
+        for (name, tiles), q_heads, num_ctas, split_cost_units in itertools.product(
+            batches.items(),
+            (1, 16),
+            (1, 3, 7, 64, 188),
+            (None, NEVER_SPLIT, ALWAYS_SPLIT),
+        ):
+            with self.subTest(
+                batch=name, q_heads=q_heads, num_ctas=num_ctas, split=split_cost_units
+            ):
+                split_tasks = self._check_plan(
+                    tiles, q_heads=q_heads, num_ctas=num_ctas, split=split_cost_units
+                )
+                if split_cost_units == NEVER_SPLIT:
+                    self.assertEqual(split_tasks, 0)
+                if split_cost_units == ALWAYS_SPLIT and num_ctas == 188:
+                    self.assertGreater(split_tasks, 0)
+
+    def _check_plan(self, tiles, *, q_heads, num_ctas, split):
+        """Check one plan as the kernels read it; returns its number of split tasks."""
+        work_units = [blocks + steps for blocks, steps in tiles for _ in range(q_heads)]
+        plan = build_stream_k_plan(
+            units_per_task=[
+                task_units(prompt_len=64 * blocks, decode_len=steps)
+                for blocks, steps in tiles
+            ],
+            q_heads=q_heads,
+            num_ctas=num_ctas,
+            split_cost_units=split,
+        ).tolist()
+        self.assertEqual(len(plan), num_ctas)
+
+        # Per task, its segments in CTA order: (cta, work start, work end, partial, slot).
+        segments = collections.defaultdict(list)
+        # Per listed task: (listing cta, last cta, first slot).
+        listed = {}
+        for cta, row in enumerate(plan):
+            first_task, end_task, first_start, last_end, first_partial, last_partial = (
+                row[:6]
+            )
+            for task in range(first_task, end_task):
+                is_first, is_last = task == first_task, task == end_task - 1
+                segments[task].append(
+                    (
+                        cta,
+                        first_start if is_first else 0,
+                        last_end if is_last else work_units[task],
+                        bool(
+                            (is_first and first_partial) or (is_last and last_partial)
+                        ),
+                        2 * cta + (0 if is_first else 1),
+                    )
+                )
+            tile_plus_1, q_head, last_cta, first_slot = row[6:]
+            if tile_plus_1:
+                task = (tile_plus_1 - 1) * q_heads + q_head
+                self.assertNotIn(task, listed)
+                listed[task] = (cta, last_cta, first_slot)
+
+        for task, num_units in enumerate(work_units):
+            parts = segments[task]
+            starts = [start for _, start, _, _, _ in parts]
+            ends = [end for _, _, end, _, _ in parts]
+            self.assertEqual(starts, [0, *ends[:-1]])
+            self.assertEqual(ends[-1], num_units)
+            self.assertTrue(all(start < end for start, end in zip(starts, ends)))
+            if len(parts) == 1:
+                self.assertFalse(parts[0][3])
+                self.assertNotIn(task, listed)
+                continue
+            self.assertTrue(all(partial for _, _, _, partial, _ in parts))
+            segment_ctas = [cta for cta, _, _, _, _ in parts]
+            self.assertEqual(
+                listed[task], (segment_ctas[0], segment_ctas[-1], parts[0][4])
+            )
+            # The merge kernel reads slot 2 * c of every later CTA c up to the
+            # last; one without a segment has no task and marked that slot empty.
+            self.assertEqual(
+                [slot for _, _, _, _, slot in parts[1:]],
+                [2 * cta for cta in segment_ctas[1:]],
+            )
+            for cta in range(segment_ctas[0] + 1, segment_ctas[-1]):
+                if cta not in segment_ctas:
+                    self.assertEqual(plan[cta][0], plan[cta][1])
+        return len(listed)
 
 
 if __name__ == "__main__":
