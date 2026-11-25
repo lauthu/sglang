@@ -241,8 +241,12 @@ def attend_prompt_blocks(
     dim_offsets = tl.arange(0, BLOCK_D)
     dim_mask = dim_offsets < HEAD_DIM
     negative_infinity = -float("inf")
-    for block in tl.range(first_block, end_block):
-        tokens = block * BLOCK_N + context_offsets
+    # The loop steps by tokens, as the default kernel's own loop did before the two
+    # kernels shared this one.
+    first_token = first_block * BLOCK_N
+    end_token = tl.minimum(end_block * BLOCK_N, prompt_len)
+    for block_start in tl.range(first_token, end_token, BLOCK_N):
+        tokens = block_start + context_offsets
         token_mask = tokens < prompt_len
         slots = tl.load(prompt_slots + tokens, mask=token_mask, other=0)
         if WIDE_KV_OFFSETS:
