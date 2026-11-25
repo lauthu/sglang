@@ -9,7 +9,7 @@ import torch
 from sglang.srt.beam_search.batch_tail import BeamTailEntry
 
 
-def ragged_case(
+def width_free_case(
     widths,
     prompt_lens,
     decode_lens,
@@ -97,16 +97,16 @@ def ragged_case(
     )
 
 
-def run_ragged(case, metadata, *, block_m, **stream_k):
+def run_width_free(case, metadata, *, block_m, **stream_k):
     """Launch the kernel a layout selects on a case's tensors (or a graph's own,
     which carry the same fields)."""
     if metadata.stream_k:
-        from sglang.kernels.ops.attention.beam_shared_context_ragged_stream_k import (
-            shared_context_attention_ragged_stream_k as attention,
+        from sglang.kernels.ops.attention.beam_shared_context_width_free_stream_k import (
+            shared_context_attention_width_free_stream_k as attention,
         )
     else:
-        from sglang.kernels.ops.attention.beam_shared_context_ragged import (
-            shared_context_attention_ragged as attention,
+        from sglang.kernels.ops.attention.beam_shared_context_width_free import (
+            shared_context_attention_width_free as attention,
         )
     return attention(
         q=case.q,

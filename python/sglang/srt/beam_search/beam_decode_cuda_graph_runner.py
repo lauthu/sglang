@@ -33,7 +33,7 @@ import msgspec
 import torch
 
 from sglang.srt.beam_search import shared_context_attention
-from sglang.srt.beam_search import shared_context_ragged as ragged
+from sglang.srt.beam_search import shared_context_width_free as width_free
 from sglang.srt.beam_search.decode_graph_settings import (
     stream_k_selected,
     width_free_graphs_enabled,
@@ -43,7 +43,9 @@ from sglang.srt.beam_search.shared_context_attention import (
     BeamAttentionBucket,
     BeamAttentionMetadata,
 )
-from sglang.srt.beam_search.shared_context_ragged import RaggedBeamAttentionMetadata
+from sglang.srt.beam_search.shared_context_width_free import (
+    WidthFreeBeamAttentionMetadata,
+)
 from sglang.srt.beam_search.trie_config import get_beam_trie_config
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
@@ -284,7 +286,7 @@ class WidthFreeSharedContextInput:
     SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH is unset.
 
     A batch describes its beam groups in one layout that the kernels read at run
-    time (shared_context_ragged):
+    time (shared_context_width_free):
 
     - Every graph size gets a beam graph.
     - A batch pads to the next size like any decode batch.
@@ -303,7 +305,7 @@ class WidthFreeSharedContextInput:
         stream_k: bool,
     ):
         # Capture-time value: all zeros, which is a launch that does no work.
-        self._graph_layout = ragged.allocate_capture_layout(
+        self._graph_layout = width_free.allocate_capture_layout(
             max_rows=max_rows,
             device=device,
             req_to_token=req_to_token,
@@ -331,15 +333,15 @@ class WidthFreeSharedContextInput:
     def can_capture(self, graph_size: int) -> bool:
         return True
 
-    def prepare_capture_inputs(self, graph_size: int) -> RaggedBeamAttentionMetadata:
+    def prepare_capture_inputs(self, graph_size: int) -> WidthFreeBeamAttentionMetadata:
         return self._graph_layout
 
     def can_replay(
-        self, metadata: Optional[RaggedBeamAttentionMetadata], *, graph_size: int
+        self, metadata: Optional[WidthFreeBeamAttentionMetadata], *, graph_size: int
     ) -> bool:
         return metadata is not None
 
-    def load_replay_inputs(self, metadata: RaggedBeamAttentionMetadata) -> None:
+    def load_replay_inputs(self, metadata: WidthFreeBeamAttentionMetadata) -> None:
         # Entries past the batch's counts keep an earlier batch's values; the
         # kernels read none past the counts.
         batch_layout = metadata.layout

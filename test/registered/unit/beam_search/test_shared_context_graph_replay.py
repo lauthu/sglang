@@ -31,12 +31,12 @@ from sglang.srt.beam_search.shared_context_attention import (
     BeamAttentionBucket,
     BeamAttentionMetadata,
 )
-from sglang.srt.beam_search.shared_context_ragged import (
-    RAGGED_BLOCK_M,
-    build_ragged_metadata,
+from sglang.srt.beam_search.shared_context_width_free import (
+    WIDTH_FREE_BLOCK_M,
+    build_width_free_metadata,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kernels.beam_shared_context import ragged_case, run_ragged
+from sglang.test.kernels.beam_shared_context import run_width_free, width_free_case
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=40, stage="base-b", runner_config="1-gpu-small")
@@ -138,7 +138,7 @@ class TestWidthFreeGraphReplay(CustomTestCase):
         0. With stream-K, the batches alternate between splitting the units and
         whole tiles per CTA (40 tiles)."""
         cases = tuple(
-            ragged_case(*split, max_context=4096, seed=seed)
+            width_free_case(*split, max_context=4096, seed=seed)
             for seed, split in enumerate(
                 (
                     ((256, 256), (2048, 7), (2, 1)),
@@ -180,10 +180,10 @@ class TestWidthFreeGraphReplay(CustomTestCase):
             ),
         )
         captured = inputs.prepare_capture_inputs(graph_size).attention_metadata
-        run_ragged(graph_inputs, captured, block_m=RAGGED_BLOCK_M)
+        run_width_free(graph_inputs, captured, block_m=WIDTH_FREE_BLOCK_M)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            output = run_ragged(graph_inputs, captured, block_m=RAGGED_BLOCK_M)
+            output = run_width_free(graph_inputs, captured, block_m=WIDTH_FREE_BLOCK_M)
         for index, case in enumerate(cases):
             with self.subTest(split=index):
                 rows = case.q.shape[0]
@@ -195,7 +195,7 @@ class TestWidthFreeGraphReplay(CustomTestCase):
                 req_to_token[: len(case.req_to_token)].copy_(case.req_to_token)
                 batch_inputs = BeamForwardInputs(
                     trie_levels=torch.zeros(rows, dtype=torch.int64, device="cuda"),
-                    attention_metadata=build_ragged_metadata(
+                    attention_metadata=build_width_free_metadata(
                         batch=case.batch,
                         req_to_token=case.req_to_token,
                         stream_k=stream_k,

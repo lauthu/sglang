@@ -46,7 +46,7 @@ from sglang.srt.beam_search.shared_context_attention import (
     BeamAttentionBucket,
     BeamAttentionMetadata,
 )
-from sglang.srt.beam_search.shared_context_ragged import RAGGED_BLOCK_M
+from sglang.srt.beam_search.shared_context_width_free import WIDTH_FREE_BLOCK_M
 from sglang.srt.beam_search.trie_config import TrieOutputHeadConfig
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -374,7 +374,9 @@ def _rows_in_tiles(layout):
     rows = []
     for group, first_beam in tiles:
         leader, first_member, members, _ = groups[group]
-        for beam in range(first_beam, min(first_beam + RAGGED_BLOCK_M, members + 1)):
+        for beam in range(
+            first_beam, min(first_beam + WIDTH_FREE_BLOCK_M, members + 1)
+        ):
             rows.append(leader if beam == 0 else first_member + beam - 1)
     return rows
 

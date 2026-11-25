@@ -22,31 +22,31 @@ import unittest
 
 import torch
 
-from sglang.srt.beam_search.shared_context_ragged import (
-    RAGGED_BLOCK_M,
-    build_ragged_metadata,
+from sglang.srt.beam_search.shared_context_width_free import (
+    WIDTH_FREE_BLOCK_M,
+    build_width_free_metadata,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kernels.beam_shared_context import ragged_case, run_ragged
+from sglang.test.kernels.beam_shared_context import run_width_free, width_free_case
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-class TestRaggedSharedContextAttention(CustomTestCase):
+class TestWidthFreeSharedContextAttention(CustomTestCase):
     def _assert_matches_reference(self, case, *, stream_k, **forced):
-        metadata = build_ragged_metadata(
+        metadata = build_width_free_metadata(
             batch=case.batch, req_to_token=case.req_to_token, stream_k=stream_k
         )
-        output = run_ragged(case, metadata, block_m=RAGGED_BLOCK_M, **forced)
+        output = run_width_free(case, metadata, block_m=WIDTH_FREE_BLOCK_M, **forced)
         torch.testing.assert_close(output.float(), case.reference, rtol=1e-2, atol=1e-2)
 
     def test_any_split_matches_fp32_reference(self):
         """Mixed widths across the 128-beam tile edge, each group with its own prompt
         (up to 5,000 tokens) and decode length, leaders apart from their member
         rows."""
-        case = ragged_case(
+        case = width_free_case(
             widths=(2, 3, 127, 128, 129, 256, 300),
             prompt_lens=(1, 5000, 64, 65, 300, 129, 513),
             decode_lens=(1, 4, 2, 3, 1, 2, 4),
@@ -61,13 +61,13 @@ class TestRaggedSharedContextAttention(CustomTestCase):
         across heads, tiles and groups, CTAs without units), the partial segments
         merge into the same attention; so do whole tiles per CTA."""
         never, always = 1 << 20, -(1 << 20)
-        mixed = ragged_case(
+        mixed = width_free_case(
             widths=(2, 129, 2, 300, 3, 7),
             prompt_lens=(1, 700, 64, 513, 2048, 130),
             decode_lens=(5, 1, 2, 4, 1, 3),
             max_context=4096,
         )
-        tiny = ragged_case(widths=(2,), prompt_lens=(1,), decode_lens=(1,))
+        tiny = width_free_case(widths=(2,), prompt_lens=(1,), decode_lens=(1,))
         runs = (
             (mixed, 1, always),
             (mixed, 3, always),

@@ -66,10 +66,10 @@ _TRITON_KERNELS = [
     ("beam_shared_context", "shared_context_attention"),
     # One contract, shared-context attention for any beam widths in a launch;
     # two ops because the registry holds one spec per (op, backend).
-    ("beam_shared_context_ragged", "shared_context_attention_ragged"),
+    ("beam_shared_context_width_free", "shared_context_attention_width_free"),
     (
-        "beam_shared_context_ragged_stream_k",
-        "shared_context_attention_ragged_stream_k",
+        "beam_shared_context_width_free_stream_k",
+        "shared_context_attention_width_free_stream_k",
     ),
 ]
 for _mod, _fn in _TRITON_KERNELS:

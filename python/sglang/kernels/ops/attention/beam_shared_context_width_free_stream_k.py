@@ -15,7 +15,7 @@
 
 Opt-in with SGLANG_BEAM_SHARED_CONTEXT_KERNEL=stream_k, for the width-free beam
 decode graphs. It reads the layout of
-beam_shared_context_ragged.py, which ends with a schedule that build_schedule
+beam_shared_context_width_free.py, which ends with a schedule that build_schedule
 writes after the tile table:
 - schedule: [most units of a tile, units of all tiles, unit_starts[0], ...,
   unit_starts[tiles]], per query head; unit_starts[t] is tile t's first unit
@@ -30,7 +30,7 @@ CTAs leaves a partial output and log-sum-exp per CTA, and the CTA holding its fi
 work unit lists it for the merge kernel. Only a run's first and last segments can
 be partial, so the workspace holds two slots per CTA for any batch.
 
-Against the tile-per-CTA kernel of beam_shared_context_ragged.py, per launch on
+Against the tile-per-CTA kernel of beam_shared_context_width_free.py, per launch on
 SM120 with 2,048-token prompts: 2.7x to 3.8x faster for one request of 16 to 256
 beams, 1.2x for 8 requests of 256 beams, and 6% to 8% slower when 8 requests of
 16 to 256 beams give each SM about one whole tile and head.
@@ -45,10 +45,10 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.attention.beam_shared_context_ragged import (
+from sglang.kernels.ops.attention.beam_shared_context_width_free import (
     attend_beam_token,
     attend_prompt_block,
-    check_ragged_inputs,
+    check_width_free_inputs,
     empty_softmax_state,
     num_sms,
 )
@@ -158,7 +158,7 @@ def _find_tile(unit_starts, num_tiles, key, TILE_SEARCH: tl.constexpr):
 @triton.jit
 def _tile_rows(groups, tiles, tile, lanes):
     """Rows of a tile's beams and their mask, then its group's leader row and prompt
-    length, as beam_shared_context_ragged.py reads the tables."""
+    length, as beam_shared_context_width_free.py reads the tables."""
     group = tl.load(tiles + 2 * tile)
     first_beam = tl.load(tiles + 2 * tile + 1)
     leader = tl.load(groups + 4 * group)
@@ -296,7 +296,7 @@ def _attend_tile_head(
 
 
 @triton.jit
-def _ragged_stream_k_kernel(
+def _width_free_stream_k_kernel(
     q,
     k_buffer,
     v_buffer,
@@ -462,7 +462,7 @@ def _ragged_stream_k_kernel(
 
 
 @triton.jit
-def _ragged_merge_kernel(
+def _width_free_merge_kernel(
     partial_output,
     partial_lse,
     merge_list,
@@ -531,7 +531,7 @@ def _ragged_merge_kernel(
             )
 
 
-def shared_context_attention_ragged_stream_k(
+def shared_context_attention_width_free_stream_k(
     q: torch.Tensor,
     k_buffer: torch.Tensor,
     v_buffer: torch.Tensor,
@@ -546,14 +546,14 @@ def shared_context_attention_ragged_stream_k(
     num_ctas: int | None = None,
     split_cost_units: int = _SPLIT_COST_UNITS,
 ) -> torch.Tensor:
-    """shared_context_attention_ragged on a persistent stream-K grid: same inputs,
+    """shared_context_attention_width_free on a persistent stream-K grid: same inputs,
     with the schedule of the layout's tiles (`build_schedule`) after its tile table.
 
     Rejects K/V buffers of 2^31 elements or more. Tuned on SM120 only. `num_ctas`
     defaults to one CTA per SM; a very large or negative `split_cost_units` forces
     whole tiles or the split.
     """
-    output = check_ragged_inputs(
+    output = check_width_free_inputs(
         q=q,
         k_buffer=k_buffer,
         v_buffer=v_buffer,
@@ -585,7 +585,7 @@ def shared_context_attention_ragged_stream_k(
         (num_ctas, _MERGE_FIELDS), dtype=torch.int32, device=q.device
     )
     block_d = triton.next_power_of_2(head_dim)
-    _ragged_stream_k_kernel[(num_ctas,)](
+    _width_free_stream_k_kernel[(num_ctas,)](
         q,
         k_buffer,
         v_buffer,
@@ -623,7 +623,7 @@ def shared_context_attention_ragged_stream_k(
         num_warps=_NUM_WARPS,
         num_stages=_NUM_STAGES,
     )
-    _ragged_merge_kernel[(num_ctas, triton.cdiv(block_m, _MERGE_ROWS))](
+    _width_free_merge_kernel[(num_ctas, triton.cdiv(block_m, _MERGE_ROWS))](
         partial_output,
         partial_lse,
         merge_list,

@@ -23,7 +23,7 @@ The per-batch layout is one int32 tensor, read on the GPU, its parts back to bac
   member rows are contiguous
 - tiles: 2 per tile, (group, first beam); beam 0 is the leader and a tile covers
   block_m beams of one group
-- for the stream-K kernel, its schedule (beam_shared_context_ragged_stream_k.py)
+- for the stream-K kernel, its schedule (beam_shared_context_width_free_stream_k.py)
 A buffer may be longer than its batch's layout: the counts bound what is read.
 
 KV slots come from req_to_token: the prompt through the leader's pool row and
@@ -107,7 +107,7 @@ def num_sms(device_index: int) -> int:
 
 
 @triton.jit
-def _ragged_shared_context_kernel(
+def _width_free_shared_context_kernel(
     q,
     k_buffer,
     v_buffer,
@@ -272,12 +272,12 @@ def _ragged_shared_context_kernel(
         )
 
 
-def ragged_num_ctas(device_index: int, q_heads: int) -> int:
+def width_free_num_ctas(device_index: int, q_heads: int) -> int:
     """Programs per query head; fixed per device and model, so a graph keeps it."""
     return max(1, triton.cdiv(_WAVES * num_sms(device_index), q_heads))
 
 
-def check_ragged_inputs(
+def check_width_free_inputs(
     q: torch.Tensor,
     k_buffer: torch.Tensor,
     v_buffer: torch.Tensor,
@@ -322,7 +322,7 @@ def check_ragged_inputs(
     return output
 
 
-def shared_context_attention_ragged(
+def shared_context_attention_width_free(
     q: torch.Tensor,
     k_buffer: torch.Tensor,
     v_buffer: torch.Tensor,
@@ -341,7 +341,7 @@ def shared_context_attention_ragged(
     buffers; `layout` is the module's int32 layout; rows past its real rows are
     written as zeros. Tuned on SM120 only; one CTA reads a tile's whole prompt.
     """
-    output = check_ragged_inputs(
+    output = check_width_free_inputs(
         q=q,
         k_buffer=k_buffer,
         v_buffer=v_buffer,
@@ -354,8 +354,8 @@ def shared_context_attention_ragged(
     num_rows, q_heads, head_dim = q.shape
     kv_heads = k_buffer.shape[1]
 
-    grid = (ragged_num_ctas(q.device.index, q_heads), q_heads)
-    _ragged_shared_context_kernel[grid](
+    grid = (width_free_num_ctas(q.device.index, q_heads), q_heads)
+    _width_free_shared_context_kernel[grid](
         q,
         k_buffer,
         v_buffer,

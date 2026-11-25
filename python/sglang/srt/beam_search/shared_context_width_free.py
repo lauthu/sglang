@@ -36,11 +36,11 @@ if TYPE_CHECKING:
 
 # Beams per tile, the kernels' M dimension. Arbitrary: the fixed-width kernel's
 # tile for small group counts.
-RAGGED_BLOCK_M = 128
+WIDTH_FREE_BLOCK_M = 128
 
 
-class RaggedBeamAttentionMetadata(msgspec.Struct):
-    # int32 layout of kernels/ops/attention/beam_shared_context_ragged.py: a batch's
+class WidthFreeBeamAttentionMetadata(msgspec.Struct):
+    # int32 layout of kernels/ops/attention/beam_shared_context_width_free.py: a batch's
     # own, or a captured buffer sized for the most a graph holds.
     layout: torch.Tensor
     req_to_token: torch.Tensor
@@ -56,12 +56,12 @@ def _layout_tensor(values: list[int], device) -> torch.Tensor:
     return torch.tensor(values, dtype=torch.int32, device=device)
 
 
-def build_ragged_metadata(
+def build_width_free_metadata(
     batch: ScheduleBatch,
     req_to_token: torch.Tensor,
     *,
     stream_k: bool = False,
-) -> Optional[RaggedBeamAttentionMetadata]:
+) -> Optional[WidthFreeBeamAttentionMetadata]:
     """The layout of a beam decode batch, built on the host from the beam tail; None
     leaves the batch to ordinary attention. Every row must belong to a beam group
     of at least two rows: a batch with a regular request gets no layout."""
@@ -83,18 +83,18 @@ def build_ragged_metadata(
     if covered_rows != num_rows:
         return None
 
-    # A tile is RAGGED_BLOCK_M beams of one group, the leader first.
+    # A tile is WIDTH_FREE_BLOCK_M beams of one group, the leader first.
     tiles = [
         (group, first_beam)
         for group, (_, _, num_members, _) in enumerate(groups)
-        for first_beam in range(0, num_members + 1, RAGGED_BLOCK_M)
+        for first_beam in range(0, num_members + 1, WIDTH_FREE_BLOCK_M)
     ]
     schedule = (
         _stream_k_schedule(groups=groups, tiles=tiles, base_lens=base_lens)
         if stream_k
         else []
     )
-    return RaggedBeamAttentionMetadata(
+    return WidthFreeBeamAttentionMetadata(
         layout=_layout_tensor(
             values=[
                 len(groups),
@@ -118,7 +118,7 @@ def _stream_k_schedule(
 ) -> list[int]:
     """The stream-K kernel's schedule: each tile's work units for one query head, from
     its group's prompt length and decode depth."""
-    from sglang.kernels.ops.attention.beam_shared_context_ragged_stream_k import (
+    from sglang.kernels.ops.attention.beam_shared_context_width_free_stream_k import (
         build_schedule,
         tile_units,
     )
@@ -136,24 +136,24 @@ def allocate_capture_layout(
     req_to_token: torch.Tensor,
     *,
     stream_k: bool = False,
-) -> RaggedBeamAttentionMetadata:
+) -> WidthFreeBeamAttentionMetadata:
     """One layout buffer for every captured row count, sized for any batch of
     max_rows rows. All zeros, it records a launch with its fixed grid and no work."""
-    from sglang.kernels.ops.attention.beam_shared_context_ragged import (
+    from sglang.kernels.ops.attention.beam_shared_context_width_free import (
         layout_tables_size,
     )
-    from sglang.kernels.ops.attention.beam_shared_context_ragged_stream_k import (
+    from sglang.kernels.ops.attention.beam_shared_context_width_free_stream_k import (
         schedule_size,
     )
 
     # Every beam group has at least two rows.
     max_groups = max(1, max_rows // 2)
     # Each group adds at most one partial tile to the rows' full tiles.
-    max_tiles = -(-max_rows // RAGGED_BLOCK_M) + max_groups
+    max_tiles = -(-max_rows // WIDTH_FREE_BLOCK_M) + max_groups
     size = layout_tables_size(num_groups=max_groups, num_tiles=max_tiles)
     if stream_k:
         size += schedule_size(max_tiles)
-    return RaggedBeamAttentionMetadata(
+    return WidthFreeBeamAttentionMetadata(
         layout=torch.zeros(size, dtype=torch.int32, device=device),
         req_to_token=req_to_token,
         stream_k=stream_k,
@@ -164,7 +164,7 @@ def forward(
     q: torch.Tensor,
     layer: RadixAttention,
     forward_batch: ForwardBatch,
-    metadata: RaggedBeamAttentionMetadata,
+    metadata: WidthFreeBeamAttentionMetadata,
     k_buffer: torch.Tensor,
     v_buffer: torch.Tensor,
 ) -> torch.Tensor:
@@ -173,12 +173,12 @@ def forward(
     # Two kernels of one contract, chosen by SGLANG_BEAM_SHARED_CONTEXT_KERNEL: see
     # the stream-K module for where each is faster.
     if metadata.stream_k:
-        from sglang.kernels.ops.attention.beam_shared_context_ragged_stream_k import (
-            shared_context_attention_ragged_stream_k as attention,
+        from sglang.kernels.ops.attention.beam_shared_context_width_free_stream_k import (
+            shared_context_attention_width_free_stream_k as attention,
         )
     else:
-        from sglang.kernels.ops.attention.beam_shared_context_ragged import (
-            shared_context_attention_ragged as attention,
+        from sglang.kernels.ops.attention.beam_shared_context_width_free import (
+            shared_context_attention_width_free as attention,
         )
     output = attention(
         q=q.reshape(-1, q_heads, head_dim),
@@ -188,7 +188,7 @@ def forward(
         req_pool_indices=forward_batch.req_pool_indices,
         seq_lens=forward_batch.seq_lens,
         layout=metadata.layout,
-        block_m=RAGGED_BLOCK_M,
+        block_m=WIDTH_FREE_BLOCK_M,
         softmax_scale=layer.scaling,
     )
     return output.view(-1, q_heads * head_dim)

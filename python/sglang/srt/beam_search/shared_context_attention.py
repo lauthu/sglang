@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 import torch
 
-from sglang.srt.beam_search import shared_context_ragged as ragged
+from sglang.srt.beam_search import shared_context_width_free as width_free
 from sglang.srt.beam_search.decode_graph_settings import (
     stream_k_selected,
     width_free_graphs_enabled,
@@ -115,7 +115,7 @@ def _metadata_tensor(values, dtype, device):
 def build_metadata(
     batch: ScheduleBatch,
     model_runner: ModelRunner,
-) -> Optional[BeamAttentionMetadata | ragged.RaggedBeamAttentionMetadata]:
+) -> Optional[BeamAttentionMetadata | width_free.WidthFreeBeamAttentionMetadata]:
     if batch.beam_tail is None or not batch.forward_mode.is_decode() or not enabled():
         return None
     if not supports_shared_context(model_runner):
@@ -124,7 +124,7 @@ def build_metadata(
     if not entries or batch.seq_lens_cpu is None:
         return None
     if width_free_graphs_enabled():
-        return ragged.build_ragged_metadata(
+        return width_free.build_width_free_metadata(
             batch=batch,
             req_to_token=model_runner.req_to_token_pool.req_to_token,
             stream_k=stream_k_selected(),
@@ -247,8 +247,8 @@ def forward(
     if k_buffer.ndim != 3 or v_buffer.ndim != 3:
         raise RuntimeError("Shared-context attention requires 3D MHA K/V cache buffers")
     # A width-free layout has no buckets; its own kernels read it.
-    if isinstance(metadata, ragged.RaggedBeamAttentionMetadata):
-        return ragged.forward(
+    if isinstance(metadata, width_free.WidthFreeBeamAttentionMetadata):
+        return width_free.forward(
             q=q,
             layer=layer,
             forward_batch=forward_batch,
