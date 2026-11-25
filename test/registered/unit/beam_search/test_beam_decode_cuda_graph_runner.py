@@ -536,9 +536,14 @@ class TestVariableWidthBeamGraphInputs(CustomTestCase):
                 ValueError, "'split_kv' is not available when .* any beam width"
             ):
                 check()
-        for without_variable_width_graphs in ({"fixed_width": 2}, {"decode_graphs": False}):
+        for without_variable_width_graphs in (
+            {"fixed_width": 2},
+            {"decode_graphs": False},
+        ):
             for kernel in ("split_kv", "stream_k"):
-                with _shared_context_server(kernel=kernel, **without_variable_width_graphs):
+                with _shared_context_server(
+                    kernel=kernel, **without_variable_width_graphs
+                ):
                     check()
 
 

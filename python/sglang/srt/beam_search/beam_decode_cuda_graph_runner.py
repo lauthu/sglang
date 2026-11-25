@@ -332,7 +332,9 @@ class VariableWidthSharedContextInput:
     def can_capture(self, graph_size: int) -> bool:
         return True
 
-    def prepare_capture_inputs(self, graph_size: int) -> VariableWidthBeamAttentionMetadata:
+    def prepare_capture_inputs(
+        self, graph_size: int
+    ) -> VariableWidthBeamAttentionMetadata:
         return self._graph_metadata
 
     def can_replay(

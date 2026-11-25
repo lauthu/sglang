@@ -149,7 +149,9 @@ def _metadata_tensor(values, dtype, device):
 def build_metadata(
     batch: ScheduleBatch,
     model_runner: ModelRunner,
-) -> Optional[BeamAttentionMetadata | variable_width.VariableWidthBeamAttentionMetadata]:
+) -> Optional[
+    BeamAttentionMetadata | variable_width.VariableWidthBeamAttentionMetadata
+]:
     if batch.beam_tail is None or not batch.forward_mode.is_decode() or not enabled():
         return None
     if not supports_shared_context(model_runner):

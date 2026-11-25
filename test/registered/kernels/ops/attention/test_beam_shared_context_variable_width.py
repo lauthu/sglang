@@ -22,7 +22,9 @@ import unittest
 
 import torch
 
-from sglang.srt.beam_search.shared_context_variable_width import build_variable_width_metadata
+from sglang.srt.beam_search.shared_context_variable_width import (
+    build_variable_width_metadata,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.beam_shared_context import (
     run_variable_width_attention,
