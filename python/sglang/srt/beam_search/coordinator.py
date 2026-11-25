@@ -452,11 +452,11 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         if tail is None:
             return
         capture = logits_output.beam
-        radix_done = self._radix_select_decode(tail, capture, batch.forward_iter)
+        radix_selected = self._radix_select_decode(tail, capture, batch.forward_iter)
         for gi, entry in enumerate(tail.entries):
             group = entry.group
             if (
-                gi in radix_done
+                gi in radix_selected
                 or group.retired
                 or group.state != BeamGroupState.DECODING
             ):
@@ -509,17 +509,18 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
     ) -> Optional[torch.Tensor]:
         """First selection with the radix kernels; None when they do not cover it."""
         selector = self._radix_selector
-        # A prefill forward returns full-vocabulary rows without a normalizer.
-        if selector is None or capture.leader_normalizer is not None:
+        if (
+            selector is None
+            # A prefill forward returns full-vocabulary rows without a normalizer.
+            or capture.leader_normalizer is not None
+            or not selector.can_select(group)
+        ):
             return None
-        step = selector.step_of(group, num_rows=1)
-        if step is None:
-            return None
-        logits, normalizer = selector.first_step_inputs(
+        logits, normalizer = selector.prepare_prefill_inputs(
             capture.leader_logits[pos : pos + 1]
         )
         (result,), next_tokens = selector.select(
-            step,
+            selector.next_step(group),
             [group],
             leader_logits=logits,
             leader_normalizer=normalizer,
@@ -529,8 +530,9 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         return next_tokens
 
     def _radix_select_decode(self, tail, capture, tick: int) -> set:
-        """Selects, remaps and relays every group the radix kernels cover, one
-        launch set per RadixStep. Returns the tail entry indices it handled."""
+        """Selects, remaps and relays every group the radix kernels cover: the
+        groups at the same RadixStep in the same launches. Returns the indices of
+        the tail entries it selected for."""
         selector = self._radix_selector
         if (
             selector is None
@@ -539,18 +541,20 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             or capture.tail_normalizer is None
         ):
             return set()
-        buckets = {}
+        entries_by_step = {}
         for gi, entry in enumerate(tail.entries):
             group = entry.group
-            if group.retired or group.state != BeamGroupState.DECODING:
+            if (
+                group.retired
+                or group.state != BeamGroupState.DECODING
+                or not selector.can_select(group)
+            ):
                 continue
-            step = selector.step_of(group, num_rows=1 + entry.end - entry.start)
-            if step is not None:
-                buckets.setdefault(step, []).append(gi)
-        for step, members in buckets.items():
-            groups = [tail.entries[gi].group for gi in members]
+            entries_by_step.setdefault(selector.next_step(group), []).append(gi)
+        for step, entry_ids in entries_by_step.items():
+            groups = [tail.entries[gi].group for gi in entry_ids]
             # Every group's rows, leader first: where its beams' KV and next tokens go.
-            rows = (
+            all_rows = (
                 groups[0].all_rows
                 if len(groups) == 1
                 else torch.cat([group.all_rows for group in groups])
@@ -560,12 +564,12 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 groups,
                 leader_logits=capture.leader_logits,
                 leader_normalizer=capture.leader_normalizer,
-                leader_rows=members,
+                leader_rows=entry_ids,
                 tail_logits=capture.tail_logits,
                 tail_normalizer=capture.tail_normalizer,
-                tail_starts=[tail.entries[gi].start for gi in members],
+                tail_starts=[tail.entries[gi].start for gi in entry_ids],
                 req_to_token=self.req_to_token_pool.req_to_token,
-                rows=rows,
+                all_rows=all_rows,
             )
             for group, result in zip(groups, results):
                 self._advance_radix(group, result, tick)
@@ -576,8 +580,8 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                             StagedOrphans(tick, *result.orphans)
                         )
                     group.leader.output_ids.append(0)
-            self._stash_next_tokens(rows, next_tokens)
-        return {gi for members in buckets.values() for gi in members}
+            self._stash_next_tokens(all_rows, next_tokens)
+        return {gi for entry_ids in entries_by_step.values() for gi in entry_ids}
 
     def _advance_radix(
         self, group: BeamGroup, result: RadixGroupResult, tick: int

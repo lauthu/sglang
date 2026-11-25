@@ -13,8 +13,8 @@
 # ==============================================================================
 """Trie-constrained beam selection by radix select, with the beam KV remap folded in.
 
-One call selects for every beam group of a step that shares a trie depth; the groups may
-have different beam widths. For frontier row r and code c of a group the score is
+The beams of one request are a group. One call selects for every group of a step that is
+at the same trie depth; the groups may have different beam widths. For frontier row r and code c of a group the score is
 cum[r] + ((logit - row_max) - row_lse), -inf where the trie forbids c: the torch path's
 fp32 operations in the same order, so the selected scores are bit-identical. The result is
 the group's best beam_width candidates by score, ties to the lower flat index
@@ -50,6 +50,8 @@ import triton.language as tl
 # Candidates one program holds in registers: 16 per thread at 8 warps.
 _SMALL_KEYS = 4096
 _TILE_KEYS = 4096
+# A program holds whole frontier rows, so a row's codes must fit one tile.
+MAX_CODEBOOK_SIZE = _TILE_KEYS
 # 11-bit digits: tl.histogram of 4096 keys into 2048 bins takes ~0.3 us on RTX PRO 6000.
 _BINS = 2048
 # Threshold-bucket entries the finalize sorts in registers; a fuller bucket takes the
@@ -116,7 +118,15 @@ _POINTERS = [
     "bucket",
     "spill",
 ]
-_INTEGERS = ["s_ll", "s_tl", "s_ln", "s_tn", "s_rt", "C", "token_start"]
+_INTEGERS = [
+    "leader_logits_stride",
+    "tail_logits_stride",
+    "leader_norm_stride",
+    "tail_norm_stride",
+    "req_to_token_stride",
+    "codebook_size",
+    "token_start",
+]
 
 
 class RadixSelection(msgspec.Struct):
@@ -156,10 +166,10 @@ def _sort_key(key, flat):
 
 
 @triton.jit
-def _unpack(sk, C):
-    key = (sk >> 32).to(tl.int32).to(tl.uint32, bitcast=True) ^ 0x80000000
-    flat = 4294967295 - (sk & 4294967295)
-    return key, flat // C, flat % C
+def _unpack(sort_keys, codebook_size):
+    key = (sort_keys >> 32).to(tl.int32).to(tl.uint32, bitcast=True) ^ 0x80000000
+    flat = 4294967295 - (sort_keys & 4294967295)
+    return key, flat // codebook_size, flat % codebook_size
 
 
 @triton.jit
@@ -188,18 +198,20 @@ def _num_rows(width, DEPTH: tl.constexpr):
 
 
 @triton.jit
-def _row_base(lead, start, rows, leader, tail, s_lead, s_tail):
+def _row_base(lead, start, rows, leader, tail, leader_stride, tail_stride):
     return tl.where(
-        rows == 0, leader + lead * s_lead, tail + (start + rows - 1) * s_tail
+        rows == 0,
+        leader + lead * leader_stride,
+        tail + (start + rows - 1) * tail_stride,
     )
 
 
 @triton.jit
-def _prefix_flat(row0, rows, live, C, prefix, DEPTH: tl.constexpr):
+def _prefix_flat(row0, rows, live, codebook_size, prefix, DEPTH: tl.constexpr):
     flat = tl.zeros_like(rows)
     for i in tl.static_range(DEPTH):
         code = tl.load(prefix + (row0 + rows) * DEPTH + i, mask=live, other=0)
-        flat = flat * C + code
+        flat = flat * codebook_size + code
     return flat
 
 
@@ -209,15 +221,15 @@ def _tile_keys(
     g,
     rows,
     codes,
-    C,
+    codebook_size,
     leader_logits,
     tail_logits,
     leader_norm,
     tail_norm,
-    s_ll,
-    s_tl,
-    s_ln,
-    s_tn,
+    leader_logits_stride,
+    tail_logits_stride,
+    leader_norm_stride,
+    tail_norm_stride,
     cum,
     prefix,
     masks,
@@ -226,37 +238,59 @@ def _tile_keys(
     """Keys [rows, codes] (0 never competes), the in-bounds mask and each row's fallback."""
     lead, start = _field(desc, g, _LEADER), _field(desc, g, _TAIL)
     row0, width = _field(desc, g, _ROW), _field(desc, g, _WIDTH)
-    in_r = rows < _num_rows(width, DEPTH)
-    inb = in_r & (codes < C)
-    lp = _row_base(lead, start, rows, leader_logits, tail_logits, s_ll, s_tl)
-    logit = tl.load(lp + codes, mask=inb, other=0.0).to(tl.float32)
-    npr = _row_base(lead, start, rows, leader_norm, tail_norm, s_ln, s_tn)
-    row_max = tl.load(npr, mask=in_r, other=0.0).to(tl.float32)
-    row_lse = tl.load(npr + 1, mask=in_r, other=0.0).to(tl.float32)
-    cum_r = tl.load(cum + row0 + rows, mask=in_r, other=0.0)
-    flat = _prefix_flat(row0, rows, in_r, C, prefix, DEPTH)
-    valid = (tl.load(masks + flat * C + codes, mask=inb, other=0) != 0) & inb
+    in_rows = rows < _num_rows(width, DEPTH)
+    in_bounds = in_rows & (codes < codebook_size)
+    logits_ptr = _row_base(
+        lead,
+        start,
+        rows,
+        leader_logits,
+        tail_logits,
+        leader_logits_stride,
+        tail_logits_stride,
+    )
+    logit = tl.load(logits_ptr + codes, mask=in_bounds, other=0.0).to(tl.float32)
+    norm_ptr = _row_base(
+        lead, start, rows, leader_norm, tail_norm, leader_norm_stride, tail_norm_stride
+    )
+    row_max = tl.load(norm_ptr, mask=in_rows, other=0.0).to(tl.float32)
+    row_lse = tl.load(norm_ptr + 1, mask=in_rows, other=0.0).to(tl.float32)
+    cum_r = tl.load(cum + row0 + rows, mask=in_rows, other=0.0)
+    flat = _prefix_flat(row0, rows, in_rows, codebook_size, prefix, DEPTH)
+    valid = (
+        tl.load(masks + flat * codebook_size + codes, mask=in_bounds, other=0) != 0
+    ) & in_bounds
     num_valid = tl.sum(valid.to(tl.int32), axis=1, keep_dims=True)
-    dead = (inb & ~valid).to(tl.int32)
+    dead = (in_bounds & ~valid).to(tl.int32)
     # int32 keeps the comparison below on the tile's int32 counts.
-    row_slots = tl.minimum(width, C).to(tl.int32)
+    row_slots = tl.minimum(width, codebook_size).to(tl.int32)
     competes = (dead != 0) & ((tl.cumsum(dead, axis=1) - dead) < row_slots - num_valid)
-    first = tl.min(tl.where(valid, codes, C), axis=1, keep_dims=True)
+    first = tl.min(tl.where(valid, codes, codebook_size), axis=1, keep_dims=True)
     fallback = tl.where(num_valid > 0, first, 0)
     score = cum_r + ((logit - row_max) - row_lse)
     dead_key = tl.where(competes, 0x007FFFFF, 0).to(tl.uint32)
-    return tl.where(valid, _score_key(score), dead_key), inb, fallback
+    return tl.where(valid, _score_key(score), dead_key), in_bounds, fallback
 
 
 @triton.jit
 def _copy_old_kv(
-    desc, g, rows, live, old_kv, req_to_token, kv_rows, s_rt, L: tl.constexpr
+    desc,
+    g,
+    rows,
+    live,
+    old_kv,
+    req_to_token,
+    kv_rows,
+    req_to_token_stride,
+    KV_LEN: tl.constexpr,
 ):
     row0, base = _field(desc, g, _ROW), _field(desc, g, _KV)
     slot_row = tl.load(kv_rows + row0 + rows, mask=live, other=0)
-    for i in tl.static_range(L):
-        slot = tl.load(req_to_token + slot_row * s_rt + base + i, mask=live, other=0)
-        tl.store(old_kv + (row0 + rows) * L + i, slot, mask=live)
+    for i in tl.static_range(KV_LEN):
+        slot = tl.load(
+            req_to_token + slot_row * req_to_token_stride + base + i, mask=live, other=0
+        )
+        tl.store(old_kv + (row0 + rows) * KV_LEN + i, slot, mask=live)
 
 
 @triton.jit
@@ -264,9 +298,9 @@ def _write(
     desc,
     g,
     pos,
-    sk,
+    sort_keys,
     live,
-    C,
+    codebook_size,
     token_start,
     prefix,
     masks,
@@ -279,18 +313,20 @@ def _write(
     new_kv,
     req_to_token,
     kv_rows,
-    s_rt,
+    req_to_token_stride,
     DEPTH: tl.constexpr,
     FINAL: tl.constexpr,
-    L: tl.constexpr,
+    KV_LEN: tl.constexpr,
 ):
     row0, out0 = _field(desc, g, _ROW), _field(desc, g, _OUT)
-    key, row, code = _unpack(sk, C)
+    key, row, code = _unpack(sort_keys, codebook_size)
     # A finite score means an allowed code; only a -inf one can be a forbidden code,
     # which carries its row's fallback code.
-    neg = live & (key == 0x007FFFFF)
-    flat = _prefix_flat(row0, row, neg, C, prefix, DEPTH)
-    forbidden = neg & (tl.load(masks + flat * C + code, mask=neg, other=1) == 0)
+    neg_inf = live & (key == 0x007FFFFF)
+    flat = _prefix_flat(row0, row, neg_inf, codebook_size, prefix, DEPTH)
+    forbidden = neg_inf & (
+        tl.load(masks + flat * codebook_size + code, mask=neg_inf, other=1) == 0
+    )
     code = tl.where(
         forbidden, tl.load(fallback + row0 + row, mask=forbidden, other=0), code
     )
@@ -303,14 +339,18 @@ def _write(
             parent_code = tl.load(prefix + (row0 + row) * DEPTH + i, mask=live, other=0)
             tl.store(out_prefix + out * (DEPTH + 1) + i, parent_code, mask=live)
         tl.store(out_prefix + out * (DEPTH + 1) + DEPTH, code, mask=live)
-    if L > 0:
+    if KV_LEN > 0:
         # A remapping step has one frontier row per beam, so beam `pos` owns row `pos`.
         base = _field(desc, g, _KV)
         slot_row = tl.load(kv_rows + row0 + pos, mask=live, other=0)
-        for i in tl.static_range(L):
-            slot = tl.load(old_kv + (row0 + row) * L + i, mask=live, other=0)
-            tl.store(new_kv + out * L + i, slot, mask=live)
-            tl.store(req_to_token + slot_row * s_rt + base + i, slot, mask=live)
+        for i in tl.static_range(KV_LEN):
+            slot = tl.load(old_kv + (row0 + row) * KV_LEN + i, mask=live, other=0)
+            tl.store(new_kv + out * KV_LEN + i, slot, mask=live)
+            tl.store(
+                req_to_token + slot_row * req_to_token_stride + base + i,
+                slot,
+                mask=live,
+            )
 
 
 @triton.jit(do_not_specialize=_INTEGERS, do_not_specialize_on_alignment=_POINTERS)
@@ -320,10 +360,10 @@ def _select_small_kernel(
     leader_norm,
     tail_norm,
     desc,
-    s_ll,
-    s_tl,
-    s_ln,
-    s_tn,
+    leader_logits_stride,
+    tail_logits_stride,
+    leader_norm_stride,
+    tail_norm_stride,
     cum,
     prefix,
     masks,
@@ -337,16 +377,16 @@ def _select_small_kernel(
     new_kv,
     req_to_token,
     kv_rows,
-    s_rt,
-    C,
+    req_to_token_stride,
+    codebook_size,
     token_start,
     DEPTH: tl.constexpr,
     FINAL: tl.constexpr,
-    L: tl.constexpr,
-    RB: tl.constexpr,
-    CB: tl.constexpr,
-    SB: tl.constexpr,
-    PB: tl.constexpr,
+    KV_LEN: tl.constexpr,
+    ROW_BLOCK: tl.constexpr,
+    CODE_BLOCK: tl.constexpr,
+    SORT_BLOCK: tl.constexpr,
+    PAD_BLOCK: tl.constexpr,
     BINS: tl.constexpr,
 ):
     g = tl.program_id(0).to(tl.int64)
@@ -356,67 +396,86 @@ def _select_small_kernel(
         _field(desc, g, _WIDTH),
     )
     num_rows = _num_rows(width, DEPTH)
-    target = tl.minimum(width, num_rows * C).to(tl.int32)
-    rows = tl.arange(0, RB).to(tl.int64)[:, None]
-    codes = tl.arange(0, CB).to(tl.int64)[None, :]
-    key, inb, fb = _tile_keys(
+    target = tl.minimum(width, num_rows * codebook_size).to(tl.int32)
+    rows = tl.arange(0, ROW_BLOCK).to(tl.int64)[:, None]
+    codes = tl.arange(0, CODE_BLOCK).to(tl.int64)[None, :]
+    key, in_bounds, row_fallback = _tile_keys(
         desc,
         g,
         rows,
         codes,
-        C,
+        codebook_size,
         leader_logits,
         tail_logits,
         leader_norm,
         tail_norm,
-        s_ll,
-        s_tl,
-        s_ln,
-        s_tn,
+        leader_logits_stride,
+        tail_logits_stride,
+        leader_norm_stride,
+        tail_norm_stride,
         cum,
         prefix,
         masks,
         DEPTH,
     )
-    rows1 = tl.arange(0, RB).to(tl.int64)
-    tl.store(fallback + row0 + rows1, tl.reshape(fb, [RB]), mask=rows1 < num_rows)
-    if L > 0:
+    rows1 = tl.arange(0, ROW_BLOCK).to(tl.int64)
+    tl.store(
+        fallback + row0 + rows1,
+        tl.reshape(row_fallback, [ROW_BLOCK]),
+        mask=rows1 < num_rows,
+    )
+    if KV_LEN > 0:
         _copy_old_kv(
-            desc, g, rows1, rows1 < num_rows, old_kv, req_to_token, kv_rows, s_rt, L
+            desc,
+            g,
+            rows1,
+            rows1 < num_rows,
+            old_kv,
+            req_to_token,
+            kv_rows,
+            req_to_token_stride,
+            KV_LEN,
         )
 
-    k = tl.reshape(key, [RB * CB])
-    live = tl.reshape(inb, [RB * CB])
-    flat = tl.reshape(rows * C + codes, [RB * CB])
-    d1 = (k >> 21).to(tl.int32)
-    b1, a1 = _pick(tl.histogram(d1, BINS, mask=live), target, BINS)
-    in1 = live & (d1 == b1)
-    d2 = ((k >> 10) & 0x7FF).to(tl.int32)
-    b2, a2 = _pick(tl.histogram(d2, BINS, mask=in1), target - a1, BINS)
-    in2 = in1 & (d2 == b2)
-    d3 = (k & 0x3FF).to(tl.int32)
-    b3, a3 = _pick(tl.histogram(d3, BINS, mask=in2), target - a1 - a2, BINS)
-    thresh = (b1.to(tl.uint32) << 21) | (b2.to(tl.uint32) << 10) | b3.to(tl.uint32)
+    k = tl.reshape(key, [ROW_BLOCK * CODE_BLOCK])
+    live = tl.reshape(in_bounds, [ROW_BLOCK * CODE_BLOCK])
+    flat = tl.reshape(rows * codebook_size + codes, [ROW_BLOCK * CODE_BLOCK])
+    digit1 = (k >> 21).to(tl.int32)
+    bin1, above1 = _pick(tl.histogram(digit1, BINS, mask=live), target, BINS)
+    in1 = live & (digit1 == bin1)
+    digit2 = ((k >> 10) & 0x7FF).to(tl.int32)
+    bin2, above2 = _pick(tl.histogram(digit2, BINS, mask=in1), target - above1, BINS)
+    in2 = in1 & (digit2 == bin2)
+    digit3 = (k & 0x3FF).to(tl.int32)
+    bin3, above3 = _pick(
+        tl.histogram(digit3, BINS, mask=in2), target - above1 - above2, BINS
+    )
+    thresh = (
+        (bin1.to(tl.uint32) << 21) | (bin2.to(tl.uint32) << 10) | bin3.to(tl.uint32)
+    )
     tie = (live & (k == thresh)).to(tl.int32)
     chosen = live & (
         (k > thresh)
-        | ((tie != 0) & (tl.cumsum(tie, axis=0) - tie < target - a1 - a2 - a3))
+        | (
+            (tie != 0)
+            & (tl.cumsum(tie, axis=0) - tie < target - above1 - above2 - above3)
+        )
     )
     chosen_i = chosen.to(tl.int32)
     pos = tl.cumsum(chosen_i, axis=0) - chosen_i
-    tl.store(scratch + g * SB + pos, _sort_key(k, flat), mask=chosen)
+    tl.store(scratch + g * SORT_BLOCK + pos, _sort_key(k, flat), mask=chosen)
     tl.debug_barrier()
 
-    j = tl.arange(0, SB)
-    sk = tl.load(scratch + g * SB + j, mask=j < target, other=_INT64_MIN)
-    sk = tl.sort(sk, descending=True)
+    j = tl.arange(0, SORT_BLOCK)
+    sort_keys = tl.load(scratch + g * SORT_BLOCK + j, mask=j < target, other=_INT64_MIN)
+    sort_keys = tl.sort(sort_keys, descending=True)
     _write(
         desc,
         g,
         j,
-        sk,
+        sort_keys,
         j < target,
-        C,
+        codebook_size,
         token_start,
         prefix,
         masks,
@@ -429,30 +488,34 @@ def _select_small_kernel(
         new_kv,
         req_to_token,
         kv_rows,
-        s_rt,
+        req_to_token_stride,
         DEPTH,
         FINAL,
-        L,
+        KV_LEN,
     )
     if DEPTH == 0:
         if target < width:
             # The torch path pads a one-row frontier with -inf copies of its best token.
             tl.debug_barrier()
             best = tl.load(out_tokens + out0)
-            for start in range(target, width, PB):
-                p = start + tl.arange(0, PB)
+            for start in range(target, width, PAD_BLOCK):
+                p = start + tl.arange(0, PAD_BLOCK)
                 pad = p < width
                 tl.store(
-                    out_tokens + out0 + p, best + tl.zeros([PB], tl.int64), mask=pad
+                    out_tokens + out0 + p,
+                    best + tl.zeros([PAD_BLOCK], tl.int64),
+                    mask=pad,
                 )
-                tl.store(out_parents + out0 + p, tl.zeros([PB], tl.int64), mask=pad)
+                tl.store(
+                    out_parents + out0 + p, tl.zeros([PAD_BLOCK], tl.int64), mask=pad
+                )
                 tl.store(
                     out_scores + out0 + p,
-                    tl.full([PB], float("-inf"), tl.float32),
+                    tl.full([PAD_BLOCK], float("-inf"), tl.float32),
                     mask=pad,
                 )
                 if not FINAL:
-                    code = best - token_start + tl.zeros([PB], tl.int64)
+                    code = best - token_start + tl.zeros([PAD_BLOCK], tl.int64)
                     tl.store(out_prefix + out0 + p, code, mask=pad)
 
 
@@ -473,10 +536,10 @@ def _keys_kernel(
     leader_norm,
     tail_norm,
     desc,
-    s_ll,
-    s_tl,
-    s_ln,
-    s_tn,
+    leader_logits_stride,
+    tail_logits_stride,
+    leader_norm_stride,
+    tail_norm_stride,
     cum,
     prefix,
     masks,
@@ -487,85 +550,114 @@ def _keys_kernel(
     old_kv,
     req_to_token,
     kv_rows,
-    s_rt,
-    C,
+    req_to_token_stride,
+    codebook_size,
     DEPTH: tl.constexpr,
-    L: tl.constexpr,
-    TR: tl.constexpr,
-    CB: tl.constexpr,
+    KV_LEN: tl.constexpr,
+    TILE_ROWS: tl.constexpr,
+    CODE_BLOCK: tl.constexpr,
     BINS: tl.constexpr,
 ):
     # Programs past a narrower group's rows only take their ticket.
     g = tl.program_id(0).to(tl.int64)
     row0, width = _field(desc, g, _ROW), _field(desc, g, _WIDTH)
-    rows1 = tl.program_id(1).to(tl.int64) * TR + tl.arange(0, TR).to(tl.int64)
+    rows1 = tl.program_id(1).to(tl.int64) * TILE_ROWS + tl.arange(0, TILE_ROWS).to(
+        tl.int64
+    )
     rows = rows1[:, None]
-    codes = tl.arange(0, CB).to(tl.int64)[None, :]
-    key, inb, fb = _tile_keys(
+    codes = tl.arange(0, CODE_BLOCK).to(tl.int64)[None, :]
+    key, in_bounds, row_fallback = _tile_keys(
         desc,
         g,
         rows,
         codes,
-        C,
+        codebook_size,
         leader_logits,
         tail_logits,
         leader_norm,
         tail_norm,
-        s_ll,
-        s_tl,
-        s_ln,
-        s_tn,
+        leader_logits_stride,
+        tail_logits_stride,
+        leader_norm_stride,
+        tail_norm_stride,
         cum,
         prefix,
         masks,
         DEPTH,
     )
-    in_r = rows1 < width
-    tl.store(keys + (row0 + rows) * C + codes, key.to(tl.int32, bitcast=True), mask=inb)
-    tl.store(fallback + row0 + rows1, tl.reshape(fb, [TR]), mask=in_r)
-    if L > 0:
-        _copy_old_kv(desc, g, rows1, in_r, old_kv, req_to_token, kv_rows, s_rt, L)
+    in_rows = rows1 < width
+    tl.store(
+        keys + (row0 + rows) * codebook_size + codes,
+        key.to(tl.int32, bitcast=True),
+        mask=in_bounds,
+    )
+    tl.store(
+        fallback + row0 + rows1, tl.reshape(row_fallback, [TILE_ROWS]), mask=in_rows
+    )
+    if KV_LEN > 0:
+        _copy_old_kv(
+            desc,
+            g,
+            rows1,
+            in_rows,
+            old_kv,
+            req_to_token,
+            kv_rows,
+            req_to_token_stride,
+            KV_LEN,
+        )
     hist = tl.histogram(
-        tl.reshape((key >> 21).to(tl.int32), [TR * CB]),
+        tl.reshape((key >> 21).to(tl.int32), [TILE_ROWS * CODE_BLOCK]),
         BINS,
-        mask=tl.reshape(inb, [TR * CB]),
+        mask=tl.reshape(in_bounds, [TILE_ROWS * CODE_BLOCK]),
     )
     bins = tl.arange(0, BINS)
     tl.atomic_add(hist1 + g * BINS + bins, hist, mask=hist > 0, sem="relaxed")
     if _last_program(meta, g, _KEYS_DONE):
-        b1, above = _pick(
+        bin1, above = _pick(
             tl.load(hist1 + g * BINS + bins, volatile=True), width.to(tl.int32), BINS
         )
-        tl.store(meta + g * _META + _DIGIT1, b1)
+        tl.store(meta + g * _META + _DIGIT1, bin1)
         tl.store(meta + g * _META + _ABOVE1, above)
 
 
 @triton.jit(do_not_specialize=_INTEGERS, do_not_specialize_on_alignment=_POINTERS)
-def _hist2_kernel(keys, hist2, meta, desc, C, TILE: tl.constexpr, BINS: tl.constexpr):
+def _hist2_kernel(
+    keys, hist2, meta, desc, codebook_size, TILE: tl.constexpr, BINS: tl.constexpr
+):
     g = tl.program_id(0).to(tl.int64)
     row0, width = _field(desc, g, _ROW), _field(desc, g, _WIDTH)
-    b1 = tl.load(meta + g * _META + _DIGIT1)
+    bin1 = tl.load(meta + g * _META + _DIGIT1)
     idx = tl.program_id(1).to(tl.int64) * TILE + tl.arange(0, TILE)
-    live = idx < width * C
-    k = tl.load(keys + row0 * C + idx, mask=live, other=0).to(tl.uint32, bitcast=True)
-    inb = live & ((k >> 21).to(tl.int32) == b1)
-    hist = tl.histogram(((k >> 10) & 0x7FF).to(tl.int32), BINS, mask=inb)
+    live = idx < width * codebook_size
+    k = tl.load(keys + row0 * codebook_size + idx, mask=live, other=0).to(
+        tl.uint32, bitcast=True
+    )
+    in_bounds = live & ((k >> 21).to(tl.int32) == bin1)
+    hist = tl.histogram(((k >> 10) & 0x7FF).to(tl.int32), BINS, mask=in_bounds)
     bins = tl.arange(0, BINS)
     tl.atomic_add(hist2 + g * BINS + bins, hist, mask=hist > 0, sem="relaxed")
     if _last_program(meta, g, _HIST2_DONE):
         above1 = tl.load(meta + g * _META + _ABOVE1)
-        b2, above = _pick(
+        bin2, above = _pick(
             tl.load(hist2 + g * BINS + bins, volatile=True),
             width.to(tl.int32) - above1,
             BINS,
         )
-        tl.store(meta + g * _META + _PREFIX22, (b1 << 11) | b2)
+        tl.store(meta + g * _META + _PREFIX22, (bin1 << 11) | bin2)
         tl.store(meta + g * _META + _ABOVE2, above1 + above)
 
 
 @triton.jit(do_not_specialize=_INTEGERS, do_not_specialize_on_alignment=_POINTERS)
 def _collect_kernel(
-    keys, meta, sure, bucket, desc, C, TILE: tl.constexpr, BK: tl.constexpr
+    keys,
+    meta,
+    sure,
+    bucket,
+    desc,
+    codebook_size,
+    TILE: tl.constexpr,
+    BUCKET_KEYS: tl.constexpr,
 ):
     g = tl.program_id(0).to(tl.int64)
     row0, out0, width = (
@@ -575,22 +667,30 @@ def _collect_kernel(
     )
     prefix22 = tl.load(meta + g * _META + _PREFIX22).to(tl.uint32)
     idx = tl.program_id(1).to(tl.int64) * TILE + tl.arange(0, TILE)
-    live = idx < width * C
-    k = tl.load(keys + row0 * C + idx, mask=live, other=0).to(tl.uint32, bitcast=True)
-    sk = _sort_key(k, idx)
+    live = idx < width * codebook_size
+    k = tl.load(keys + row0 * codebook_size + idx, mask=live, other=0).to(
+        tl.uint32, bitcast=True
+    )
+    sort_keys = _sort_key(k, idx)
     above = (live & ((k >> 10) > prefix22)).to(tl.int32)
     n_above = tl.sum(above, axis=0)
     if n_above > 0:
         base = tl.atomic_add(meta + g * _META + _SURE, n_above, sem="relaxed")
         tl.store(
-            sure + out0 + base + tl.cumsum(above, axis=0) - above, sk, mask=above != 0
+            sure + out0 + base + tl.cumsum(above, axis=0) - above,
+            sort_keys,
+            mask=above != 0,
         )
     inside = (live & ((k >> 10) == prefix22)).to(tl.int32)
     n_inside = tl.sum(inside, axis=0)
     if n_inside > 0:
         base = tl.atomic_add(meta + g * _META + _BUCKET, n_inside, sem="relaxed")
         pos = base + tl.cumsum(inside, axis=0) - inside
-        tl.store(bucket + g * BK + pos, sk, mask=(inside != 0) & (pos < BK))
+        tl.store(
+            bucket + g * BUCKET_KEYS + pos,
+            sort_keys,
+            mask=(inside != 0) & (pos < BUCKET_KEYS),
+        )
 
 
 @triton.jit
@@ -601,7 +701,7 @@ def _rank_and_write(
     n,
     src,
     out_base,
-    C,
+    codebook_size,
     token_start,
     prefix,
     masks,
@@ -614,29 +714,31 @@ def _rank_and_write(
     new_kv,
     req_to_token,
     kv_rows,
-    s_rt,
+    req_to_token_stride,
     DEPTH: tl.constexpr,
     FINAL: tl.constexpr,
-    L: tl.constexpr,
-    SL: tl.constexpr,
-    CH: tl.constexpr,
+    KV_LEN: tl.constexpr,
+    RANK_SLICE: tl.constexpr,
+    RANK_CHUNK: tl.constexpr,
 ):
-    """Writes src[start : start + SL] at out_base + its rank among src[:n] (keys unique)."""
-    i = start + tl.arange(0, SL)
+    """Writes src[start : start + RANK_SLICE] at out_base + its rank among src[:n] (keys unique)."""
+    i = start + tl.arange(0, RANK_SLICE)
     live = i < n
-    ski = tl.load(src + i, mask=live, other=_INT64_MIN)
-    rank = tl.zeros([SL], tl.int32)
-    for c0 in range(0, n, CH):
-        j = c0 + tl.arange(0, CH)
-        skj = tl.load(src + j, mask=j < n, other=_INT64_MIN)
-        rank += tl.sum((skj[None, :] > ski[:, None]).to(tl.int32), axis=1)
+    sort_keys_i = tl.load(src + i, mask=live, other=_INT64_MIN)
+    rank = tl.zeros([RANK_SLICE], tl.int32)
+    for c0 in range(0, n, RANK_CHUNK):
+        j = c0 + tl.arange(0, RANK_CHUNK)
+        sort_keys_j = tl.load(src + j, mask=j < n, other=_INT64_MIN)
+        rank += tl.sum(
+            (sort_keys_j[None, :] > sort_keys_i[:, None]).to(tl.int32), axis=1
+        )
     _write(
         desc,
         g,
         out_base + rank,
-        ski,
+        sort_keys_i,
         live,
-        C,
+        codebook_size,
         token_start,
         prefix,
         masks,
@@ -649,10 +751,10 @@ def _rank_and_write(
         new_kv,
         req_to_token,
         kv_rows,
-        s_rt,
+        req_to_token_stride,
         DEPTH,
         FINAL,
-        L,
+        KV_LEN,
     )
 
 
@@ -664,7 +766,7 @@ def _finalize_kernel(
     bucket,
     spill,
     desc,
-    C,
+    codebook_size,
     token_start,
     prefix,
     masks,
@@ -677,15 +779,15 @@ def _finalize_kernel(
     new_kv,
     req_to_token,
     kv_rows,
-    s_rt,
+    req_to_token_stride,
     DEPTH: tl.constexpr,
     FINAL: tl.constexpr,
-    L: tl.constexpr,
+    KV_LEN: tl.constexpr,
     TILE: tl.constexpr,
     BINS: tl.constexpr,
-    BK: tl.constexpr,
-    SL: tl.constexpr,
-    CH: tl.constexpr,
+    BUCKET_KEYS: tl.constexpr,
+    RANK_SLICE: tl.constexpr,
+    RANK_CHUNK: tl.constexpr,
 ):
     # Programs [0, n) rank slices of the entries above the threshold bucket, which take
     # the first output positions; the last program takes the bucket's winners after them.
@@ -694,15 +796,15 @@ def _finalize_kernel(
     pid = tl.program_id(1)
     n_sure = tl.load(meta + g * _META + _SURE)
     if pid < tl.num_programs(1) - 1:
-        if pid * SL < n_sure:
+        if pid * RANK_SLICE < n_sure:
             _rank_and_write(
                 desc,
                 g,
-                pid * SL,
+                pid * RANK_SLICE,
                 n_sure,
                 sure + out0,
                 0,
-                C,
+                codebook_size,
                 token_start,
                 prefix,
                 masks,
@@ -715,27 +817,29 @@ def _finalize_kernel(
                 new_kv,
                 req_to_token,
                 kv_rows,
-                s_rt,
+                req_to_token_stride,
                 DEPTH,
                 FINAL,
-                L,
-                SL,
-                CH,
+                KV_LEN,
+                RANK_SLICE,
+                RANK_CHUNK,
             )
     else:
         need = width.to(tl.int32) - n_sure
         n_bucket = tl.load(meta + g * _META + _BUCKET)
-        if n_bucket <= BK:
-            j = tl.arange(0, BK)
-            sk = tl.load(bucket + g * BK + j, mask=j < n_bucket, other=_INT64_MIN)
-            sk = tl.sort(sk, descending=True)
+        if n_bucket <= BUCKET_KEYS:
+            j = tl.arange(0, BUCKET_KEYS)
+            sort_keys = tl.load(
+                bucket + g * BUCKET_KEYS + j, mask=j < n_bucket, other=_INT64_MIN
+            )
+            sort_keys = tl.sort(sort_keys, descending=True)
             _write(
                 desc,
                 g,
                 n_sure + j,
-                sk,
+                sort_keys,
                 j < need,
-                C,
+                codebook_size,
                 token_start,
                 prefix,
                 masks,
@@ -748,10 +852,10 @@ def _finalize_kernel(
                 new_kv,
                 req_to_token,
                 kv_rows,
-                s_rt,
+                req_to_token_stride,
                 DEPTH,
                 FINAL,
-                L,
+                KV_LEN,
             )
         else:
             _bucket_slow_path(
@@ -762,7 +866,7 @@ def _finalize_kernel(
                 spill,
                 n_sure,
                 need,
-                C,
+                codebook_size,
                 token_start,
                 prefix,
                 masks,
@@ -775,14 +879,14 @@ def _finalize_kernel(
                 new_kv,
                 req_to_token,
                 kv_rows,
-                s_rt,
+                req_to_token_stride,
                 DEPTH,
                 FINAL,
-                L,
+                KV_LEN,
                 TILE,
                 BINS,
-                SL,
-                CH,
+                RANK_SLICE,
+                RANK_CHUNK,
             )
 
 
@@ -795,7 +899,7 @@ def _bucket_slow_path(
     spill,
     n_sure,
     need,
-    C,
+    codebook_size,
     token_start,
     prefix,
     masks,
@@ -808,14 +912,14 @@ def _bucket_slow_path(
     new_kv,
     req_to_token,
     kv_rows,
-    s_rt,
+    req_to_token_stride,
     DEPTH: tl.constexpr,
     FINAL: tl.constexpr,
-    L: tl.constexpr,
+    KV_LEN: tl.constexpr,
     TILE: tl.constexpr,
     BINS: tl.constexpr,
-    SL: tl.constexpr,
-    CH: tl.constexpr,
+    RANK_SLICE: tl.constexpr,
+    RANK_CHUNK: tl.constexpr,
 ):
     # The bucket overflowed (ties at the threshold, or many dead candidates): one program
     # rescans the group's keys for the last digit, then takes ties in flat-index order.
@@ -824,40 +928,42 @@ def _bucket_slow_path(
         _field(desc, g, _OUT),
         _field(desc, g, _WIDTH),
     )
-    total = width * C
+    total = width * codebook_size
     prefix22 = tl.load(meta + g * _META + _PREFIX22).to(tl.uint32)
     hist = tl.zeros([BINS], tl.int32)
     for start in range(0, total, TILE):
         idx = start + tl.arange(0, TILE)
         live = idx < total
-        k = tl.load(keys + row0 * C + idx, mask=live, other=0).to(
+        k = tl.load(keys + row0 * codebook_size + idx, mask=live, other=0).to(
             tl.uint32, bitcast=True
         )
         hist += tl.histogram(
             (k & 0x3FF).to(tl.int32), BINS, mask=live & ((k >> 10) == prefix22)
         )
-    b3, n_above = _pick(hist, need, BINS)
-    thresh = (prefix22 << 10) | b3.to(tl.uint32)
+    bin3, n_above = _pick(hist, need, BINS)
+    thresh = (prefix22 << 10) | bin3.to(tl.uint32)
     n_gt = 0
     n_tie = 0
     for start in range(0, total, TILE):
         idx = start + tl.arange(0, TILE)
         live = idx < total
-        k = tl.load(keys + row0 * C + idx, mask=live, other=0).to(
+        k = tl.load(keys + row0 * codebook_size + idx, mask=live, other=0).to(
             tl.uint32, bitcast=True
         )
-        sk = _sort_key(k, idx)
+        sort_keys = _sort_key(k, idx)
         gt = (live & ((k >> 10) == prefix22) & (k > thresh)).to(tl.int32)
-        tl.store(spill + out0 + n_gt + tl.cumsum(gt, axis=0) - gt, sk, mask=gt != 0)
+        tl.store(
+            spill + out0 + n_gt + tl.cumsum(gt, axis=0) - gt, sort_keys, mask=gt != 0
+        )
         tie = (live & (k == thresh)).to(tl.int32)
         tie_rank = n_tie + tl.cumsum(tie, axis=0) - tie
         _write(
             desc,
             g,
             n_sure + n_above + tie_rank,
-            sk,
+            sort_keys,
             (tie != 0) & (tie_rank < need - n_above),
-            C,
+            codebook_size,
             token_start,
             prefix,
             masks,
@@ -870,15 +976,15 @@ def _bucket_slow_path(
             new_kv,
             req_to_token,
             kv_rows,
-            s_rt,
+            req_to_token_stride,
             DEPTH,
             FINAL,
-            L,
+            KV_LEN,
         )
         n_gt += tl.sum(gt, axis=0)
         n_tie += tl.sum(tie, axis=0)
     tl.debug_barrier()
-    for start in range(0, n_above, SL):
+    for start in range(0, n_above, RANK_SLICE):
         _rank_and_write(
             desc,
             g,
@@ -886,7 +992,7 @@ def _bucket_slow_path(
             n_above,
             spill + out0,
             n_sure,
-            C,
+            codebook_size,
             token_start,
             prefix,
             masks,
@@ -899,12 +1005,12 @@ def _bucket_slow_path(
             new_kv,
             req_to_token,
             kv_rows,
-            s_rt,
+            req_to_token_stride,
             DEPTH,
             FINAL,
-            L,
-            SL,
-            CH,
+            KV_LEN,
+            RANK_SLICE,
+            RANK_CHUNK,
         )
 
 
@@ -928,22 +1034,26 @@ def _declared(kernel, args: dict) -> dict:
     return {name: args[name] for name in kernel.arg_names if name in args}
 
 
-def _launch_small(args: dict, desc: torch.Tensor, *, constants: dict, cb: int) -> None:
+def _launch_small(
+    args: dict, desc: torch.Tensor, *, constants: dict, code_block: int
+) -> None:
     """One program per group: the groups whose candidates fit one program's registers."""
-    small_rows = max(1, _SMALL_KEYS // cb)
+    small_rows = max(1, _SMALL_KEYS // code_block)
     # One sort covers a first step's codebook and a later step's beams.
-    sb = max(cb, small_rows)
+    sort_block = max(code_block, small_rows)
     num_groups = desc.shape[0]
-    scratch = torch.empty((num_groups, sb), dtype=torch.int64, device=desc.device)
+    scratch = torch.empty(
+        (num_groups, sort_block), dtype=torch.int64, device=desc.device
+    )
     _select_small_kernel[(num_groups,)](
         **args,
         desc=desc,
         scratch=scratch,
         **constants,
-        RB=small_rows,
-        CB=cb,
-        SB=sb,
-        PB=_PAD_BLOCK,
+        ROW_BLOCK=small_rows,
+        CODE_BLOCK=code_block,
+        SORT_BLOCK=sort_block,
+        PAD_BLOCK=_PAD_BLOCK,
         BINS=_BINS,
         num_warps=8,
     )
@@ -954,7 +1064,7 @@ def _launch_large(
     desc: torch.Tensor,
     *,
     constants: dict,
-    cb: int,
+    code_block: int,
     widest: int,
     total_rows: int,
     total_width: int,
@@ -962,7 +1072,7 @@ def _launch_large(
     """Four launches over many programs per group; `widest` sizes the grids, and a
     narrower group's spare programs return at once."""
     num_groups, device = desc.shape[0], desc.device
-    size = args["C"]
+    size = args["codebook_size"]
     work = torch.zeros(
         num_groups * (2 * _BINS + _META.value), dtype=torch.int32, device=device
     )
@@ -973,7 +1083,7 @@ def _launch_large(
     sure = torch.empty(total_width, dtype=torch.int64, device=device)
     bucket = torch.empty((num_groups, _BUCKET_KEYS), dtype=torch.int64, device=device)
     spill = torch.empty(total_width, dtype=torch.int64, device=device)
-    tile_rows = max(1, _TILE_KEYS // cb)
+    tile_rows = max(1, _TILE_KEYS // code_block)
     tiles = triton.cdiv(widest * size, _TILE_KEYS)
     work_args = dict(
         args,
@@ -981,6 +1091,7 @@ def _launch_large(
         desc=desc,
         keys=keys,
         hist1=hist1,
+        hist2=hist2,
         meta=meta,
         sure=sure,
         bucket=bucket,
@@ -988,32 +1099,30 @@ def _launch_large(
     )
     _keys_kernel[(num_groups, triton.cdiv(widest, tile_rows))](
         **_declared(_keys_kernel, work_args),
-        TR=tile_rows,
-        CB=cb,
+        TILE_ROWS=tile_rows,
+        CODE_BLOCK=code_block,
         BINS=_BINS,
         num_warps=8,
     )
     _hist2_kernel[(num_groups, tiles)](
-        keys, hist2, meta, desc, size, TILE=_TILE_KEYS, BINS=_BINS, num_warps=8
+        **_declared(_hist2_kernel, work_args),
+        TILE=_TILE_KEYS,
+        BINS=_BINS,
+        num_warps=8,
     )
     _collect_kernel[(num_groups, tiles)](
-        keys,
-        meta,
-        sure,
-        bucket,
-        desc,
-        size,
+        **_declared(_collect_kernel, work_args),
         TILE=_TILE_KEYS,
-        BK=_BUCKET_KEYS,
+        BUCKET_KEYS=_BUCKET_KEYS,
         num_warps=8,
     )
     _finalize_kernel[(num_groups, triton.cdiv(widest, _RANK_SLICE) + 1)](
         **_declared(_finalize_kernel, work_args),
         TILE=_TILE_KEYS,
         BINS=_BINS,
-        BK=_BUCKET_KEYS,
-        SL=_RANK_SLICE,
-        CH=_RANK_CHUNK,
+        BUCKET_KEYS=_BUCKET_KEYS,
+        RANK_SLICE=_RANK_SLICE,
+        RANK_CHUNK=_RANK_CHUNK,
         num_warps=8,
     )
 
@@ -1096,8 +1205,8 @@ def radix_select_trie_beams(
 ) -> RadixSelection:
     """One selection step for groups of one trie depth, as the module docstring describes.
 
-    Covers any beam widths, mixed freely, on CUDA; codebook_size <= 4096; child masks as a
-    dense table. It rejects (asserts) a larger codebook and a table of another shape.
+    Covers any beam widths, mixed freely, on CUDA; codebook_size <= MAX_CODEBOOK_SIZE; child
+    masks as a dense table. It rejects (asserts) a larger codebook and a table of another shape.
 
     leader_logits/tail_logits: logits [rows, >= codebook_size], unit stride along the codes;
         group g's frontier row 0 is leader row leader_rows[g], and row b > 0 is tail row
@@ -1117,15 +1226,15 @@ def radix_select_trie_beams(
         f"depth {depth} needs a dense child-mask table [{size**depth}, {size}], "
         f"got {tuple(child_masks.shape)}"
     )
-    assert size <= _TILE_KEYS and cum_logprobs.dtype == torch.float32
+    assert size <= MAX_CODEBOOK_SIZE and cum_logprobs.dtype == torch.float32
     assert leader_logits.stride(1) == 1 and leader_normalizer.stride(1) == 1
     if tail_logits is None:
         assert depth == 0, "frontier rows past the leader need the tail logits"
         tail_logits, tail_normalizer = leader_logits, leader_normalizer
         tail_starts = leader_rows
     remap = kv_len if req_to_token is not None and not final else 0
-    cb = triton.next_power_of_2(size)
-    small_rows = max(1, _SMALL_KEYS // cb)
+    code_block = triton.next_power_of_2(size)
+    small_rows = max(1, _SMALL_KEYS // code_block)
     num_groups = len(beam_widths)
     small = [g for g in range(num_groups) if depth == 0 or beam_widths[g] <= small_rows]
     large = [g for g in range(num_groups) if depth > 0 and beam_widths[g] > small_rows]
@@ -1153,10 +1262,10 @@ def radix_select_trie_beams(
         tail_logits=tail_logits,
         leader_norm=leader_normalizer,
         tail_norm=tail_normalizer,
-        s_ll=leader_logits.stride(0),
-        s_tl=tail_logits.stride(0),
-        s_ln=leader_normalizer.stride(0),
-        s_tn=tail_normalizer.stride(0),
+        leader_logits_stride=leader_logits.stride(0),
+        tail_logits_stride=tail_logits.stride(0),
+        leader_norm_stride=leader_normalizer.stride(0),
+        tail_norm_stride=tail_normalizer.stride(0),
         cum=cum_logprobs,
         prefix=prefix_codes if depth else unused,
         masks=child_masks.view(torch.uint8),
@@ -1169,19 +1278,21 @@ def radix_select_trie_beams(
         new_kv=out.new_kv if remap else unused,
         req_to_token=req_to_token if remap else unused,
         kv_rows=kv_rows if remap else unused,
-        s_rt=req_to_token.stride(0) if remap else 0,
-        C=size,
+        req_to_token_stride=req_to_token.stride(0) if remap else 0,
+        codebook_size=size,
         token_start=token_start,
     )
-    constants = dict(DEPTH=depth, FINAL=final, L=remap)
+    constants = dict(DEPTH=depth, FINAL=final, KV_LEN=remap)
     if small:
-        _launch_small(args, desc[: len(small)], constants=constants, cb=cb)
+        _launch_small(
+            args, desc[: len(small)], constants=constants, code_block=code_block
+        )
     if large:
         _launch_large(
             args,
             desc[len(small) :],
             constants=constants,
-            cb=cb,
+            code_block=code_block,
             widest=max(beam_widths[g] for g in large),
             total_rows=out.row_offsets[-1],
             total_width=out.offsets[-1],
