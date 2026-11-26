@@ -337,7 +337,6 @@ def _variable_width_stream_k_kernel(
             BLOCK_N=BLOCK_N,
             BLOCK_D=BLOCK_D,
             TILE_FIELDS=TILE_FIELDS,
-            PROMPT_LOOP_STEP=1,
             WIDE_KV_OFFSETS=WIDE_KV_OFFSETS,
         )
         output_mask = beam_mask[:, None] & dim_mask[None, :]
