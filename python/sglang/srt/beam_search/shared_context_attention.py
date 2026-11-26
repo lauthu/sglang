@@ -164,10 +164,10 @@ def build_metadata(
             req_to_token=model_runner.req_to_token_pool.req_to_token,
             stream_k_grid=variable_width.get_stream_k_grid(model_runner),
         )
-    return _build_width_buckets(batch=batch, model_runner=model_runner)
+    return build_fixed_width_metadata(batch=batch, model_runner=model_runner)
 
 
-def _build_width_buckets(
+def build_fixed_width_metadata(
     batch: ScheduleBatch, model_runner: ModelRunner
 ) -> Optional[BeamAttentionMetadata]:
     entries = batch.beam_tail.entries
@@ -291,7 +291,18 @@ def forward(
             k_buffer=k_buffer,
             v_buffer=v_buffer,
         )
+    return forward_fixed_width(
+        q=q, layer=layer, metadata=metadata, k_buffer=k_buffer, v_buffer=v_buffer
+    )
 
+
+def forward_fixed_width(
+    q: torch.Tensor,
+    layer: RadixAttention,
+    metadata: BeamAttentionMetadata,
+    k_buffer: torch.Tensor,
+    v_buffer: torch.Tensor,
+) -> torch.Tensor:
     q_heads = layer.tp_q_head_num
     head_dim = layer.head_dim
     flat_q = q.contiguous().view(metadata.num_rows, q_heads, head_dim)

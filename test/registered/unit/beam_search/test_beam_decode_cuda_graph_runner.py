@@ -468,7 +468,7 @@ class TestVariableWidthBeamGraphInputs(CustomTestCase):
                 _shared_context_server(**settings),
                 patch.object(
                     shared_context_attention,
-                    "_build_width_buckets",
+                    "build_fixed_width_metadata",
                     return_value=width_buckets,
                 ),
             ):
