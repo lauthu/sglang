@@ -24,7 +24,7 @@ from sglang.srt.beam_search import shared_context_attention
 from sglang.srt.beam_search.trie_output_head import build_trie_row_levels
 
 if TYPE_CHECKING:
-    from sglang.srt.beam_search.shared_context_attention import BeamAttentionMetadata
+    from sglang.srt.beam_search.shared_context_fixed_width import BeamAttentionMetadata
     from sglang.srt.beam_search.shared_context_variable_width import (
         VariableWidthBeamAttentionMetadata,
     )

@@ -47,7 +47,7 @@ from sglang.srt.beam_search.forward_inputs import (
     BeamForwardInputs,
     build_beam_forward_inputs,
 )
-from sglang.srt.beam_search.shared_context_attention import (
+from sglang.srt.beam_search.shared_context_fixed_width import (
     BeamAttentionBucket,
     BeamAttentionMetadata,
 )

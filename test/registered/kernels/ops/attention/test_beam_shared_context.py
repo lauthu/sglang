@@ -516,10 +516,10 @@ class TestBeamSharedContextAttention(CustomTestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_forward_runs_the_selected_kernel(self):
         """SGLANG_BEAM_SHARED_CONTEXT_KERNEL picks the kernel every bucket runs."""
-        from sglang.srt.beam_search.shared_context_attention import (
+        from sglang.srt.beam_search.shared_context_attention import forward
+        from sglang.srt.beam_search.shared_context_fixed_width import (
             BeamAttentionBucket,
             BeamAttentionMetadata,
-            forward,
         )
         from sglang.srt.environ import envs
 
@@ -585,7 +585,7 @@ class TestBeamSharedContextAttention(CustomTestCase):
                 )
 
     def test_unknown_kernel_is_rejected(self):
-        from sglang.srt.beam_search.shared_context_attention import selected_kernel
+        from sglang.srt.beam_search.shared_context_fixed_width import selected_kernel
         from sglang.srt.environ import envs
 
         with envs.SGLANG_BEAM_SHARED_CONTEXT_KERNEL.override("splitkv"):
