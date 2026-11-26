@@ -86,7 +86,7 @@ def header_and_tiles_len(num_tiles: int) -> int:
 @triton.jit
 def read_tile(
     tiles,  # the layout's tiles, TILE_FIELDS int32 each
-    tile,  # index of the tile to read
+    tile_idx,
     beam_offsets,  # [n] int32 positions in the tile; a caller masks those >= BLOCK_M
     TILE_FIELDS: tl.constexpr,
 ):
@@ -96,7 +96,7 @@ def read_tile(
     the positions past them; their row is the leader's, so that it is a valid
     index, and callers mask every load and store with beam_mask.
     """
-    tile_fields = tiles + TILE_FIELDS * tile
+    tile_fields = tiles + TILE_FIELDS * tile_idx
     leader_row = tl.load(tile_fields)
     first_member_row = tl.load(tile_fields + 1)
     num_members = tl.load(tile_fields + 2)
@@ -104,9 +104,9 @@ def read_tile(
     first_beam = tl.load(tile_fields + 4)
 
     # Beam 0 of a group is its leader, beam i >= 1 its member i - 1.
-    beams = first_beam + beam_offsets
-    beam_mask = beams <= num_members
-    rows = tl.where(beams == 0, leader_row, first_member_row + beams - 1)
+    beam_indices = first_beam + beam_offsets
+    beam_mask = beam_indices <= num_members
+    rows = tl.where(beam_indices == 0, leader_row, first_member_row + beam_indices - 1)
     rows = tl.where(beam_mask, rows, leader_row)
     return rows, beam_mask, leader_row, prompt_len
 
@@ -234,7 +234,7 @@ def _attend_prompt_blocks(
     HEAD_DIM: tl.constexpr,
     BLOCK_N: tl.constexpr,  # prompt tokens per block
     BLOCK_D: tl.constexpr,  # HEAD_DIM rounded up to a power of 2
-    WIDE_KV_OFFSETS: tl.constexpr,  # 64-bit K/V offsets; False needs < 2^31 elements
+    INT64_KV_OFFSETS: tl.constexpr,  # False needs K/V caches of < 2^31 elements
 ):
     """All beams of a tile attend blocks [first_block, end_block) of their group's
     prompt, the same BLOCK_N tokens at a time. Returns the softmax state after."""
@@ -251,7 +251,7 @@ def _attend_prompt_blocks(
         token_indices = block_start + token_offsets
         token_mask = token_indices < prompt_len
         slots = tl.load(prompt_slots + token_indices, mask=token_mask, other=0)
-        if WIDE_KV_OFFSETS:
+        if INT64_KV_OFFSETS:
             slots = slots.to(tl.int64)
         kv_mask = token_mask[:, None] & dim_mask[None, :]
         k_values = _load_kv(
@@ -307,16 +307,16 @@ def _attend_decode_steps(
     stride_v_head,  # v_buffer.stride(1)
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,  # HEAD_DIM rounded up to a power of 2
-    WIDE_KV_OFFSETS: tl.constexpr,  # 64-bit K/V offsets; False needs < 2^31 elements
+    INT64_KV_OFFSETS: tl.constexpr,  # False needs K/V caches of < 2^31 elements
 ):
     """Each beam of a tile attends the tokens it generated at decode steps
     [first_step, end_step), one step at a time. Returns the softmax state after."""
     dim_offsets = tl.arange(0, BLOCK_D)
     kv_mask = beam_mask[:, None] & (dim_offsets < HEAD_DIM)[None, :]
     negative_infinity = -float("inf")
-    for step in range(first_step, end_step):
-        slots = tl.load(decode_slots + step, mask=beam_mask, other=0)
-        if WIDE_KV_OFFSETS:
+    for step_idx in range(first_step, end_step):
+        slots = tl.load(decode_slots + step_idx, mask=beam_mask, other=0)
+        if INT64_KV_OFFSETS:
             slots = slots.to(tl.int64)
         k_values = _load_kv(
             buffer=k_buffer,
@@ -358,7 +358,7 @@ def attend_tile(
     req_pool_indices,  # [rows] int32 or int64, each row's pool row
     seq_lens,  # [rows] int32 or int64; only the leaders' are read
     tiles,  # the layout's tiles
-    tile,  # index of the tile to attend
+    tile_idx,
     q_head,
     work_start,  # work units to attend: [work_start, work_end), clipped to the tile's
     work_end,
@@ -376,7 +376,7 @@ def attend_tile(
     BLOCK_N: tl.constexpr,  # prompt tokens per block
     BLOCK_D: tl.constexpr,  # HEAD_DIM rounded up to a power of 2
     TILE_FIELDS: tl.constexpr,
-    WIDE_KV_OFFSETS: tl.constexpr,  # 64-bit K/V offsets; False needs < 2^31 elements
+    INT64_KV_OFFSETS: tl.constexpr,  # False needs K/V caches of < 2^31 elements
 ):
     """Attend one tile for one query head over its work units [work_start, work_end).
 
@@ -389,7 +389,10 @@ def attend_tile(
     dim_offsets = tl.arange(0, BLOCK_D)
 
     rows, beam_mask, leader_row, prompt_len = read_tile(
-        tiles=tiles, tile=tile, beam_offsets=beam_offsets, TILE_FIELDS=TILE_FIELDS
+        tiles=tiles,
+        tile_idx=tile_idx,
+        beam_offsets=beam_offsets,
+        TILE_FIELDS=TILE_FIELDS,
     )
     q_values = _load_q(
         q=q,
@@ -429,7 +432,7 @@ def attend_tile(
         HEAD_DIM=HEAD_DIM,
         BLOCK_N=BLOCK_N,
         BLOCK_D=BLOCK_D,
-        WIDE_KV_OFFSETS=WIDE_KV_OFFSETS,
+        INT64_KV_OFFSETS=INT64_KV_OFFSETS,
     )
 
     # The following work units: the decode steps. Each beam's generated tokens
@@ -457,7 +460,7 @@ def attend_tile(
         stride_v_head=stride_v_head,
         HEAD_DIM=HEAD_DIM,
         BLOCK_D=BLOCK_D,
-        WIDE_KV_OFFSETS=WIDE_KV_OFFSETS,
+        INT64_KV_OFFSETS=INT64_KV_OFFSETS,
     )
     return rows, beam_mask, max_values, normalizers, accumulator
 
@@ -503,7 +506,7 @@ def _variable_width_shared_context_kernel(
 
     num_tiles = tl.load(layout)
     tiles = layout + HEADER_FIELDS
-    for tile in range(program, num_tiles, programs_per_head):
+    for tile_idx in range(program, num_tiles, programs_per_head):
         rows, beam_mask, max_values, normalizers, accumulator = attend_tile(
             q=q,
             k_buffer=k_buffer,
@@ -512,7 +515,7 @@ def _variable_width_shared_context_kernel(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             tiles=tiles,
-            tile=tile,
+            tile_idx=tile_idx,
             q_head=q_head,
             work_start=0,
             work_end=WHOLE_TILE,
@@ -530,7 +533,7 @@ def _variable_width_shared_context_kernel(
             BLOCK_N=BLOCK_N,
             BLOCK_D=BLOCK_D,
             TILE_FIELDS=TILE_FIELDS,
-            WIDE_KV_OFFSETS=True,
+            INT64_KV_OFFSETS=True,
         )
         store_output(
             output=output,

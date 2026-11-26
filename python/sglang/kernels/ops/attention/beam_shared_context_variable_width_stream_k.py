@@ -99,10 +99,10 @@ _SETUP_UNITS = 1
 _SPLIT_COST_UNITS = 2
 # Measured: merge programs of 8 beams are fastest at 1-4 groups (8-64 tried).
 _MERGE_BEAMS = 8
-# K/V offsets are 32-bit while the caches' elements fit (attend_tile's
-# WIDE_KV_OFFSETS), which saves registers: 64-bit offsets take as many as a third
-# pipeline stage would.
-_MAX_OFFSET = 2**31
+# K/V offsets are int32 while every element of the caches is below this offset
+# (attend_tile's INT64_KV_OFFSETS). It saves registers: int64 offsets take as many
+# as a third pipeline stage would.
+_INT32_OFFSET_LIMIT = 2**31
 
 # int32 fields of a plan row, in the order the kernels read them:
 #   0 first task, 1 end task: the CTA attends tasks [first task, end task)
@@ -277,7 +277,7 @@ def _variable_width_stream_k_kernel(
     TILE_FIELDS: tl.constexpr,
     PLAN_FIELDS: tl.constexpr,  # int32 entries of a plan row
     WHOLE_TILE: tl.constexpr,
-    WIDE_KV_OFFSETS: tl.constexpr,  # 64-bit K/V offsets, for caches of 2^31 elements
+    INT64_KV_OFFSETS: tl.constexpr,  # for K/V caches of 2^31 elements or more
 ):
     """CTA c attends the tasks of its plan row. A task that lies in its run goes to
     the output; a segment of a split task goes to a partial slot, for the merge
@@ -307,10 +307,10 @@ def _variable_width_stream_k_kernel(
             tl.full((BLOCK_M,), -float("inf"), tl.float32),
         )
 
-    for task in range(first_task, end_task):
-        is_first = task == first_task
-        is_last = task == end_task - 1
-        q_head = task % Q_HEADS
+    for task_idx in range(first_task, end_task):
+        is_first_task = task_idx == first_task
+        is_last_task = task_idx == end_task - 1
+        q_head = task_idx % Q_HEADS
         rows, beam_mask, max_values, normalizers, accumulator = attend_tile(
             q=q,
             k_buffer=k_buffer,
@@ -319,10 +319,10 @@ def _variable_width_stream_k_kernel(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             tiles=tiles,
-            tile=task // Q_HEADS,
+            tile_idx=task_idx // Q_HEADS,
             q_head=q_head,
-            work_start=tl.where(is_first, first_work_start, 0),
-            work_end=tl.where(is_last, last_work_end, WHOLE_TILE),
+            work_start=tl.where(is_first_task, first_work_start, 0),
+            work_end=tl.where(is_last_task, last_work_end, WHOLE_TILE),
             softmax_scale_log2=softmax_scale_log2,
             stride_q_row=stride_q_row,
             stride_q_head=stride_q_head,
@@ -337,13 +337,15 @@ def _variable_width_stream_k_kernel(
             BLOCK_N=BLOCK_N,
             BLOCK_D=BLOCK_D,
             TILE_FIELDS=TILE_FIELDS,
-            WIDE_KV_OFFSETS=WIDE_KV_OFFSETS,
+            INT64_KV_OFFSETS=INT64_KV_OFFSETS,
         )
         output_mask = beam_mask[:, None] & dim_mask[None, :]
-        is_partial = (is_first & first_is_partial) | (is_last & last_is_partial)
+        is_partial = (is_first_task & first_is_partial) | (
+            is_last_task & last_is_partial
+        )
         if is_partial:
             # Slot 2 * cta for the run's first task, 2 * cta + 1 for its last.
-            partial_slot = 2 * cta + tl.where(is_first, 0, 1)
+            partial_slot = 2 * cta + tl.where(is_first_task, 0, 1)
             slot_beams = partial_slot * BLOCK_M + beam_offsets
             tl.store(
                 partial_output
@@ -417,14 +419,17 @@ def _variable_width_merge_kernel(
     merge_fields = (
         tiles + TILE_FIELDS * num_tiles + PLAN_FIELDS * cta + PLAN_MERGE_FIELD
     )
-    tile = tl.load(merge_fields) - 1
-    if tile >= 0:
+    tile_idx = tl.load(merge_fields) - 1
+    if tile_idx >= 0:
         q_head = tl.load(merge_fields + 1)
         last_cta = tl.load(merge_fields + 2)
         first_segment_slot = tl.load(merge_fields + 3)
         beam_offsets = tl.program_id(1) * MERGE_BEAMS + tl.arange(0, MERGE_BEAMS)
         rows, beam_mask, _, _ = read_tile(
-            tiles=tiles, tile=tile, beam_offsets=beam_offsets, TILE_FIELDS=TILE_FIELDS
+            tiles=tiles,
+            tile_idx=tile_idx,
+            beam_offsets=beam_offsets,
+            TILE_FIELDS=TILE_FIELDS,
         )
         # The last chunk reaches past the tile if MERGE_BEAMS does not divide BLOCK_M.
         beam_mask = beam_mask & (beam_offsets < BLOCK_M)
@@ -549,8 +554,8 @@ def shared_context_attention_variable_width_stream_k(
         TILE_FIELDS=TILE_FIELDS,
         PLAN_FIELDS=_PLAN_FIELDS,
         WHOLE_TILE=WHOLE_TILE,
-        WIDE_KV_OFFSETS=max(map(max_element_offset, (k_buffer, v_buffer)))
-        >= _MAX_OFFSET,
+        INT64_KV_OFFSETS=max(map(max_element_offset, (k_buffer, v_buffer)))
+        >= _INT32_OFFSET_LIMIT,
         num_warps=_NUM_WARPS,
         num_stages=_NUM_STAGES,
     )
