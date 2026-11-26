@@ -31,8 +31,8 @@ that module):
   of a batch are numbered task by task.
 - run: the consecutive units that one CTA executes.
 - segment: the work units of a task that lie in one run.
-- plan: what the host appends to the layout (build_stream_k_plan), one row per
-  CTA: the tasks the CTA attends, over which work units, and the split task it
+- plan: what the host puts in the layout after its header (build_stream_k_plan),
+  one row per CTA: the tasks the CTA attends, over which work units, and the split task it
   lists for the merge kernel.
 
 The grid is persistent: one CTA per SM for any batch. The plan gives each CTA an
@@ -74,7 +74,6 @@ from sglang.kernels.ops.attention.beam_shared_context import (
     num_sms,
 )
 from sglang.kernels.ops.attention.beam_shared_context_variable_width import (
-    HEADER_FIELDS,
     TILE_FIELDS,
     WHOLE_TILE,
     attend_tile,
@@ -251,7 +250,9 @@ def _variable_width_stream_k_kernel(
     req_to_token,  # [pool rows, max context] int32, the KV slot of each token
     req_pool_indices,  # [rows] int32 or int64, each row's pool row
     seq_lens,  # [rows] int32 or int64; only the leaders' are read
-    layout,  # int32: header, tiles, plan
+    row_count,  # [1] int32, the batch's real rows
+    tiles,  # [tiles, TILE_FIELDS] int32, the layout's tiles
+    plan,  # [num_ctas, PLAN_FIELDS] int32, the layout's plan
     output,  # like q; whole tasks and the padding rows are written here
     partial_output,  # [2 * num_ctas, BLOCK_M, HEAD_DIM] fp32, the segments' outputs
     partial_lse,  # [2 * num_ctas, BLOCK_M] fp32, log2 of the segments' softmax sums
@@ -273,7 +274,6 @@ def _variable_width_stream_k_kernel(
     BLOCK_M: tl.constexpr,  # beams per tile, the value the layout was built with
     BLOCK_N: tl.constexpr,  # prompt tokens per block
     BLOCK_D: tl.constexpr,  # HEAD_DIM rounded up to a power of 2
-    HEADER_FIELDS: tl.constexpr,
     TILE_FIELDS: tl.constexpr,
     PLAN_FIELDS: tl.constexpr,  # int32 entries of a plan row
     WHOLE_TILE: tl.constexpr,
@@ -288,10 +288,7 @@ def _variable_width_stream_k_kernel(
     dim_mask = dim_offsets < HEAD_DIM
     # exp2 is cheaper than exp: fold log2(e) into the scale.
     softmax_scale_log2 = softmax_scale * 1.4426950408889634
-    # The layout's parts: the header, the tiles, the plan.
-    num_tiles = tl.load(layout)
-    tiles = layout + HEADER_FIELDS
-    plan_row = tiles + TILE_FIELDS * num_tiles + PLAN_FIELDS * cta
+    plan_row = plan + PLAN_FIELDS * cta
     first_task = tl.load(plan_row)
     end_task = tl.load(plan_row + 1)
     first_work_start = tl.load(plan_row + 2)
@@ -372,7 +369,7 @@ def _variable_width_stream_k_kernel(
                 stride_out_head=stride_out_head,
             )
 
-    num_real_rows = tl.load(layout + 1)
+    num_real_rows = tl.load(row_count)
     for q_head in range(0, Q_HEADS):
         zero_padding_rows(
             output=output,
@@ -393,7 +390,8 @@ def _variable_width_stream_k_kernel(
 def _variable_width_merge_kernel(
     partial_output,  # [2 * num_ctas, BLOCK_M, HEAD_DIM] fp32, the segments' outputs
     partial_lse,  # [2 * num_ctas, BLOCK_M] fp32, log2 of the segments' softmax sums
-    layout,  # int32: header, tiles, plan
+    tiles,  # [tiles, TILE_FIELDS] int32, the layout's tiles
+    plan,  # [num_ctas, PLAN_FIELDS] int32, the layout's plan
     output,  # [rows, q_heads, HEAD_DIM]; the rows of split tasks are written
     stride_out_row,  # output.stride(0); in elements
     stride_out_head,  # output.stride(1)
@@ -401,7 +399,6 @@ def _variable_width_merge_kernel(
     BLOCK_M: tl.constexpr,  # beams per tile
     BLOCK_D: tl.constexpr,  # HEAD_DIM rounded up to a power of 2
     MERGE_BEAMS: tl.constexpr,  # beams per program
-    HEADER_FIELDS: tl.constexpr,
     TILE_FIELDS: tl.constexpr,
     PLAN_FIELDS: tl.constexpr,  # int32 entries of a plan row
     PLAN_MERGE_FIELD: tl.constexpr,
@@ -414,11 +411,7 @@ def _variable_width_merge_kernel(
     weighted by each segment's softmax sum.
     """
     cta = tl.program_id(0)
-    num_tiles = tl.load(layout)
-    tiles = layout + HEADER_FIELDS
-    merge_fields = (
-        tiles + TILE_FIELDS * num_tiles + PLAN_FIELDS * cta + PLAN_MERGE_FIELD
-    )
+    merge_fields = plan + PLAN_FIELDS * cta + PLAN_MERGE_FIELD
     tile_idx = tl.load(merge_fields) - 1
     if tile_idx >= 0:
         q_head = tl.load(merge_fields + 1)
@@ -487,7 +480,10 @@ def shared_context_attention_variable_width_stream_k(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
     seq_lens: torch.Tensor,
-    layout: torch.Tensor,
+    tile_count: torch.Tensor,
+    row_count: torch.Tensor,
+    tiles: torch.Tensor,
+    plan: torch.Tensor,
     *,
     block_m: int,
     num_ctas: int,
@@ -496,7 +492,7 @@ def shared_context_attention_variable_width_stream_k(
     """shared_context_attention_variable_width on a persistent stream-K grid.
 
     Same inputs and output, and:
-    - `layout` must carry the plan of its tiles (`build_stream_k_plan`) after them.
+    - `plan`: the layout's plan of its tiles (`build_stream_k_plan`).
     - `num_ctas`: the grid size; it must be the one the plan was built for.
     Tuned on SM120 only.
     """
@@ -507,8 +503,12 @@ def shared_context_attention_variable_width_stream_k(
         req_to_token=req_to_token,
         req_pool_indices=req_pool_indices,
         seq_lens=seq_lens,
-        layout=layout,
+        tile_count=tile_count,
+        row_count=row_count,
+        tiles=tiles,
     )
+    if plan.dtype != torch.int32 or plan.numel() != plan_len(num_ctas):
+        raise ValueError("The plan must be int32 with one row per CTA")
     output = torch.empty_like(q)
     num_rows, q_heads, head_dim = q.shape
     kv_heads = k_buffer.shape[1]
@@ -528,7 +528,9 @@ def shared_context_attention_variable_width_stream_k(
         req_to_token,
         req_pool_indices,
         seq_lens,
-        layout,
+        row_count,
+        tiles,
+        plan,
         output,
         partial_output,
         partial_lse,
@@ -550,7 +552,6 @@ def shared_context_attention_variable_width_stream_k(
         BLOCK_M=block_m,
         BLOCK_N=_BLOCK_N,
         BLOCK_D=block_d,
-        HEADER_FIELDS=HEADER_FIELDS,
         TILE_FIELDS=TILE_FIELDS,
         PLAN_FIELDS=_PLAN_FIELDS,
         WHOLE_TILE=WHOLE_TILE,
@@ -562,7 +563,8 @@ def shared_context_attention_variable_width_stream_k(
     _variable_width_merge_kernel[(num_ctas, triton.cdiv(block_m, _MERGE_BEAMS))](
         partial_output,
         partial_lse,
-        layout,
+        tiles,
+        plan,
         output,
         output.stride(0),
         output.stride(1),
@@ -570,7 +572,6 @@ def shared_context_attention_variable_width_stream_k(
         BLOCK_M=block_m,
         BLOCK_D=block_d,
         MERGE_BEAMS=_MERGE_BEAMS,
-        HEADER_FIELDS=HEADER_FIELDS,
         TILE_FIELDS=TILE_FIELDS,
         PLAN_FIELDS=_PLAN_FIELDS,
         PLAN_MERGE_FIELD=_PLAN_MERGE_FIELD,

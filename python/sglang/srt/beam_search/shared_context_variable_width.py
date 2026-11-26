@@ -46,6 +46,9 @@ from sglang.srt.beam_search.decode_graph_settings import variable_width_kernel
 from sglang.srt.utils.device import is_pin_memory_available
 
 if TYPE_CHECKING:
+    from sglang.kernels.ops.attention.beam_shared_context_variable_width import (
+        LayoutParts,
+    )
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -81,8 +84,11 @@ class VariableWidthBeamAttentionMetadata(msgspec.Struct):
     layout: Optional[torch.Tensor]
     # The request pool's KV slot table; the kernels look slots up in it on the GPU.
     req_to_token: torch.Tensor
-    # Set to run the stream-K kernel; its plan follows the tiles in the layout.
+    # Set to run the stream-K kernel; its plan is in the layout, before the tiles.
     stream_k_grid: Optional[StreamKGrid]
+    # The parts of `layout` as the kernels take them, views of it. Split once: by
+    # the first forward on it.
+    layout_parts: Optional[LayoutParts] = None
 
 
 class _Tile(msgspec.Struct, frozen=True):
@@ -167,16 +173,17 @@ def build_variable_width_metadata(
     if rows_in_groups != num_rows:
         return None
 
-    # Header [tile count, real rows], then each tile's fields, then the stream-K
-    # plan: the order the kernels read.
-    parts = [
-        np.array([len(tiles), num_rows], dtype=np.int32),
-        np.array([msgspec.structs.astuple(tile) for tile in tiles], dtype=np.int32),
-    ]
+    # Header [tile count, real rows], then the stream-K plan, then each tile's
+    # fields: the order the kernels' entry points split the layout in. The plan is
+    # before the tiles because its length does not depend on the batch.
+    parts = [np.array([len(tiles), num_rows], dtype=np.int32)]
     if stream_k_grid is not None:
         parts.append(
             _stream_k_plan(tiles=tiles, decode_lens=decode_lens, grid=stream_k_grid)
         )
+    parts.append(
+        np.array([msgspec.structs.astuple(tile) for tile in tiles], dtype=np.int32)
+    )
     layout = torch.from_numpy(np.concatenate([part.reshape(-1) for part in parts]))
     # Pinned, so that the upload does not wait for the copy.
     if is_pin_memory_available(batch.device):
@@ -251,9 +258,31 @@ def device_layout(metadata: VariableWidthBeamAttentionMetadata, device) -> torch
     return metadata.layout
 
 
+def device_layout_parts(
+    metadata: VariableWidthBeamAttentionMetadata, device
+) -> LayoutParts:
+    """The layout on the GPU as its parts, which the kernels take. A batch's layout
+    is split once per decode step and the graphs' buffer once, so a layer's launch
+    makes no views."""
+    if metadata.layout_parts is None:
+        from sglang.kernels.ops.attention.beam_shared_context_variable_width import (
+            split_layout,
+        )
+        from sglang.kernels.ops.attention.beam_shared_context_variable_width_stream_k import (
+            plan_len,
+        )
+
+        grid = metadata.stream_k_grid
+        metadata.layout_parts = split_layout(
+            device_layout(metadata, device=device),
+            plan_len=0 if grid is None else plan_len(num_ctas=grid.num_ctas),
+        )
+    return metadata.layout_parts
+
+
 def _attention_kernel(stream_k: bool):
     """The kernel a layout runs, chosen by SGLANG_BEAM_SHARED_CONTEXT_KERNEL. Both
-    take the same inputs; the stream-K kernel also takes its grid size. Its module
+    take the same inputs; the stream-K kernel also takes its plan and grid size. Its module
     says where each is faster."""
     if stream_k:
         from sglang.kernels.ops.attention.beam_shared_context_variable_width_stream_k import (
@@ -280,8 +309,11 @@ def forward(
     head_dim = layer.head_dim
     grid = metadata.stream_k_grid
     attention = _attention_kernel(stream_k=grid is not None)
-    # The stream-K kernel's grid is the one its plan was built for.
-    grid_options = {} if grid is None else {"num_ctas": grid.num_ctas}
+    layout = device_layout_parts(metadata, device=q.device)
+    # The stream-K kernel also takes its plan and the grid the plan was built for.
+    stream_k_inputs = (
+        {} if grid is None else {"plan": layout.plan, "num_ctas": grid.num_ctas}
+    )
     output = attention(
         q=q.reshape(-1, q_heads, head_dim),
         k_buffer=k_buffer,
@@ -289,9 +321,11 @@ def forward(
         req_to_token=metadata.req_to_token,
         req_pool_indices=forward_batch.req_pool_indices,
         seq_lens=forward_batch.seq_lens,
-        layout=device_layout(metadata, device=q.device),
+        tile_count=layout.tile_count,
+        row_count=layout.row_count,
+        tiles=layout.tiles,
         block_m=BEAMS_PER_TILE,
         softmax_scale=layer.scaling,
-        **grid_options,
+        **stream_k_inputs,
     )
     return output.view(-1, q_heads * head_dim)

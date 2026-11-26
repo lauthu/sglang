@@ -552,7 +552,7 @@ class TestVariableWidthBeamGraphInputs(CustomTestCase):
 
     def test_layout_buffer_holds_the_most_tiles_of_the_largest_graph(self):
         """A graph's rows hold the most tiles when every group has two beams. The
-        layout of that batch, with a stream-K plan after its tiles, fills the
+        layout of that batch, with a stream-K plan before its tiles, fills the
         buffer that the graphs captured."""
         max_rows = 64
         grid = StreamKGrid(q_heads=1, num_ctas=7)

@@ -33,11 +33,12 @@ Terms:
 The layout is one int32 tensor that the host writes per batch
 (srt/beam_search/shared_context_variable_width.py), its parts back to back:
 - header: [number of tiles, number of real rows]
-- per tile: (leader row, first member row, members, prompt length, first beam)
 - for the stream-K kernel only: its plan
-  (beam_shared_context_variable_width_stream_k.py)
-The tensor may be longer than a batch's layout: the header counts the tiles, and
-nothing past the last part is read.
+  (beam_shared_context_variable_width_stream_k.py), of one length for any batch
+- per tile: (leader row, first member row, members, prompt length, first beam)
+The kernels take the parts as separate tensors, views of that one upload
+(split_layout, once per upload). The tensor may be longer than a batch's layout:
+the header counts the tiles, and no tile past them is read.
 Beam widths live in this tensor, not in the launch arguments, so a graph captured
 for a row count replays for any widths that add up to at most that many rows.
 
@@ -47,6 +48,8 @@ length up to the leader's sequence length: the beams of a group are equally long
 """
 
 from __future__ import annotations
+
+from typing import NamedTuple
 
 import torch
 import triton
@@ -81,6 +84,28 @@ WHOLE_TILE = 1 << 30
 def header_and_tiles_len(num_tiles: int) -> int:
     """int32 entries of a layout's header and tiles, without a stream-K plan."""
     return HEADER_FIELDS + TILE_FIELDS * num_tiles
+
+
+class LayoutParts(NamedTuple):
+    """A layout's parts as the kernels take them: views of the one tensor."""
+
+    # One number each. They stay tensors because a CUDA graph keeps the addresses
+    # of a launch's inputs, not the numbers in them.
+    tile_count: torch.Tensor  # [1] int32, the batch's tiles
+    row_count: torch.Tensor  # [1] int32, the batch's real rows
+    plan: torch.Tensor  # the stream-K plan; empty in a layout without one
+    tiles: torch.Tensor  # TILE_FIELDS int32 per tile
+
+
+def split_layout(layout: torch.Tensor, plan_len: int = 0) -> LayoutParts:
+    """The parts of a layout whose plan has plan_len entries (0: no plan)."""
+    tiles_start = HEADER_FIELDS + plan_len
+    return LayoutParts(
+        tile_count=layout[0:1],
+        row_count=layout[1:2],
+        plan=layout[HEADER_FIELDS:tiles_start],
+        tiles=layout[tiles_start:],
+    )
 
 
 @triton.jit
@@ -473,7 +498,9 @@ def _variable_width_shared_context_kernel(
     req_to_token,  # [pool rows, max context] int32, the KV slot of each token
     req_pool_indices,  # [rows] int32 or int64, each row's pool row
     seq_lens,  # [rows] int32 or int64; only the leaders' are read
-    layout,  # int32, see the module docstring
+    tile_count,  # [1] int32, the batch's tiles
+    row_count,  # [1] int32, the batch's real rows
+    tiles,  # [tiles, TILE_FIELDS] int32, see the module docstring
     output,  # like q; every row is written: attention, or zeros in padding rows
     softmax_scale,  # float, scales q.k before the softmax
     num_rows,  # q.shape[0]
@@ -491,7 +518,6 @@ def _variable_width_shared_context_kernel(
     BLOCK_M: tl.constexpr,  # beams per tile, the value the layout was built with
     BLOCK_N: tl.constexpr,  # prompt tokens per block
     BLOCK_D: tl.constexpr,  # HEAD_DIM rounded up to a power of 2
-    HEADER_FIELDS: tl.constexpr,
     TILE_FIELDS: tl.constexpr,
     WHOLE_TILE: tl.constexpr,
 ):
@@ -504,8 +530,7 @@ def _variable_width_shared_context_kernel(
     # exp2 is cheaper than exp: fold log2(e) into the scale.
     softmax_scale_log2 = softmax_scale * 1.4426950408889634
 
-    num_tiles = tl.load(layout)
-    tiles = layout + HEADER_FIELDS
+    num_tiles = tl.load(tile_count)
     for tile_idx in range(program, num_tiles, programs_per_head):
         rows, beam_mask, max_values, normalizers, accumulator = attend_tile(
             q=q,
@@ -546,7 +571,7 @@ def _variable_width_shared_context_kernel(
             stride_out_head=stride_out_head,
         )
 
-    num_real_rows = tl.load(layout + 1)
+    num_real_rows = tl.load(row_count)
     zero_padding_rows(
         output=output,
         num_real_rows=num_real_rows,
@@ -576,7 +601,9 @@ def check_variable_width_inputs(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
     seq_lens: torch.Tensor,
-    layout: torch.Tensor,
+    tile_count: torch.Tensor,
+    row_count: torch.Tensor,
+    tiles: torch.Tensor,
 ) -> None:
     """Check the inputs that both kernels of this layout read."""
     if q.ndim != 3 or q.stride(2) != 1:
@@ -597,8 +624,10 @@ def check_variable_width_inputs(
         raise ValueError(f"Q heads {q_heads} must be divisible by KV heads {kv_heads}")
     if req_to_token.dtype != torch.int32 or req_to_token.stride(1) != 1:
         raise ValueError("req_to_token must be int32 with a unit token stride")
-    if layout.dtype != torch.int32 or layout.ndim != 1 or len(layout) < HEADER_FIELDS:
-        raise ValueError("The layout must be a 1-D int32 tensor with its header")
+    if any(t.dtype != torch.int32 for t in (tile_count, row_count, tiles)):
+        raise ValueError("tile_count, row_count and tiles must be int32")
+    if tile_count.numel() != 1 or row_count.numel() != 1:
+        raise ValueError("tile_count and row_count must hold one number each")
     if req_pool_indices.shape[0] < num_rows or seq_lens.shape[0] < num_rows:
         raise ValueError("req_pool_indices and seq_lens must cover every row of Q")
     if any(
@@ -614,7 +643,9 @@ def shared_context_attention_variable_width(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
     seq_lens: torch.Tensor,
-    layout: torch.Tensor,
+    tile_count: torch.Tensor,
+    row_count: torch.Tensor,
+    tiles: torch.Tensor,
     *,
     block_m: int,
     softmax_scale: float,
@@ -626,7 +657,8 @@ def shared_context_attention_variable_width(
     - `req_to_token`: [pool rows, max context] int32, the KV slot of each token.
     - `req_pool_indices`, `seq_lens`: [rows] int32 or int64, each row's pool row
       and sequence length.
-    - `layout`: the module's int32 layout of the batch.
+    - `tile_count`, `row_count`, `tiles`: the parts of the batch's layout
+      (split_layout).
     - `block_m`: beams per tile; it must be the tile size the layout was built with.
     Returns the output, like `q`. The padding rows, those past the layout's real
     rows, are zeros.
@@ -640,7 +672,9 @@ def shared_context_attention_variable_width(
         req_to_token=req_to_token,
         req_pool_indices=req_pool_indices,
         seq_lens=seq_lens,
-        layout=layout,
+        tile_count=tile_count,
+        row_count=row_count,
+        tiles=tiles,
     )
     output = torch.empty_like(q)
     num_rows, q_heads, head_dim = q.shape
@@ -654,7 +688,9 @@ def shared_context_attention_variable_width(
         req_to_token,
         req_pool_indices,
         seq_lens,
-        layout,
+        tile_count,
+        row_count,
+        tiles,
         output,
         softmax_scale,
         num_rows,
@@ -672,7 +708,6 @@ def shared_context_attention_variable_width(
         BLOCK_M=block_m,
         BLOCK_N=_BLOCK_N,
         BLOCK_D=triton.next_power_of_2(head_dim),
-        HEADER_FIELDS=HEADER_FIELDS,
         TILE_FIELDS=TILE_FIELDS,
         WHOLE_TILE=WHOLE_TILE,
         num_warps=_NUM_WARPS,

@@ -348,7 +348,7 @@ class VariableWidthSharedContextInput:
     def load_replay_inputs(self, metadata: VariableWidthBeamAttentionMetadata) -> None:
         # The batch's one upload, straight into the buffer the graphs read. Entries
         # past the batch's layout keep an earlier batch's values; the kernels read
-        # only the tiles that the layout's header counts and the plan after them.
+        # only the tiles that the layout's header counts.
         batch_layout = metadata.host_layout
         self._graph_metadata.layout[: len(batch_layout)].copy_(
             batch_layout, non_blocking=True
