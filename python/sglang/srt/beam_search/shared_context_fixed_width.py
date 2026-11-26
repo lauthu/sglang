@@ -188,7 +188,7 @@ def build_fixed_width_metadata(
     return BeamAttentionMetadata(buckets=buckets, num_rows=len(batch.seq_lens))
 
 
-def forward_fixed_width(
+def forward(
     q: torch.Tensor,
     layer: RadixAttention,
     metadata: BeamAttentionMetadata,

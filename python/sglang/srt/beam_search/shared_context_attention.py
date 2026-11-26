@@ -11,7 +11,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Shared-context decode attention for wide beam batches."""
+"""Shared-context decode attention for wide beam batches.
+
+This module decides whether a server runs it and which of its two layouts a
+beam decode batch gets; each layout has a module of its own:
+- fixed-width (shared_context_fixed_width): buckets of requests that share a
+  beam width, one kernel launch per bucket.
+- variable-width (shared_context_variable_width): one layout for any beam
+  widths, on a server whose beam decode graphs take any width.
+"""
 
 from __future__ import annotations
 
@@ -21,13 +29,9 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.beam_search import shared_context_fixed_width as fixed_width
 from sglang.srt.beam_search import shared_context_variable_width as variable_width
 from sglang.srt.beam_search.decode_graph_settings import variable_width_graphs_enabled
-from sglang.srt.beam_search.shared_context_fixed_width import (
-    BeamAttentionMetadata,
-    build_fixed_width_metadata,
-    forward_fixed_width,
-)
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -94,7 +98,8 @@ def build_metadata(
     batch: ScheduleBatch,
     model_runner: ModelRunner,
 ) -> Optional[
-    BeamAttentionMetadata | variable_width.VariableWidthBeamAttentionMetadata
+    fixed_width.BeamAttentionMetadata
+    | variable_width.VariableWidthBeamAttentionMetadata
 ]:
     if batch.beam_tail is None or not batch.forward_mode.is_decode() or not enabled():
         return None
@@ -111,7 +116,9 @@ def build_metadata(
             req_to_token=model_runner.req_to_token_pool.req_to_token,
             stream_k_grid=variable_width.get_stream_k_grid(model_runner),
         )
-    return build_fixed_width_metadata(batch=batch, model_runner=model_runner)
+    return fixed_width.build_fixed_width_metadata(
+        batch=batch, model_runner=model_runner
+    )
 
 
 def forward(
@@ -130,7 +137,7 @@ def forward(
     k_buffer, v_buffer = kv_layers.read(layer.layer_id).kv()
     if k_buffer.ndim != 3 or v_buffer.ndim != 3:
         raise RuntimeError("Shared-context attention requires 3D MHA K/V cache buffers")
-    # A variable-width layout has no buckets; its own kernels read it.
+    # Each layout has its own kernels.
     if isinstance(metadata, variable_width.VariableWidthBeamAttentionMetadata):
         return variable_width.forward(
             q=q,
@@ -140,6 +147,6 @@ def forward(
             k_buffer=k_buffer,
             v_buffer=v_buffer,
         )
-    return forward_fixed_width(
+    return fixed_width.forward(
         q=q, layer=layer, metadata=metadata, k_buffer=k_buffer, v_buffer=v_buffer
     )
