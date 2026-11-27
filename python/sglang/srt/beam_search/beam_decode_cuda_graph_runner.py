@@ -33,14 +33,16 @@ import msgspec
 import torch
 
 from sglang.srt.beam_search import shared_context_attention
-from sglang.srt.beam_search import shared_context_variable_width as variable_width
 from sglang.srt.beam_search.forward_inputs import BeamForwardInputs
 from sglang.srt.beam_search.shared_context_attention import (
     BeamAttentionBucket,
     BeamAttentionMetadata,
 )
-from sglang.srt.beam_search.shared_context_variable_width import (
+from sglang.srt.beam_search.shared_context_attention_variable_width import (
+    StreamKGrid,
     VariableWidthBeamAttentionMetadata,
+    allocate_graph_metadata,
+    get_stream_k_grid,
 )
 from sglang.srt.beam_search.trie_config import get_beam_trie_config
 from sglang.srt.environ import envs
@@ -278,7 +280,8 @@ class VariableWidthSharedContextInput:
     SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH is unset.
 
     Nothing about beam widths is captured: a batch describes its beams in one
-    layout that the kernels read at run time (shared_context_variable_width). So:
+    layout that the kernels read at run time
+    (shared_context_attention_variable_width). So:
 
     - Every graph size gets a beam graph.
     - A batch pads to the next size like any decode batch.
@@ -294,9 +297,9 @@ class VariableWidthSharedContextInput:
         max_rows: int,
         device,
         req_to_token: torch.Tensor,
-        stream_k_grid: Optional[variable_width.StreamKGrid],
+        stream_k_grid: Optional[StreamKGrid],
     ):
-        self._graph_metadata = variable_width.allocate_graph_metadata(
+        self._graph_metadata = allocate_graph_metadata(
             max_rows=max_rows,
             device=device,
             req_to_token=req_to_token,
@@ -327,7 +330,7 @@ class VariableWidthSharedContextInput:
             max_rows=max_rows,
             device=model_runner.device,
             req_to_token=model_runner.req_to_token_pool.req_to_token,
-            stream_k_grid=variable_width.get_stream_k_grid(model_runner),
+            stream_k_grid=get_stream_k_grid(model_runner),
         )
 
     def can_capture(self, graph_size: int) -> bool:

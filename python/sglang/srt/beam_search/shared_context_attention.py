@@ -23,7 +23,9 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 import torch
 
-from sglang.srt.beam_search import shared_context_variable_width as variable_width
+from sglang.srt.beam_search import (
+    shared_context_attention_variable_width as variable_width,
+)
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:

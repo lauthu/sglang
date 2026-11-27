@@ -29,7 +29,7 @@ from sglang.kernels.ops.attention.beam_shared_context_variable_width_stream_k im
     shared_context_attention_variable_width_stream_k,
 )
 from sglang.srt.beam_search import shared_context_attention
-from sglang.srt.beam_search.shared_context_variable_width import (
+from sglang.srt.beam_search.shared_context_attention_variable_width import (
     VariableWidthBeamAttentionMetadata,
 )
 from sglang.srt.environ import envs

@@ -51,7 +51,7 @@ from sglang.srt.beam_search.shared_context_attention import (
     BeamAttentionBucket,
     BeamAttentionMetadata,
 )
-from sglang.srt.beam_search.shared_context_variable_width import (
+from sglang.srt.beam_search.shared_context_attention_variable_width import (
     BEAMS_PER_TILE,
     StreamKGrid,
     VariableWidthBeamAttentionMetadata,

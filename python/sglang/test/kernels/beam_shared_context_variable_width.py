@@ -10,7 +10,7 @@ import torch
 from sglang.kernels.ops.attention import beam_shared_context_variable_width_stream_k
 from sglang.srt.beam_search import shared_context_attention
 from sglang.srt.beam_search.batch_tail import BeamTailEntry
-from sglang.srt.beam_search.shared_context_variable_width import (
+from sglang.srt.beam_search.shared_context_attention_variable_width import (
     StreamKGrid,
     build_variable_width_metadata,
 )

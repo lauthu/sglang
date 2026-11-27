@@ -31,7 +31,7 @@ Terms:
   units are its prompt blocks (BLOCK_N tokens each), then its decode steps.
 
 The layout is one int32 tensor that the host writes per batch
-(srt/beam_search/shared_context_variable_width.py), its parts back to back:
+(srt/beam_search/shared_context_attention_variable_width.py), its parts back to back:
 - header: [number of tiles, number of real rows]
 - for the stream-K kernel only: its plan
   (beam_shared_context_variable_width_stream_k.py), of one length for any batch
