@@ -13,11 +13,12 @@
 # ==============================================================================
 """Variable-width shared-context attention: the host side.
 
-The beam decode graphs that take any beam width (decode_graph_settings) cannot
-record a width at capture. So instead of per-width buckets of gathered KV slots,
-a decode batch describes its beams in one small int32 layout that the kernels read
-on the GPU. One kernel launch then serves every beam width in the batch, and a
-graph captured for a row count replays any batch of at most that many rows.
+The beam decode graphs that take any beam width
+(SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH unset) cannot record a width at capture. So
+instead of per-width buckets of gathered KV slots, a decode batch describes its
+beams in one small int32 layout that the kernels read on the GPU. One kernel
+launch then serves every beam width in the batch, and a graph captured for a row
+count replays any batch of at most that many rows.
 
 Terms:
 - group: the beams of one request. Its leader is the request's own batch row; its
@@ -42,7 +43,7 @@ import msgspec
 import numpy as np
 import torch
 
-from sglang.srt.beam_search.decode_graph_settings import variable_width_kernel
+from sglang.srt.environ import envs
 from sglang.srt.utils.device import is_pin_memory_available
 
 if TYPE_CHECKING:
@@ -57,6 +58,8 @@ if TYPE_CHECKING:
 # Beams per tile, passed to the kernels as block_m. Not swept for these kernels:
 # it is beam_shared_context.py's tile size for up to 5 groups.
 BEAMS_PER_TILE = 128
+# The variable-width layout has no split-KV kernel.
+_KERNELS = ("default", "stream_k")
 
 
 class StreamKGrid(msgspec.Struct, frozen=True):
@@ -102,6 +105,17 @@ class _Tile(msgspec.Struct, frozen=True):
     first_beam: int
 
 
+def _selected_kernel() -> str:
+    kernel = envs.SGLANG_BEAM_SHARED_CONTEXT_KERNEL.get()
+    if kernel not in _KERNELS:
+        raise ValueError(
+            f"SGLANG_BEAM_SHARED_CONTEXT_KERNEL is {kernel!r}, not one of "
+            f"{_KERNELS}: the beam decode graphs for any beam width "
+            "(SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH unset) have no other kernel."
+        )
+    return kernel
+
+
 _stream_k_grids: weakref.WeakKeyDictionary[ModelRunner, StreamKGrid] = (
     weakref.WeakKeyDictionary()
 )
@@ -110,7 +124,7 @@ _stream_k_grids: weakref.WeakKeyDictionary[ModelRunner, StreamKGrid] = (
 def get_stream_k_grid(model_runner: ModelRunner) -> Optional[StreamKGrid]:
     """The stream-K kernel's grid on this server; None when the default kernel
     runs. Evaluated once per runner."""
-    if variable_width_kernel() != "stream_k":
+    if _selected_kernel() != "stream_k":
         return None
     grid = _stream_k_grids.get(model_runner)
     if grid is None:

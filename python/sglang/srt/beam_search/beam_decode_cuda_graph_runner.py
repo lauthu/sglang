@@ -34,7 +34,6 @@ import torch
 
 from sglang.srt.beam_search import shared_context_attention
 from sglang.srt.beam_search import shared_context_variable_width as variable_width
-from sglang.srt.beam_search.decode_graph_settings import variable_width_graphs_enabled
 from sglang.srt.beam_search.forward_inputs import BeamForwardInputs
 from sglang.srt.beam_search.shared_context_fixed_width import (
     BeamAttentionBucket,
@@ -438,7 +437,7 @@ def _create_beam_graph_inputs(model_runner: ModelRunner) -> Optional[BeamGraphIn
     ):
         input_class = (
             VariableWidthSharedContextInput
-            if variable_width_graphs_enabled()
+            if shared_context_attention.variable_width_graphs_enabled()
             else FixedWidthSharedContextInput
         )
         shared_context_input = input_class.create(model_runner, max_rows=max_rows)

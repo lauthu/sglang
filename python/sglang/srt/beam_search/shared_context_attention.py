@@ -31,7 +31,6 @@ import torch
 
 from sglang.srt.beam_search import shared_context_fixed_width as fixed_width
 from sglang.srt.beam_search import shared_context_variable_width as variable_width
-from sglang.srt.beam_search.decode_graph_settings import variable_width_graphs_enabled
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -46,6 +45,16 @@ logger = logging.getLogger(__name__)
 
 def enabled() -> bool:
     return envs.SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION.get()
+
+
+def variable_width_graphs_enabled() -> bool:
+    """SGLANG_ENABLE_BEAM_DECODE_GRAPH is on with no fixed width. With
+    shared-context attention on, which the callers check, the beam decode graphs
+    then take any beam width."""
+    return (
+        envs.SGLANG_ENABLE_BEAM_DECODE_GRAPH.get()
+        and envs.SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH.get() is None
+    )
 
 
 def _unsupported_reason(model_runner: ModelRunner) -> Optional[str]:
