@@ -22,8 +22,8 @@ Terms:
   the leader; beam i >= 1 is member row `first member row + i - 1`.
 - pool row: a batch row's row of req_to_token, req_pool_indices[row]. It lists
   the KV slots of the row's tokens.
-- tile: up to BLOCK_M consecutive beams of one group, the work of one program at
-  a time.
+- tile: up to BLOCK_M consecutive beams of one group. A kernel attends a tile's
+  beams together.
 - real rows: the rows of the batch; each is in exactly one tile. A CUDA graph
   captured for more rows has padding rows after them; they are in no tile and
   their output is written as zeros.
@@ -37,7 +37,7 @@ The layout is one int32 tensor that the host writes per batch
   (beam_shared_context_variable_width_stream_k.py), of one length for any batch
 - per tile: (leader row, first member row, members, prompt length, first beam)
 The kernels take the parts as separate tensors, views of that one upload
-(split_layout, once per upload). The tensor may be longer than a batch's layout:
+(split_layout). The tensor may be longer than a batch's layout:
 the header counts the tiles, and no tile past them is read.
 Beam widths live in this tensor, not in the launch arguments, so a graph captured
 for a row count replays for any widths that add up to at most that many rows.
@@ -74,7 +74,7 @@ _PROGRAMS_PER_SM = 8
 # int32 entries of the layout's header and of one tile.
 HEADER_FIELDS = 2
 TILE_FIELDS = 5
-# An end of a work unit range that is past any tile's last unit: the whole tile.
+# A work_end past any tile's last work unit: attend to the tile's end.
 WHOLE_TILE = 1 << 30
 
 
@@ -256,7 +256,7 @@ def _attend_prompt_blocks(
     HEAD_DIM: tl.constexpr,
     BLOCK_N: tl.constexpr,  # prompt tokens per block
     BLOCK_D: tl.constexpr,  # HEAD_DIM rounded up to a power of 2
-    INT64_KV_OFFSETS: tl.constexpr,  # False needs K/V caches of < 2^31 elements
+    INT64_KV_OFFSETS: tl.constexpr,  # False needs every K/V element offset < 2^31
 ):
     """All beams of a tile attend blocks [first_block, end_block) of their group's
     prompt, the same BLOCK_N tokens at a time. Returns the softmax state after."""
@@ -329,7 +329,7 @@ def _attend_decode_steps(
     stride_v_head,  # v_buffer.stride(1)
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,  # HEAD_DIM rounded up to a power of 2
-    INT64_KV_OFFSETS: tl.constexpr,  # False needs K/V caches of < 2^31 elements
+    INT64_KV_OFFSETS: tl.constexpr,  # False needs every K/V element offset < 2^31
 ):
     """Each beam of a tile attends the tokens it generated at decode steps
     [first_step, end_step), one step at a time. Returns the softmax state after."""
@@ -398,13 +398,13 @@ def attend_tile(
     BLOCK_N: tl.constexpr,  # prompt tokens per block
     BLOCK_D: tl.constexpr,  # HEAD_DIM rounded up to a power of 2
     TILE_FIELDS: tl.constexpr,
-    INT64_KV_OFFSETS: tl.constexpr,  # False needs K/V caches of < 2^31 elements
+    INT64_KV_OFFSETS: tl.constexpr,  # False needs every K/V element offset < 2^31
 ):
     """Attend one tile for one query head over its work units [work_start, work_end).
 
     Returns (rows, beam_mask, max_values, normalizers, accumulator): the tile's
-    batch rows, which of its beams exist, and the softmax state after the units.
-    The attention output of a whole tile is accumulator / normalizers.
+    batch rows, which of its beams exist, and the softmax state after those work
+    units. The attention output of a whole tile is accumulator / normalizers.
     """
     kv_head = q_head // Q_PER_KV
     beam_offsets = tl.arange(0, BLOCK_M)
@@ -555,6 +555,7 @@ def _variable_width_shared_context_kernel(
             BLOCK_N=BLOCK_N,
             BLOCK_D=BLOCK_D,
             TILE_FIELDS=TILE_FIELDS,
+            # 64-bit K/V offsets for any cache; the stream-K kernel picks per cache.
             INT64_KV_OFFSETS=True,
         )
         store_output(
@@ -602,7 +603,7 @@ def check_variable_width_inputs(
     row_count: torch.Tensor,
     tiles: torch.Tensor,
 ) -> None:
-    """Check the inputs that both kernels of this layout read."""
+    """Check the inputs that both entry points of this layout take."""
     if q.ndim != 3 or q.stride(2) != 1:
         raise ValueError(
             f"Expected Q [rows, heads, dim] with unit dim stride, got {q.shape}"

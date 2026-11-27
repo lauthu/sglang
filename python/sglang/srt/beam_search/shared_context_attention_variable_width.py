@@ -26,8 +26,9 @@ Terms:
 - tile: up to BEAMS_PER_TILE consecutive beams of one group. The kernels work
   tile by tile.
 - layout: one int32 tensor that lists a batch's tiles and, for the stream-K
-  kernel, its plan: which tiles each of the kernel's CTAs attends. Its format is
-  in kernels/ops/attention/beam_shared_context_variable_width.py.
+  kernel, its plan: the share of the batch's work that each of the kernel's CTAs
+  does. Its format is in
+  kernels/ops/attention/beam_shared_context_variable_width.py.
 
 The layout is built on the host once per decode step and uploaded once: into the
 graph's buffer when a graph replays the batch, into a tensor of its own otherwise.
@@ -65,7 +66,7 @@ _KERNELS = ("default", "stream_k")
 class StreamKGrid(msgspec.Struct, frozen=True):
     """What a stream-K plan is built for; fixed for a server's model and GPU."""
 
-    # Query heads of an attention layer on this rank.
+    # Query heads of an attention layer on this tensor-parallel rank.
     q_heads: int
     # CTAs of the kernel's grid: one per SM of the GPU.
     num_ctas: int
@@ -123,7 +124,7 @@ _stream_k_grids: weakref.WeakKeyDictionary[ModelRunner, StreamKGrid] = (
 
 def get_stream_k_grid(model_runner: ModelRunner) -> Optional[StreamKGrid]:
     """The stream-K kernel's grid on this server; None when the default kernel
-    runs. Evaluated once per runner."""
+    runs. The grid is computed once per runner."""
     if _selected_kernel() != "stream_k":
         return None
     grid = _stream_k_grids.get(model_runner)
@@ -188,8 +189,8 @@ def build_variable_width_metadata(
         return None
 
     # Header [tile count, real rows], then the stream-K plan, then each tile's
-    # fields: the order the kernels' entry points split the layout in. The plan is
-    # before the tiles because its length does not depend on the batch.
+    # fields: the order split_layout reads them in. The plan is before the tiles
+    # because its length does not depend on the batch.
     parts = [np.array([len(tiles), num_rows], dtype=np.int32)]
     if stream_k_grid is not None:
         parts.append(
@@ -296,8 +297,8 @@ def device_layout_parts(
 
 def _attention_kernel(stream_k: bool):
     """The kernel a layout runs, chosen by SGLANG_BEAM_SHARED_CONTEXT_KERNEL. Both
-    take the same inputs; the stream-K kernel also takes its plan and grid size. Its module
-    says how the two differ."""
+    take the same inputs; the stream-K kernel also takes its plan and grid size.
+    Its module says how the two differ."""
     if stream_k:
         from sglang.kernels.ops.attention.beam_shared_context_variable_width_stream_k import (
             shared_context_attention_variable_width_stream_k,

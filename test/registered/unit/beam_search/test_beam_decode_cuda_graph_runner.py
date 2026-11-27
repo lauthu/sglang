@@ -390,9 +390,9 @@ def _variable_width_graph_inputs(max_rows, *, trie_head=True):
 
 
 def _read_layout(layout):
-    """What a layout buffer holds: (real rows, tiles). The format the kernels
-    read is a header of [tiles, real rows], then per tile (leader row, first
-    member row, members, prompt length, first beam)."""
+    """What a layout buffer without a stream-K plan holds: (real rows, tiles). The
+    format the kernels read is a header of [tiles, real rows], then per tile
+    (leader row, first member row, members, prompt length, first beam)."""
     header_len, tile_fields = 2, 5
     num_tiles, num_real_rows = layout[:header_len].tolist()
     tiles = layout[header_len : header_len + tile_fields * num_tiles]
@@ -580,10 +580,13 @@ PROMPT_BLOCK = 64
 class TestStreamKPlan(CustomTestCase):
     def test_plan_attends_every_work_unit_once_and_merges_what_it_splits(self):
         """What the stream-K kernels rely on, for any batch, grid and way to place
-        the ranges: the parts of a (tile, head) cover its work units once and in
-        order; one in a single part is written directly; a split one is merged
-        once, from the CTA with its first part to the CTA with its last, and the
-        merge kernel reads each part from the slot its CTA wrote."""
+        the ranges:
+        - the parts of a (tile, head) cover its work units once and in order;
+        - a (tile, head) in a single part is written directly;
+        - a split one is merged once, from the CTA with its first part to the CTA
+          with its last;
+        - the merge kernel reads each part from the slot its CTA wrote.
+        """
         # (prompt blocks, decode steps) of each tile.
         batches = {
             "one request": [(32, 2)] * 2,
