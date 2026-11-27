@@ -89,17 +89,18 @@ class TestVariableWidthSharedContextAttention(CustomTestCase):
                     case, build_case_metadata(case, stream_k=stream_k)
                 )
 
-    def test_stream_k_any_cut_of_the_units_matches_fp32_reference(self):
-        """Wherever the CTAs' runs cut the work (inside a prompt, at a decode step,
-        between heads, tiles and groups, with CTAs left without units), the
-        segments merge into the same attention; so do whole tasks per CTA."""
+    def test_stream_k_ranges_cut_anywhere_match_fp32_reference(self):
+        """Wherever the CTAs' ranges cut the work (inside a prompt, at a decode step,
+        between heads, tiles and groups, with CTAs left an empty range), the parts
+        merge into the same attention; so do ranges that end only between (tile,
+        head) pairs."""
         mixed = variable_width_case(
             widths=(2, 129, 2, 300, 3, 7),
             prompt_lens=(1, 700, 64, 513, 2048, 130),
             decode_lens=(5, 1, 2, 4, 1, 3),
             max_context=4096,
         )
-        # 4 tasks of 3 units each: most of the 64 CTAs get no unit.
+        # 4 heads of one tile of 2 work units: most of the 64 CTAs get an empty range.
         tiny = variable_width_case(widths=(2,), prompt_lens=(1,), decode_lens=(1,))
         launches = (
             (mixed, 1, ALWAYS_SPLIT),
@@ -114,7 +115,7 @@ class TestVariableWidthSharedContextAttention(CustomTestCase):
                 self.subTest(
                     launch=index,
                     num_ctas=num_ctas,
-                    whole_tasks=split_cost_units == NEVER_SPLIT,
+                    never_split=split_cost_units == NEVER_SPLIT,
                 ),
                 stream_k_split_cost(split_cost_units),
             ):

@@ -27,7 +27,7 @@ import torch
 
 from sglang.kernels.ops.attention.beam_shared_context_variable_width_stream_k import (
     build_stream_k_plan,
-    task_units,
+    work_units,
 )
 from sglang.srt.beam_search import (
     beam_decode_cuda_graph_runner,
@@ -578,20 +578,20 @@ PROMPT_BLOCK = 64
 
 
 class TestStreamKPlan(CustomTestCase):
-    def test_plan_attends_every_work_unit_once_and_lists_every_split_task(self):
-        """What the stream-K kernels rely on, for any batch, grid and choice of
-        splitting: the segments of a task cover its work units once and in order;
-        a task in one piece is written directly; a split task is listed once, by
-        the CTA with its first segment, up to the CTA with its last, and its later
-        segments are where the merge kernel reads them."""
-        # (prompt blocks, decode steps) of each tile's tasks.
+    def test_plan_attends_every_work_unit_once_and_merges_what_it_splits(self):
+        """What the stream-K kernels rely on, for any batch, grid and way to place
+        the ranges: the parts of a (tile, head) cover its work units once and in
+        order; one in a single part is written directly; a split one is merged
+        once, from the CTA with its first part to the CTA with its last, and the
+        merge kernel reads each part from the slot its CTA wrote."""
+        # (prompt blocks, decode steps) of each tile.
         batches = {
             "one request": [(32, 2)] * 2,
             "eight requests": [(32, 2)] * 16,
             "uneven tiles": [(1, 1), (11, 3), (1, 5), (32, 1), (8, 2), (3, 1)],
             "one tiny tile": [(1, 1)],
         }
-        # None: the plan chooses between whole tasks and equal runs, as in serving.
+        # None: the plan chooses how to place the ranges, as in serving.
         for (name, tiles), q_heads, num_ctas, split_cost_units in itertools.product(
             batches.items(),
             (1, 16),
@@ -609,20 +609,24 @@ class TestStreamKPlan(CustomTestCase):
                 )
                 if split_cost_units is not None:
                     stack.enter_context(stream_k_split_cost(split_cost_units))
-                split_tasks = self._check_plan(
+                split_pairs = self._check_plan(
                     tiles, q_heads=q_heads, num_ctas=num_ctas
                 )
                 if split_cost_units == NEVER_SPLIT:
-                    self.assertEqual(split_tasks, 0)
+                    self.assertEqual(split_pairs, 0)
                 if split_cost_units == ALWAYS_SPLIT and num_ctas == 188:
-                    self.assertGreater(split_tasks, 0)
+                    self.assertGreater(split_pairs, 0)
 
     def _check_plan(self, tiles, *, q_heads, num_ctas):
-        """Check one plan as the kernels read it; returns its number of split tasks."""
-        work_units = [blocks + steps for blocks, steps in tiles for _ in range(q_heads)]
+        """Check one plan as the kernels read it; returns its number of split
+        (tile, head) pairs."""
+        # Of each (tile, head) pair, in the plan's order.
+        num_work_units = [
+            blocks + steps for blocks, steps in tiles for _ in range(q_heads)
+        ]
         plan = build_stream_k_plan(
-            task_units_per_tile=[
-                task_units(prompt_len=PROMPT_BLOCK * blocks, decode_len=steps)
+            work_units_per_tile=[
+                work_units(prompt_len=PROMPT_BLOCK * blocks, decode_len=steps)
                 for blocks, steps in tiles
             ],
             q_heads=q_heads,
@@ -630,59 +634,69 @@ class TestStreamKPlan(CustomTestCase):
         ).tolist()
         self.assertEqual(len(plan), num_ctas)
 
-        # Per task, its segments in CTA order: (cta, work start, work end, partial, slot).
-        segments = collections.defaultdict(list)
-        # Per listed task: (listing cta, last cta, first slot).
-        listed = {}
+        # Per pair, its parts in CTA order: (cta, work start, work end, partial, slot).
+        parts = collections.defaultdict(list)
+        # Per merged pair: the CTAs whose slots the merge kernel reads.
+        merges = {}
+        # CTAs with an empty range; each marks its slot 2 * cta empty.
+        empty_ctas = set()
         for cta, row in enumerate(plan):
-            first_task, end_task, first_start, last_end, first_partial, last_partial = (
-                row[:6]
-            )
-            for task in range(first_task, end_task):
-                is_first, is_last = task == first_task, task == end_task - 1
-                segments[task].append(
+            start_tile, start_head, start_work, end_tile, end_head, end_work = row[:6]
+            merge_end = row[6]
+            first_pair = start_tile * q_heads + start_head
+            end_pair = end_tile * q_heads + end_head
+            is_empty = first_pair == end_pair and start_work == end_work
+            if is_empty:
+                empty_ctas.add(cta)
+            stop_pair = first_pair if is_empty else end_pair + (end_work > 0)
+            for pair in range(first_pair, stop_pair):
+                work_start = start_work if pair == first_pair else 0
+                stops_early = pair == end_pair
+                parts[pair].append(
                     (
                         cta,
-                        first_start if is_first else 0,
-                        last_end if is_last else work_units[task],
-                        bool(
-                            (is_first and first_partial) or (is_last and last_partial)
-                        ),
-                        2 * cta + (0 if is_first else 1),
+                        work_start,
+                        end_work if stops_early else num_work_units[pair],
+                        work_start > 0 or stops_early,
+                        2 * cta + (0 if work_start > 0 else 1),
                     )
                 )
-            tile_plus_1, q_head, last_cta, first_slot = row[6:]
-            if tile_plus_1:
-                task = (tile_plus_1 - 1) * q_heads + q_head
-                self.assertNotIn(task, listed)
-                listed[task] = (cta, last_cta, first_slot)
+            starts_pair = (start_tile, start_head) != (end_tile, end_head) or (
+                start_work == 0
+            )
+            if end_work > 0 and starts_pair:
+                self.assertNotIn(end_pair, merges)
+                merges[end_pair] = list(range(cta, merge_end))
 
-        for task, num_units in enumerate(work_units):
-            parts = segments[task]
-            starts = [start for _, start, _, _, _ in parts]
-            ends = [end for _, _, end, _, _ in parts]
+        written_slots = [2 * cta for cta in empty_ctas]
+        for pair, num_units in enumerate(num_work_units):
+            pair_parts = parts[pair]
+            starts = [start for _, start, _, _, _ in pair_parts]
+            ends = [end for _, _, end, _, _ in pair_parts]
             self.assertEqual(starts, [0, *ends[:-1]])
             self.assertEqual(ends[-1], num_units)
             self.assertTrue(all(start < end for start, end in zip(starts, ends)))
-            if len(parts) == 1:
-                self.assertFalse(parts[0][3])
-                self.assertNotIn(task, listed)
+            if len(pair_parts) == 1:
+                self.assertFalse(pair_parts[0][3])
+                self.assertNotIn(pair, merges)
                 continue
-            self.assertTrue(all(partial for _, _, _, partial, _ in parts))
-            segment_ctas = [cta for cta, _, _, _, _ in parts]
+            self.assertTrue(all(partial for _, _, _, partial, _ in pair_parts))
+            part_slots = {cta: slot for cta, _, _, _, slot in pair_parts}
+            written_slots += part_slots.values()
+            merged_ctas = merges[pair]
             self.assertEqual(
-                listed[task], (segment_ctas[0], segment_ctas[-1], parts[0][4])
+                merged_ctas, list(range(pair_parts[0][0], pair_parts[-1][0] + 1))
             )
-            # The merge kernel reads slot 2 * c of every later CTA c up to the
-            # last; one without a segment has no task and marked that slot empty.
-            self.assertEqual(
-                [slot for _, _, _, _, slot in parts[1:]],
-                [2 * cta for cta in segment_ctas[1:]],
-            )
-            for cta in range(segment_ctas[0] + 1, segment_ctas[-1]):
-                if cta not in segment_ctas:
-                    self.assertEqual(plan[cta][0], plan[cta][1])
-        return len(listed)
+            # The merge kernel reads slot 2 * c + 1 of the first of them, slot 2 * c
+            # of the others; one without a part has an empty range.
+            for cta in merged_ctas:
+                slot = 2 * cta + (1 if cta == merged_ctas[0] else 0)
+                if cta in part_slots:
+                    self.assertEqual(slot, part_slots[cta])
+                else:
+                    self.assertIn(cta, empty_ctas)
+        self.assertEqual(len(written_slots), len(set(written_slots)))
+        return len(merges)
 
 
 if __name__ == "__main__":

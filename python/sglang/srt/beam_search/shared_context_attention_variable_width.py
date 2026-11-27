@@ -219,12 +219,12 @@ def _stream_k_plan(
     # them.
     from sglang.kernels.ops.attention.beam_shared_context_variable_width_stream_k import (
         build_stream_k_plan,
-        task_units,
+        work_units,
     )
 
     return build_stream_k_plan(
-        task_units_per_tile=[
-            task_units(prompt_len=tile.prompt_len, decode_len=decode_len)
+        work_units_per_tile=[
+            work_units(prompt_len=tile.prompt_len, decode_len=decode_len)
             for tile, decode_len in zip(tiles, decode_lens, strict=True)
         ],
         q_heads=grid.q_heads,

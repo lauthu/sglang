@@ -15,8 +15,8 @@ from sglang.srt.beam_search.shared_context_attention_variable_width import (
     build_variable_width_metadata,
 )
 
-# Split costs that force the stream-K plan's choice, whatever the batch: whole
-# tasks per CTA, or equal runs of units, which split tasks.
+# Split costs that force how the stream-K plan places its ranges, whatever the
+# batch: between (tile, head) pairs, or with equal costs, which splits pairs.
 NEVER_SPLIT = 1 << 20
 ALWAYS_SPLIT = -(1 << 20)
 

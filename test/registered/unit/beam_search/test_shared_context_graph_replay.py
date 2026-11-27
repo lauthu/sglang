@@ -136,8 +136,9 @@ class TestVariableWidthGraphReplay(CustomTestCase):
     def test_graph_captured_once_replays_any_widths(self):
         """Capture records no beam width, group count or length: one beam graph
         replays every batch loaded into its layout, and the padding rows after
-        a batch's read 0. With stream-K, the batches alternate between splitting
-        tasks and whole tasks per CTA (the batch of 40 groups)."""
+        a batch's read 0. With stream-K, the batches alternate between ranges that
+        split (tile, head) pairs and ranges that end between them (the batch of 40
+        groups)."""
         batches = (
             dict(widths=(256, 256), prompt_lens=(2048, 7), decode_lens=(2, 1)),
             dict(
