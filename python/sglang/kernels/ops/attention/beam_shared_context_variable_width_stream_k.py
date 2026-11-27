@@ -16,67 +16,72 @@
 Opt-in with SGLANG_BEAM_SHARED_CONTEXT_KERNEL=stream_k on a server whose beam
 decode graphs take any beam width; every batch with the variable-width layout
 there runs it, replayed or eager. It computes what the default kernel
-(beam_shared_context_variable_width.py) computes, from the same layout. That kernel
-gives a program whole tiles, so one request with a long prompt keeps a few SMs
-busy and leaves the others idle; this one shares the work of a batch evenly over
-the SMs.
+(beam_shared_context_variable_width.py) computes, from the same layout:
+- The default kernel gives a program whole tiles, so one request with a long
+  prompt keeps a few SMs busy and leaves the others idle.
+- This kernel has one CTA per SM for any batch and shares the batch's work evenly
+  over them.
 
 Terms (group, tile, pool row, real rows, work unit and the layout are defined in
-that module):
+the default kernel's module):
 - range: the consecutive work units that one CTA attends. Work units are ordered
-  by tile, then by query head, then within their (tile, head). A range is a start
-  and an end in that order, each an index (tile, head, work unit); the end is
-  exclusive.
-- plan: what the host puts in the layout after its header (build_stream_k_plan),
-  one row per CTA: its range and its merge end (see Merge below).
+  by tile, then by query head, then within their (tile, head). A range has a
+  start and an end, each an index (tile, head, work unit); the end is exclusive.
 - partial slot: where a CTA leaves its part of a (tile, head) that its range does
-  not hold whole. CTA c has two, 2 * c and 2 * c + 1, so the workspace has one
+  not hold whole. CTA c has slots 2 * c and 2 * c + 1, so the workspace has one
   size for any batch.
+- merge end of CTA c: the first CTA whose range starts after the (tile, head)
+  that CTA c's range ends in. The parts of that (tile, head) are in the CTAs
+  before it.
+- plan: one row per CTA, with its range and its merge end. The host builds it
+  once per decode step (build_stream_k_plan) and puts it in the layout after the
+  header; every layer's launch reads it.
 
-The grid is persistent: one CTA per SM for any batch. The plan gives the CTAs
-ranges of equal cost, so a range may start and end inside a (tile, head); a work
-unit costs 1 and starting a (tile, head) costs _SETUP_UNITS. Where ranges that
-end only between (tile, head) pairs load no CTA more than that, the plan takes
-those instead (_range_start_costs).
+How the kernels read the row of CTA c:
+1. Attend every (tile, head) from the range's start to its end:
+   - from work unit 0, except in the start's (tile, head);
+   - to the last work unit, except in the end's (tile, head), which is attended
+     only if the end's work unit is above 0.
+2. Store each result:
+   - a (tile, head) attended from work unit 0 to its last: to the output;
+   - a part that starts after work unit 0: to slot 2 * c;
+   - a part that starts at work unit 0 and stops early: to slot 2 * c + 1.
+   A CTA with an empty range (its start is its end) attends nothing and marks
+   slot 2 * c empty.
+3. Merge, if the range ends inside a (tile, head) that it started: the merge
+   kernel combines slot 2 * c + 1 with slot 2 * k of every CTA k after c and
+   before the merge end. The row holds the merge end so that the merge kernel
+   reads no other row to find it.
 
-How the kernels read the range of CTA c:
-- Attend: every (tile, head) from the range's start to its end. From work unit 0,
-  except in the start's (tile, head); to the last work unit, except in the end's,
-  which is attended only if the end's work unit is above 0.
-- Store: a (tile, head) attended from work unit 0 to its last goes to the output.
-  One that starts after 0 goes to slot 2 * c; one that starts at 0 and stops
-  early goes to slot 2 * c + 1.
-- Merge: if the range ends inside a (tile, head) that it started, the merge
-  kernel reads slot 2 * c + 1, then slot 2 * k of every later CTA k whose range
-  starts inside that (tile, head). The row's merge end is the CTA after them.
-  The kernel must not find it by reading the plan's rows: measured on SM120,
-  those reads cost 3% to 8% of a launch for one request of 16 or 64 beams.
-A CTA with an empty range (its start is its end) attends nothing and marks slot
-2 * c empty, for the merge of a (tile, head) split around it.
+How the host places the ranges:
+- The global line holds every (tile, head) in order: _SETUP_UNITS entries for its
+  setup (S below), then one entry per work unit. A position on it is a global
+  index.
+- The plan cuts the line into ranges of equal length, so a range may start and
+  end inside a (tile, head). Where ranges that end only between (tile, head)
+  pairs load no CTA more than that, it takes those instead
+  (_range_global_starts).
+- A range that starts inside a setup starts at that (tile, head)'s first work
+  unit.
 
 Example: 1 tile, 2 heads, 4 prompt blocks (P) and 6 decode steps (D), 3 CTAs.
 
-  work unit     P0 P1 P2 P3 D0 D1 D2 D3 D4 D5 P0 P1 P2 P3 D0 D1 D2 D3 D4 D5
-  its index     0  1  2  3  4  5  6  7  8  9  0  1  2  3  4  5  6  7  8  9
-  query head    0  0  0  0  0  0  0  0  0  0  1  1  1  1  1  1  1  1  1  1
-  CTA           0  0  0  0  0  0  1  1  1  1  1  1  2  2  2  2  2  2  2  2
-  partial slot  1  1  1  1  1  1  2  2  2  2  3  3  4  4  4  4  4  4  4  4
+  global index  0  1  2  3  4  5  6  7  8  9  10 11 12 13 14 15 16 17 18 19 20 21
+  entry         S  P0 P1 P2 P3 D0 D1 D2 D3 D4 D5 S  P0 P1 P2 P3 D0 D1 D2 D3 D4 D5
+  work unit     -  0  1  2  3  4  5  6  7  8  9  -  0  1  2  3  4  5  6  7  8  9
+  query head    0  0  0  0  0  0  0  0  0  0  0  1  1  1  1  1  1  1  1  1  1  1
+  CTA           0  0  0  0  0  0  0  1  1  1  1  1  1  1  2  2  2  2  2  2  2  2
+  partial slot  -  1  1  1  1  1  1  2  2  2  2  -  3  3  4  4  4  4  4  4  4  4
 
-The plan is [[0, 0, 0, 0, 0, 6, 2], [0, 0, 6, 0, 1, 2, 3], [0, 1, 2, 1, 0, 0, 4]]:
-CTA 1's range starts at (tile 0, head 0, work unit 6) and ends at (tile 0, head 1,
-work unit 2), and its merge end is 3: the parts of (tile 0, head 1) are in CTAs 1
-and 2. The merge kernel combines slots 1 and 2 for head 0, slots 3 and 4 for
-head 1.
+- The ranges start at global indices 0, 7 and 14; the global length is 22.
+- The plan is [[0, 0, 0, 0, 0, 6, 2], [0, 0, 6, 0, 1, 2, 3], [0, 1, 2, 1, 0, 0, 4]].
+  CTA 1's range starts at (tile 0, head 0, work unit 6) and ends at (tile 0,
+  head 1, work unit 2). Its merge end is 3: the parts of (tile 0, head 1) are in
+  CTAs 1 and 2.
+- The merge kernel combines slots 1 and 2 for head 0, slots 3 and 4 for head 1.
 
-The host builds the plan once per decode step and every layer's launch reads it.
 A zeroed plan gives every CTA an empty range and nothing to merge, so a graph
 captured on a zeroed layout attends nothing.
-
-Against the default kernel, per launch on SM120 with 2,048-token prompts: 3.0x to
-4.1x faster for one request of 16 to 256 beams, 1.2x to 1.3x for 4 or 8 requests
-of 256 beams, and as fast for a batch of 8 requests that mixes 16, 64 and 256
-beams. That batch already gives each SM about one (tile, head), so nothing is
-left to balance.
 """
 
 from __future__ import annotations
@@ -102,24 +107,21 @@ from sglang.kernels.ops.attention.beam_shared_context_variable_width import (
     zero_padding_rows,
 )
 
-# The fixed-width stream-K kernel's values (beam_shared_context_stream_k.py). This
-# kernel was timed with them on RTX PRO 6000 (SM120), Qwen3-0.6B heads, 1-8 groups
-# of 1-2,000 beams.
+# The fixed-width stream-K kernel's values (beam_shared_context_stream_k.py), not
+# re-tuned for this kernel.
 _BLOCK_N = 64
 _NUM_WARPS = 8
 _NUM_STAGES = 2
-# What starting a (tile, head) costs (a Q load, an output store), in work units.
-# Not swept here: beam_shared_context_stream_k.py measured 1 as the best of 0-3.
+# Entries of the global line that starting a (tile, head) takes: a Q load and an
+# output store. Also the fixed-width stream-K kernel's value.
 _SETUP_UNITS = 1
-# What splitting adds to a CTA's equal share of the cost, in work units (a second
-# Q load, partial stores, the merge). Measured: of 0-16, 2 picks the faster of the
-# two ways to place the ranges (_range_start_costs) at 39 batch shapes.
+# What splitting a (tile, head) adds to a CTA's load, in entries of the global
+# line: a second Q load, the partial stores and the merge. Chosen by measurement.
 _SPLIT_COST_UNITS = 2
-# Measured: merge programs of 8 beams are fastest at 1-4 groups (8-64 tried).
+# Beams per merge program. Chosen by measurement.
 _MERGE_BEAMS = 8
 # K/V offsets are int32 while every element of the caches is below this offset
-# (attend_tile's INT64_KV_OFFSETS). It saves registers: int64 offsets take as many
-# as a third pipeline stage would.
+# (attend_tile's INT64_KV_OFFSETS); int32 offsets take fewer registers.
 _INT32_OFFSET_LIMIT = 2**31
 
 # int32 fields of a plan row, in the order the kernels read them. The CTA's range:
@@ -131,8 +133,7 @@ _PLAN_FIELDS = 7
 
 
 def default_num_ctas(device_index: int) -> int:
-    """The grid of the stream-K kernel on a device: one CTA per SM. On SM120, 8
-    warps of this kernel fill an SM's register file."""
+    """The grid of the stream-K kernel on a device: one CTA per SM."""
     return num_sms(device_index)
 
 
@@ -147,32 +148,34 @@ def plan_len(num_ctas: int) -> int:
     return _PLAN_FIELDS * num_ctas
 
 
-def _range_start_costs(
-    pair_bounds: np.ndarray, longest_pair_cost: int, num_ctas: int
+def _range_global_starts(
+    tile_qhead_global_starts: np.ndarray, longest_tile_qhead_len: int, num_ctas: int
 ) -> np.ndarray:
-    """Where each CTA's range starts, as the cost of the batch's work before it,
-    [num_ctas + 1]; the last entry is the batch's cost, where the last range ends.
+    """The global index where each CTA's range starts, then the global length,
+    [num_ctas + 1].
 
-    pair_bounds is the cost before each (tile, head) pair, in order, then the
-    batch's cost. Two ways to place the ranges:
-    - between pairs: CTA c takes pairs [c * n, (c + 1) * n), n = ceil(pairs / CTAs);
-      the last CTAs get fewer or none, and no pair is split;
-    - equal ranges: every CTA takes the same cost, and a pair that is split costs
-      _SPLIT_COST_UNITS more.
-    Ranges between pairs win unless splitting saves the busiest CTA more than that
-    cost, taking n of the longest pair as its load. So they win when the pairs are
+    tile_qhead_global_starts is the global index where each (tile, head) starts,
+    then the global length. Two ways to place the ranges:
+    1. Between (tile, head) pairs: CTA c takes pairs [c * n, (c + 1) * n), with
+       n = ceil(pairs / CTAs). No pair is split; the last CTAs get fewer or none.
+    2. Equal ranges: every CTA takes the same length of the global line. A pair
+       that is split costs _SPLIT_COST_UNITS more.
+    The first way is taken unless splitting saves the busiest CTA more than that
+    cost, counting n of the longest pair as its load. That is when the pairs are
     short, or when their count is at or just under a multiple of the CTA count.
     """
-    num_pairs = len(pair_bounds) - 1
-    batch_cost = int(pair_bounds[-1])
-    cuts = np.arange(num_ctas + 1, dtype=np.int64)
-    pairs_per_cta = triton.cdiv(num_pairs, num_ctas)
+    num_tile_qheads = len(tile_qhead_global_starts) - 1
+    global_len = int(tile_qhead_global_starts[-1])
+    ctas = np.arange(num_ctas + 1, dtype=np.int64)
+    tile_qheads_per_cta = triton.cdiv(num_tile_qheads, num_ctas)
 
-    between_pairs_cost = pairs_per_cta * longest_pair_cost
-    equal_ranges_cost = triton.cdiv(batch_cost, num_ctas) + _SPLIT_COST_UNITS
-    if between_pairs_cost <= equal_ranges_cost:
-        return pair_bounds[np.minimum(cuts * pairs_per_cta, num_pairs)]
-    return cuts * batch_cost // num_ctas
+    between_tile_qheads_cost = tile_qheads_per_cta * longest_tile_qhead_len
+    equal_ranges_cost = triton.cdiv(global_len, num_ctas) + _SPLIT_COST_UNITS
+    if between_tile_qheads_cost <= equal_ranges_cost:
+        return tile_qhead_global_starts[
+            np.minimum(ctas * tile_qheads_per_cta, num_tile_qheads)
+        ]
+    return ctas * global_len // num_ctas
 
 
 def build_stream_k_plan(
@@ -183,26 +186,35 @@ def build_stream_k_plan(
 
     work_units_per_tile[t] is the `work_units` of tile t, at least one.
     """
-    # A (tile, head) costs _SETUP_UNITS to start, then its work units. pair_bounds
-    # is the cost before each one, in order, then the batch's cost.
-    tile_costs = np.asarray(work_units_per_tile, dtype=np.int64) + _SETUP_UNITS
-    pair_costs = np.repeat(tile_costs, q_heads)
-    pair_bounds = np.concatenate(([0], np.cumsum(pair_costs)))
-    start_costs = _range_start_costs(
-        pair_bounds, longest_pair_cost=int(pair_costs.max()), num_ctas=num_ctas
+    # The global line: every (tile, head) in order, each taking _SETUP_UNITS global
+    # indices for its setup, then one per work unit.
+    tile_qhead_lens = np.repeat(
+        np.asarray(work_units_per_tile, dtype=np.int64) + _SETUP_UNITS, q_heads
     )
-    # Each cost as an index (tile, head, work unit). A cost inside a setup is the
-    # pair's first work unit; the batch's cost is (num_tiles, 0, 0).
-    pair = np.searchsorted(pair_bounds, start_costs, side="right") - 1
-    work_unit = np.maximum(start_costs - pair_bounds[pair] - _SETUP_UNITS, 0)
-    starts = np.stack([pair // q_heads, pair % q_heads, work_unit], axis=1)
+    tile_qhead_global_starts = np.concatenate(([0], np.cumsum(tile_qhead_lens)))
+    range_global_starts = _range_global_starts(
+        tile_qhead_global_starts,
+        longest_tile_qhead_len=int(tile_qhead_lens.max()),
+        num_ctas=num_ctas,
+    )
+    # Each global start as an index (tile, head, work unit). One inside a setup is
+    # the (tile, head)'s first work unit; the global length is (num_tiles, 0, 0).
+    tile_qhead = (
+        np.searchsorted(tile_qhead_global_starts, range_global_starts, side="right") - 1
+    )
+    work_unit = np.maximum(
+        range_global_starts - tile_qhead_global_starts[tile_qhead] - _SETUP_UNITS, 0
+    )
+    range_starts = np.stack(
+        [tile_qhead // q_heads, tile_qhead % q_heads, work_unit], axis=1
+    )
     # CTA c's range ends where CTA c + 1's starts.
-    ends = starts[1:]
-    # The first CTA whose range starts after the pair of each end.
-    merge_end = np.searchsorted(pair, pair[1:], side="right")
-    return np.concatenate((starts[:-1], ends, merge_end[:, None]), axis=1).astype(
-        np.int32
-    )
+    range_ends = range_starts[1:]
+    # The first CTA whose range starts after the (tile, head) of each end.
+    merge_end = np.searchsorted(tile_qhead, tile_qhead[1:], side="right")
+    return np.concatenate(
+        (range_starts[:-1], range_ends, merge_end[:, None]), axis=1
+    ).astype(np.int32)
 
 
 @triton.jit
@@ -261,10 +273,12 @@ def _variable_width_stream_k_kernel(
 
     # The range's (tile, head) pairs in order, numbered tile * Q_HEADS + head. The
     # end's pair is attended only if the range ends inside it.
-    first_pair = start_tile * Q_HEADS + start_head
-    end_pair = end_tile * Q_HEADS + end_head
-    is_empty = (first_pair == end_pair) & (start_work == end_work)
-    stop_pair = tl.where(is_empty, first_pair, end_pair + tl.where(end_work > 0, 1, 0))
+    first_tile_qhead = start_tile * Q_HEADS + start_head
+    end_tile_qhead = end_tile * Q_HEADS + end_head
+    is_empty = (first_tile_qhead == end_tile_qhead) & (start_work == end_work)
+    stop_tile_qhead = tl.where(
+        is_empty, first_tile_qhead, end_tile_qhead + tl.where(end_work > 0, 1, 0)
+    )
 
     if is_empty:
         # The merge of a (tile, head) split around this CTA still reads its slot
@@ -274,10 +288,10 @@ def _variable_width_stream_k_kernel(
             tl.full((BLOCK_M,), -float("inf"), tl.float32),
         )
 
-    for pair in range(first_pair, stop_pair):
-        q_head = pair % Q_HEADS
-        work_start = tl.where(pair == first_pair, start_work, 0)
-        work_end = tl.where(pair == end_pair, end_work, WHOLE_TILE)
+    for tile_qhead in range(first_tile_qhead, stop_tile_qhead):
+        q_head = tile_qhead % Q_HEADS
+        work_start = tl.where(tile_qhead == first_tile_qhead, start_work, 0)
+        work_end = tl.where(tile_qhead == end_tile_qhead, end_work, WHOLE_TILE)
         rows, beam_mask, max_values, normalizers, accumulator = attend_tile(
             q=q,
             k_buffer=k_buffer,
@@ -286,7 +300,7 @@ def _variable_width_stream_k_kernel(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             tiles=tiles,
-            tile_idx=pair // Q_HEADS,
+            tile_idx=tile_qhead // Q_HEADS,
             q_head=q_head,
             work_start=work_start,
             work_end=work_end,
@@ -383,12 +397,12 @@ def _variable_width_merge_kernel(
     q_head = tl.load(plan_row + 4)
     end_work = tl.load(plan_row + 5)
     # The range holds the first work unit of the (tile, head) it ends inside.
-    starts_pair = (
+    starts_tile_qhead = (
         (tl.load(plan_row) != tile_idx)
         | (tl.load(plan_row + 1) != q_head)
         | (tl.load(plan_row + 2) == 0)
     )
-    if (end_work > 0) & starts_pair:
+    if (end_work > 0) & starts_tile_qhead:
         beam_offsets = tl.program_id(1) * MERGE_BEAMS + tl.arange(0, MERGE_BEAMS)
         rows, beam_mask, _, _ = read_tile(
             tiles=tiles,
@@ -466,7 +480,6 @@ def shared_context_attention_variable_width_stream_k(
     Same inputs and output, and:
     - `plan`: the layout's plan of its tiles (`build_stream_k_plan`).
     - `num_ctas`: the grid size; it must be the one the plan was built for.
-    Tuned on SM120 only.
     """
     check_variable_width_inputs(
         q=q,

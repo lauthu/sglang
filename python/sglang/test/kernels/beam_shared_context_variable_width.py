@@ -16,7 +16,7 @@ from sglang.srt.beam_search.shared_context_attention_variable_width import (
 )
 
 # Split costs that force how the stream-K plan places its ranges, whatever the
-# batch: between (tile, head) pairs, or with equal costs, which splits pairs.
+# batch: between (tile, head) pairs, or as equal ranges, which splits pairs.
 NEVER_SPLIT = 1 << 20
 ALWAYS_SPLIT = -(1 << 20)
 

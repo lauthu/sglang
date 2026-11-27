@@ -609,18 +609,18 @@ class TestStreamKPlan(CustomTestCase):
                 )
                 if split_cost_units is not None:
                     stack.enter_context(stream_k_split_cost(split_cost_units))
-                split_pairs = self._check_plan(
+                split_tile_qheads = self._check_plan(
                     tiles, q_heads=q_heads, num_ctas=num_ctas
                 )
                 if split_cost_units == NEVER_SPLIT:
-                    self.assertEqual(split_pairs, 0)
+                    self.assertEqual(split_tile_qheads, 0)
                 if split_cost_units == ALWAYS_SPLIT and num_ctas == 188:
-                    self.assertGreater(split_pairs, 0)
+                    self.assertGreater(split_tile_qheads, 0)
 
     def _check_plan(self, tiles, *, q_heads, num_ctas):
         """Check one plan as the kernels read it; returns its number of split
         (tile, head) pairs."""
-        # Of each (tile, head) pair, in the plan's order.
+        # Of each (tile, head), in the plan's order.
         num_work_units = [
             blocks + steps for blocks, steps in tiles for _ in range(q_heads)
         ]
@@ -634,58 +634,62 @@ class TestStreamKPlan(CustomTestCase):
         ).tolist()
         self.assertEqual(len(plan), num_ctas)
 
-        # Per pair, its parts in CTA order: (cta, work start, work end, partial, slot).
+        # Per (tile, head), its parts in CTA order:
+        # (cta, work start, work end, partial, slot).
         parts = collections.defaultdict(list)
-        # Per merged pair: the CTAs whose slots the merge kernel reads.
+        # Per merged (tile, head): the CTAs whose slots the merge kernel reads.
         merges = {}
         # CTAs with an empty range; each marks its slot 2 * cta empty.
         empty_ctas = set()
         for cta, row in enumerate(plan):
             start_tile, start_head, start_work, end_tile, end_head, end_work = row[:6]
             merge_end = row[6]
-            first_pair = start_tile * q_heads + start_head
-            end_pair = end_tile * q_heads + end_head
-            is_empty = first_pair == end_pair and start_work == end_work
+            first_tile_qhead = start_tile * q_heads + start_head
+            end_tile_qhead = end_tile * q_heads + end_head
+            is_empty = first_tile_qhead == end_tile_qhead and start_work == end_work
             if is_empty:
                 empty_ctas.add(cta)
-            stop_pair = first_pair if is_empty else end_pair + (end_work > 0)
-            for pair in range(first_pair, stop_pair):
-                work_start = start_work if pair == first_pair else 0
-                stops_early = pair == end_pair
-                parts[pair].append(
+            stop_tile_qhead = (
+                first_tile_qhead if is_empty else end_tile_qhead + (end_work > 0)
+            )
+            for tile_qhead in range(first_tile_qhead, stop_tile_qhead):
+                work_start = start_work if tile_qhead == first_tile_qhead else 0
+                stops_early = tile_qhead == end_tile_qhead
+                parts[tile_qhead].append(
                     (
                         cta,
                         work_start,
-                        end_work if stops_early else num_work_units[pair],
+                        end_work if stops_early else num_work_units[tile_qhead],
                         work_start > 0 or stops_early,
                         2 * cta + (0 if work_start > 0 else 1),
                     )
                 )
-            starts_pair = (start_tile, start_head) != (end_tile, end_head) or (
+            starts_tile_qhead = (start_tile, start_head) != (end_tile, end_head) or (
                 start_work == 0
             )
-            if end_work > 0 and starts_pair:
-                self.assertNotIn(end_pair, merges)
-                merges[end_pair] = list(range(cta, merge_end))
+            if end_work > 0 and starts_tile_qhead:
+                self.assertNotIn(end_tile_qhead, merges)
+                merges[end_tile_qhead] = list(range(cta, merge_end))
 
         written_slots = [2 * cta for cta in empty_ctas]
-        for pair, num_units in enumerate(num_work_units):
-            pair_parts = parts[pair]
-            starts = [start for _, start, _, _, _ in pair_parts]
-            ends = [end for _, _, end, _, _ in pair_parts]
+        for tile_qhead, num_units in enumerate(num_work_units):
+            tile_qhead_parts = parts[tile_qhead]
+            starts = [start for _, start, _, _, _ in tile_qhead_parts]
+            ends = [end for _, _, end, _, _ in tile_qhead_parts]
             self.assertEqual(starts, [0, *ends[:-1]])
             self.assertEqual(ends[-1], num_units)
             self.assertTrue(all(start < end for start, end in zip(starts, ends)))
-            if len(pair_parts) == 1:
-                self.assertFalse(pair_parts[0][3])
-                self.assertNotIn(pair, merges)
+            if len(tile_qhead_parts) == 1:
+                self.assertFalse(tile_qhead_parts[0][3])
+                self.assertNotIn(tile_qhead, merges)
                 continue
-            self.assertTrue(all(partial for _, _, _, partial, _ in pair_parts))
-            part_slots = {cta: slot for cta, _, _, _, slot in pair_parts}
+            self.assertTrue(all(partial for _, _, _, partial, _ in tile_qhead_parts))
+            part_slots = {cta: slot for cta, _, _, _, slot in tile_qhead_parts}
             written_slots += part_slots.values()
-            merged_ctas = merges[pair]
+            merged_ctas = merges[tile_qhead]
             self.assertEqual(
-                merged_ctas, list(range(pair_parts[0][0], pair_parts[-1][0] + 1))
+                merged_ctas,
+                list(range(tile_qhead_parts[0][0], tile_qhead_parts[-1][0] + 1)),
             )
             # The merge kernel reads slot 2 * c + 1 of the first of them, slot 2 * c
             # of the others; one without a part has an empty range.
