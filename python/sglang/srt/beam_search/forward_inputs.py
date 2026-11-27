@@ -25,6 +25,9 @@ from sglang.srt.beam_search.trie_output_head import build_trie_row_levels
 
 if TYPE_CHECKING:
     from sglang.srt.beam_search.shared_context_attention import BeamAttentionMetadata
+    from sglang.srt.beam_search.shared_context_attention_variable_width import (
+        VariableWidthBeamAttentionMetadata,
+    )
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -34,7 +37,9 @@ class BeamForwardInputs:
     # Per-row SID codebook depths for trie-conditioned decode batches.
     trie_levels: Optional[torch.Tensor] = None
     # Shared-context attention metadata for all-beam decode batches.
-    attention_metadata: Optional[BeamAttentionMetadata] = None
+    attention_metadata: Optional[
+        BeamAttentionMetadata | VariableWidthBeamAttentionMetadata
+    ] = None
 
 
 def build_beam_forward_inputs(

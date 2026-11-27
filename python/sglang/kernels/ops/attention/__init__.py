@@ -66,6 +66,13 @@ _TRITON_KERNELS = [
     ("beam_shared_context", "shared_context_attention"),
     ("beam_shared_context_split_kv", "shared_context_attention_split_kv"),
     ("beam_shared_context_stream_k", "shared_context_attention_stream_k"),
+    # Shared-context attention for any beam widths in a launch. Two ops: the
+    # registry holds one spec per (op, backend), and stream-K also takes its plan.
+    ("beam_shared_context_variable_width", "shared_context_attention_variable_width"),
+    (
+        "beam_shared_context_variable_width_stream_k",
+        "shared_context_attention_variable_width_stream_k",
+    ),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(

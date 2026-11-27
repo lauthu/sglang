@@ -23,6 +23,9 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 import torch
 
+from sglang.srt.beam_search import (
+    shared_context_attention_variable_width as variable_width,
+)
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -51,6 +54,16 @@ class BeamAttentionMetadata(msgspec.Struct):
 
 def enabled() -> bool:
     return envs.SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION.get()
+
+
+def variable_width_graphs_enabled() -> bool:
+    """SGLANG_ENABLE_BEAM_DECODE_GRAPH is on with no fixed width. With
+    shared-context attention on, which the callers check, the beam decode graphs
+    then take any beam width."""
+    return (
+        envs.SGLANG_ENABLE_BEAM_DECODE_GRAPH.get()
+        and envs.SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH.get() is None
+    )
 
 
 _KERNELS = ("default", "split_kv", "stream_k")
@@ -144,7 +157,9 @@ def _metadata_tensor(values, dtype, device):
 def build_metadata(
     batch: ScheduleBatch,
     model_runner: ModelRunner,
-) -> Optional[BeamAttentionMetadata]:
+) -> Optional[
+    BeamAttentionMetadata | variable_width.VariableWidthBeamAttentionMetadata
+]:
     if batch.beam_tail is None or not batch.forward_mode.is_decode() or not enabled():
         return None
     if not supports_shared_context(model_runner):
@@ -152,7 +167,21 @@ def build_metadata(
     entries = batch.beam_tail.entries
     if not entries or batch.seq_lens_cpu is None:
         return None
+    # A variable-width graph replays only the variable-width layout, so on such a
+    # server every beam decode batch gets it, replayed or not.
+    if variable_width_graphs_enabled():
+        return variable_width.build_variable_width_metadata(
+            batch=batch,
+            req_to_token=model_runner.req_to_token_pool.req_to_token,
+            stream_k_grid=variable_width.get_stream_k_grid(model_runner),
+        )
+    return _build_width_buckets(batch=batch, model_runner=model_runner)
 
+
+def _build_width_buckets(
+    batch: ScheduleBatch, model_runner: ModelRunner
+) -> Optional[BeamAttentionMetadata]:
+    entries = batch.beam_tail.entries
     widths = [entry.end - entry.start + 1 for entry in entries]
     if any(width <= 1 for width in widths):
         return None
@@ -263,6 +292,16 @@ def forward(
     k_buffer, v_buffer = kv_layers.read(layer.layer_id).kv()
     if k_buffer.ndim != 3 or v_buffer.ndim != 3:
         raise RuntimeError("Shared-context attention requires 3D MHA K/V cache buffers")
+    # A variable-width layout has no buckets; its own kernels read it.
+    if isinstance(metadata, variable_width.VariableWidthBeamAttentionMetadata):
+        return variable_width.forward(
+            q=q,
+            layer=layer,
+            forward_batch=forward_batch,
+            metadata=metadata,
+            k_buffer=k_buffer,
+            v_buffer=v_buffer,
+        )
 
     q_heads = layer.tp_q_head_num
     head_dim = layer.head_dim

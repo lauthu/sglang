@@ -6,6 +6,9 @@
 - Acceptance: sequence-set overlap vs HF transformers >= 0.8 for k in {2, 10}.
 - TestBeamParityDecodeGraph: the same acceptance on a server that replays
   all-beam decode batches as CUDA graphs.
+- TestBeamParityVariableWidthDecodeGraph: the same on graphs that take any beam
+  width (no SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH); TestBeamParityVariableWidthStreamK
+  with their stream-K kernel.
 
 Manual test (GPU host): python3 test_beam_parity.py
 """
@@ -188,6 +191,45 @@ class TestBeamParityDecodeGraph(TestBeamParity):
         after = _decode_passes(self.base_url)
         self.assertGreater(after["decode_cuda_graph"], before["decode_cuda_graph"])
         self.assertEqual(after["decode_none"], before["decode_none"])
+
+
+class TestBeamParityVariableWidthDecodeGraph(TestBeamParity):
+    """The same acceptance on the variable-width graphs: requests of any beam width
+    replay graphs of the default decode graph sizes, with no width and no token
+    budget set."""
+
+    # At 2 beams this prompt's search sits on a near-tie between two prefixes, which
+    # attention implementations resolve differently by rounding.
+    parity_beam_widths = (10,)
+    server_env = {
+        "SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION": "1",
+        "SGLANG_ENABLE_BEAM_DECODE_GRAPH": "1",
+    }
+    # Shared-context attention needs FlashInfer decode attention.
+    server_args = ("--decode-attention-backend", "flashinfer", "--enable-metrics")
+
+    def test_every_beam_width_replays_a_beam_graph(self):
+        """Parity alone also passes when every beam batch falls back to eager
+        decode, or to the ordinary decode graph without shared-context attention."""
+        self.assertIn(
+            "(compact trie head off, shared-context attention on)",
+            self.server_log.getvalue(),
+        )
+        for beam_width in (2, 10):
+            before = _decode_passes(self.base_url)
+            self._generate_beams(beam_width)
+            after = _decode_passes(self.base_url)
+            self.assertGreater(after["decode_cuda_graph"], before["decode_cuda_graph"])
+            self.assertEqual(after["decode_none"], before["decode_none"])
+
+
+class TestBeamParityVariableWidthStreamK(TestBeamParityVariableWidthDecodeGraph):
+    """The same with the variable-width graphs' stream-K kernel."""
+
+    server_env = {
+        **TestBeamParityVariableWidthDecodeGraph.server_env,
+        "SGLANG_BEAM_SHARED_CONTEXT_KERNEL": "stream_k",
+    }
 
 
 if __name__ == "__main__":

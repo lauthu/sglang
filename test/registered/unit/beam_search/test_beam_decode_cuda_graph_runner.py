@@ -12,8 +12,11 @@
 # limitations under the License.
 # ==============================================================================
 """What a beam decode graph replays: the batch loaded into its buffers, and only
-a batch that fits them."""
+a batch that fits them. Also the stream-K plan that the host adds to a
+variable-width batch's layout."""
 
+import collections
+import contextlib
 import itertools
 import unittest
 from types import SimpleNamespace
@@ -22,23 +25,49 @@ from unittest.mock import patch
 import msgspec
 import torch
 
-from sglang.srt.beam_search import beam_decode_cuda_graph_runner
+from sglang.kernels.ops.attention.beam_shared_context_variable_width_stream_k import (
+    build_stream_k_plan,
+    work_units,
+)
+from sglang.srt.beam_search import (
+    beam_decode_cuda_graph_runner,
+    shared_context_attention,
+    trie_output_head,
+)
+from sglang.srt.beam_search.batch_tail import BeamTailEntry
 from sglang.srt.beam_search.beam_decode_cuda_graph_runner import (
     BeamGraphInputs,
     FixedWidthCapacity,
     FixedWidthSharedContextInput,
     TrieLevelsInput,
+    VariableWidthSharedContextInput,
+    _create_beam_graph_inputs,
 )
-from sglang.srt.beam_search.forward_inputs import BeamForwardInputs
+from sglang.srt.beam_search.forward_inputs import (
+    BeamForwardInputs,
+    build_beam_forward_inputs,
+)
 from sglang.srt.beam_search.shared_context_attention import (
     BeamAttentionBucket,
     BeamAttentionMetadata,
 )
+from sglang.srt.beam_search.shared_context_attention_variable_width import (
+    BEAMS_PER_TILE,
+    StreamKGrid,
+    VariableWidthBeamAttentionMetadata,
+    build_variable_width_metadata,
+)
+from sglang.srt.beam_search.trie_config import TrieOutputHeadConfig
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.kernels.beam_shared_context_variable_width import (
+    ALWAYS_SPLIT,
+    NEVER_SPLIT,
+    stream_k_split_cost,
+)
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 CAPACITY = FixedWidthCapacity(beam_width=2, max_context_len=4, max_decode_len=3)
 
@@ -205,11 +234,11 @@ class TestFixedWidthSharedContextInput(CustomTestCase):
         for decode_len in bucket.decode_lens.tolist():
             self.assertIn(decode_len, range(1, CAPACITY.max_decode_len + 1))
 
-    def test_graphs_need_a_width_and_a_token_budget(self):
-        """The graph is captured for one beam width and a fixed number of decode
-        steps. Nothing but the operator knows the width, and without a trie
-        nothing bounds the steps, so a server that sets neither captures no graph.
-        A step attends the tokens generated before it: one fewer than the budget."""
+    def test_graphs_need_a_token_budget(self):
+        """The graph is captured for a fixed number of decode steps. Without a trie
+        nothing bounds the steps, so a server that sets no budget captures no
+        graph. A step attends the tokens generated before it: one fewer than the
+        budget."""
         runner = SimpleNamespace(
             lora_manager=None,
             device="cpu",
@@ -217,7 +246,6 @@ class TestFixedWidthSharedContextInput(CustomTestCase):
         )
         cases = (
             # (width, max new tokens, trie codebooks) -> max_decode_len, or None for no graph
-            ((None, 4, None), None),
             ((2, None, None), None),
             ((2, 4, None), 3),
             ((2, None, 3), 2),
@@ -253,6 +281,429 @@ class TestFixedWidthSharedContextInput(CustomTestCase):
                             max_decode_len=max_decode_len,
                         ),
                     )
+
+
+_TRIE_CONFIG = TrieOutputHeadConfig(
+    tensor_path="/unused/trie_output_head.safetensors",
+    token_start=8,
+    codebook_size=4,
+    num_codebooks=2,
+)
+
+
+def _model_runner(compact_head=True, lora=False):
+    """The model runner fields the forward-input builders and the beam graph
+    inputs read."""
+    return SimpleNamespace(
+        beam_trie_compact_enabled=compact_head,
+        lora_manager=object() if lora else None,
+        model_config=SimpleNamespace(context_len=8),
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=torch.zeros(4, 8, dtype=torch.int32)
+        ),
+        device=torch.device("cpu"),
+        max_decode_logits_rows=lambda: 600,
+    )
+
+
+@contextlib.contextmanager
+def _shared_context_server(*, decode_graphs=True, fixed_width=None, kernel="default"):
+    """The settings of a server with shared-context attention on and supported.
+    With the beam decode graphs on and no fixed width, its graphs are the
+    variable-width ones."""
+    with contextlib.ExitStack() as stack:
+        overrides = (
+            (envs.SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION, True),
+            (envs.SGLANG_ENABLE_BEAM_DECODE_GRAPH, decode_graphs),
+            (envs.SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH, fixed_width),
+            (envs.SGLANG_BEAM_SHARED_CONTEXT_KERNEL, kernel),
+        )
+        for setting, value in overrides:
+            stack.enter_context(setting.override(value))
+        stack.enter_context(
+            patch.object(
+                shared_context_attention, "supports_shared_context", return_value=True
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                trie_output_head, "get_beam_trie_config", return_value=_TRIE_CONFIG
+            )
+        )
+        yield
+
+
+# Entries of _decode_batch's `widths` that are not a live beam group.
+REGULAR_REQUEST = 1
+FINISHED_GROUP = 0
+
+
+def _decode_batch(widths, prompt_len=7, decode_len=2):
+    """A decode batch of one request per entry of `widths`: a beam width, or
+    REGULAR_REQUEST (a request with its own KV), or FINISHED_GROUP (the leader of
+    a beam group that has no member rows left).
+
+    Rows are laid out as the scheduler does: one row per request, in order, then
+    each live beam group's member rows.
+    """
+    reqs, entries, leader_lens, member_lens = [], [], [], []
+    for row, width in enumerate(widths):
+        if width == REGULAR_REQUEST:
+            reqs.append(SimpleNamespace(beam_group=None))
+            leader_lens.append(40 + row)
+            continue
+        group = SimpleNamespace(prompt_len=prompt_len, num_generated=decode_len - 1)
+        reqs.append(SimpleNamespace(beam_group=group))
+        leader_lens.append(prompt_len + decode_len)
+        if width != FINISHED_GROUP:
+            num_members = width - 1
+            start = len(member_lens)
+            entries.append(
+                BeamTailEntry(
+                    group=group, leader_idx=row, start=start, end=start + num_members
+                )
+            )
+            member_lens.extend([prompt_len + decode_len] * num_members)
+    seq_lens = torch.tensor(leader_lens + member_lens, dtype=torch.int64)
+    return SimpleNamespace(
+        reqs=reqs,
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens,
+        beam_tail=SimpleNamespace(num_base_rows=len(reqs), entries=entries),
+        forward_mode=SimpleNamespace(is_decode=lambda: True),
+        device=torch.device("cpu"),
+    )
+
+
+def _variable_width_graph_inputs(max_rows, *, trie_head=True):
+    return BeamGraphInputs(
+        trie_levels_input=(
+            TrieLevelsInput(max_rows=max_rows, device="cpu") if trie_head else None
+        ),
+        shared_context_input=VariableWidthSharedContextInput(
+            max_rows=max_rows,
+            device="cpu",
+            req_to_token=torch.zeros(4, 8, dtype=torch.int32),
+            stream_k_grid=None,
+        ),
+    )
+
+
+def _read_layout(layout):
+    """What a layout buffer without a stream-K plan holds: (real rows, tiles). The
+    format the kernels read is a header of [tiles, real rows], then per tile
+    (leader row, first member row, members, prompt length, first beam)."""
+    header_len, tile_fields = 2, 5
+    num_tiles, num_real_rows = layout[:header_len].tolist()
+    tiles = layout[header_len : header_len + tile_fields * num_tiles]
+    return num_real_rows, tiles.view(num_tiles, tile_fields).tolist()
+
+
+def _rows_in_tiles(layout):
+    """The row of every beam of every tile of a layout, tile by tile."""
+    _, tiles = _read_layout(layout)
+    rows = []
+    for leader_row, first_member_row, num_members, _, first_beam in tiles:
+        beam_width = num_members + 1
+        for beam in range(first_beam, min(first_beam + BEAMS_PER_TILE, beam_width)):
+            rows.append(leader_row if beam == 0 else first_member_row + beam - 1)
+    return rows
+
+
+class TestVariableWidthBeamGraphInputs(CustomTestCase):
+    def test_settings_decide_what_the_graphs_hold(self):
+        """With a fixed width set, graphs hold the fixed-width shared-context
+        input, which limits them to whole groups of that width. Without one they
+        hold the variable-width input and are captured at every size. A LoRA server
+        gets no beam graphs: the beam label takes LoRA's slot of the graph key."""
+        # (fixed width, compact head, LoRA) -> the shared-context input's class,
+        # or None for a server without beam graphs.
+        cases = {
+            (2, True, False): FixedWidthSharedContextInput,
+            (None, True, False): VariableWidthSharedContextInput,
+            (None, False, False): VariableWidthSharedContextInput,
+            (None, True, True): None,
+        }
+        for (fixed_width, compact_head, lora), input_class in cases.items():
+            with self.subTest(
+                fixed_width=fixed_width, compact_head=compact_head, lora=lora
+            ):
+                with (
+                    _shared_context_server(fixed_width=fixed_width),
+                    patch.object(
+                        beam_decode_cuda_graph_runner,
+                        "get_beam_trie_config",
+                        return_value=_TRIE_CONFIG,
+                    ),
+                ):
+                    inputs = _create_beam_graph_inputs(
+                        _model_runner(compact_head=compact_head, lora=lora)
+                    )
+                if input_class is None:
+                    self.assertIsNone(inputs)
+                    continue
+                self.assertIsInstance(inputs.shared_context_input, input_class)
+                self.assertEqual(inputs.trie_levels_input is not None, compact_head)
+                # 3 rows are not whole groups of 2 beams.
+                self.assertEqual(inputs.can_capture(3), fixed_width is None)
+
+    def test_only_graphs_without_a_fixed_width_run_the_variable_width_layout(self):
+        """A server keeps the per-width buckets, and with them its kernel, unless
+        its beam decode graphs take any width: with the graphs off, or with a
+        fixed width, a batch must not get the variable-width layout."""
+        batch, runner = _decode_batch((4, 4)), _model_runner()
+        width_buckets = object()
+        # Server settings -> whether a batch gets the variable-width layout. The
+        # per-width buckets have a split-KV kernel.
+        cases = (
+            ({"decode_graphs": False}, False),
+            ({"decode_graphs": False, "kernel": "split_kv"}, False),
+            ({"fixed_width": 4}, False),
+            ({"fixed_width": 4, "kernel": "split_kv"}, False),
+            ({}, True),
+        )
+        for settings, expects_variable_width in cases:
+            with (
+                self.subTest(settings=settings),
+                _shared_context_server(**settings),
+                patch.object(
+                    shared_context_attention,
+                    "_build_width_buckets",
+                    return_value=width_buckets,
+                ),
+            ):
+                metadata = shared_context_attention.build_metadata(batch, runner)
+                self.assertEqual(
+                    isinstance(metadata, VariableWidthBeamAttentionMetadata),
+                    expects_variable_width,
+                )
+
+    def test_any_widths_load_into_a_larger_graph(self):
+        """Variable-width graphs take a batch of any widths and of fewer rows than
+        they hold. Loaded over a larger earlier batch's layout, the batch's tiles
+        must cover each of its rows exactly once."""
+        with _shared_context_server():
+            inputs = _variable_width_graph_inputs(max_rows=600)
+            self.assertTrue(inputs.can_capture(431))
+            captured = inputs.prepare_capture_inputs(512)
+            runner = _model_runner()
+            inputs.load_replay_inputs(
+                build_beam_forward_inputs(_decode_batch((300, 300)), runner)
+            )
+            beam = build_beam_forward_inputs(_decode_batch((2, 129, 300)), runner)
+            self.assertEqual(beam.trie_levels.shape[0], 431)
+            self.assertTrue(inputs.can_replay(beam, graph_size=512))
+            inputs.load_replay_inputs(beam)
+
+            layout = captured.attention_metadata.layout
+            num_real_rows, tiles = _read_layout(layout)
+            leader_rows = {leader_row for leader_row, _, _, _, _ in tiles}
+            self.assertEqual((num_real_rows, len(leader_rows)), (431, 3))
+            self.assertEqual(sorted(_rows_in_tiles(layout)), list(range(431)))
+
+    def test_dense_head_batch_replays_without_trie_levels(self):
+        """With the compact trie head off, a beam batch carries its variable-width
+        layout and no trie levels; a graph captured without levels replays it."""
+        with _shared_context_server():
+            inputs = _variable_width_graph_inputs(max_rows=600, trie_head=False)
+            captured = inputs.prepare_capture_inputs(512)
+            self.assertIsNone(captured.trie_levels)
+            beam = build_beam_forward_inputs(
+                _decode_batch((2, 129, 300)), _model_runner(compact_head=False)
+            )
+            self.assertIsNone(beam.trie_levels)
+            self.assertTrue(inputs.can_replay(beam, graph_size=512))
+            inputs.load_replay_inputs(beam)
+            self.assertEqual(
+                sorted(_rows_in_tiles(captured.attention_metadata.layout)),
+                list(range(431)),
+            )
+
+    def test_variable_width_graph_takes_no_ordinary_attention_batch(self):
+        """A batch that the layout builder turned away (here: a finished group's
+        leader is still in it) carries no layout; replaying it would attend the
+        previous batch's groups. A batch with a regular request carries no beam
+        inputs at all, so it decodes on the ordinary path."""
+        with _shared_context_server():
+            inputs = _variable_width_graph_inputs(max_rows=600)
+            inputs.prepare_capture_inputs(512)
+            beam = build_beam_forward_inputs(
+                _decode_batch((129, FINISHED_GROUP, 300)), _model_runner()
+            )
+            self.assertIsNotNone(beam.trie_levels)
+            self.assertIsNone(beam.attention_metadata)
+            self.assertFalse(inputs.can_replay(beam, graph_size=512))
+            with_regular_request = _decode_batch((129, REGULAR_REQUEST, 300))
+            self.assertIsNone(
+                build_beam_forward_inputs(with_regular_request, _model_runner())
+            )
+
+    def test_variable_width_graphs_refuse_a_kernel_they_lack(self):
+        """The variable-width layout has no split-KV kernel, and selecting it must
+        not silently run another one: the server fails when it creates its beam
+        graphs, and a batch fails on a server that captures none."""
+        runner = _model_runner()
+        with _shared_context_server(kernel="split_kv"):
+            with self.assertRaisesRegex(ValueError, "'split_kv', not one of"):
+                _create_beam_graph_inputs(runner)
+            with self.assertRaisesRegex(ValueError, "'split_kv', not one of"):
+                shared_context_attention.build_metadata(_decode_batch((4, 4)), runner)
+
+    def test_layout_buffer_holds_the_most_tiles_of_the_largest_graph(self):
+        """A graph's rows hold the most tiles when every group has two beams. The
+        layout of that batch, with a stream-K plan before its tiles, fills the
+        buffer that the graphs captured."""
+        max_rows = 64
+        grid = StreamKGrid(q_heads=1, num_ctas=7)
+        req_to_token = torch.zeros(4, 8, dtype=torch.int32)
+        shared_context_input = VariableWidthSharedContextInput(
+            max_rows=max_rows,
+            device="cpu",
+            req_to_token=req_to_token,
+            stream_k_grid=grid,
+        )
+        graph_layout = shared_context_input.prepare_capture_inputs(max_rows).layout
+        metadata = build_variable_width_metadata(
+            batch=_decode_batch((2,) * (max_rows // 2)),
+            req_to_token=req_to_token,
+            stream_k_grid=grid,
+        )
+        self.assertEqual(len(metadata.host_layout), len(graph_layout))
+        shared_context_input.load_replay_inputs(metadata)
+        self.assertEqual(graph_layout.tolist(), metadata.host_layout.tolist())
+
+
+# Tokens of a prompt block in the stream-K kernel.
+PROMPT_BLOCK = 64
+
+
+class TestStreamKPlan(CustomTestCase):
+    def test_plan_attends_every_work_unit_once_and_merges_what_it_splits(self):
+        """What the stream-K kernels rely on, for any batch, grid and way to place
+        the ranges:
+        - the parts of a (tile, head) cover its work units once and in order;
+        - a (tile, head) in a single part is written directly;
+        - a split one is merged once, from the CTA with its first part to the CTA
+          with its last;
+        - the merge kernel reads each part from the slot its CTA wrote.
+        """
+        # (prompt blocks, decode steps) of each tile.
+        batches = {
+            "one request": [(32, 2)] * 2,
+            "eight requests": [(32, 2)] * 16,
+            "uneven tiles": [(1, 1), (11, 3), (1, 5), (32, 1), (8, 2), (3, 1)],
+            "one tiny tile": [(1, 1)],
+        }
+        # None: the plan chooses how to place the ranges, as in serving.
+        for (name, tiles), q_heads, num_ctas, split_cost_units in itertools.product(
+            batches.items(),
+            (1, 16),
+            (1, 3, 7, 64, 188),
+            (None, NEVER_SPLIT, ALWAYS_SPLIT),
+        ):
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(
+                    self.subTest(
+                        batch=name,
+                        q_heads=q_heads,
+                        num_ctas=num_ctas,
+                        split=split_cost_units,
+                    )
+                )
+                if split_cost_units is not None:
+                    stack.enter_context(stream_k_split_cost(split_cost_units))
+                split_tile_qheads = self._check_plan(
+                    tiles, q_heads=q_heads, num_ctas=num_ctas
+                )
+                if split_cost_units == NEVER_SPLIT:
+                    self.assertEqual(split_tile_qheads, 0)
+                if split_cost_units == ALWAYS_SPLIT and num_ctas == 188:
+                    self.assertGreater(split_tile_qheads, 0)
+
+    def _check_plan(self, tiles, *, q_heads, num_ctas):
+        """Check one plan as the kernels read it; returns its number of split
+        (tile, head) pairs."""
+        # Of each (tile, head), in the plan's order.
+        num_work_units = [
+            blocks + steps for blocks, steps in tiles for _ in range(q_heads)
+        ]
+        plan = build_stream_k_plan(
+            work_units_per_tile=[
+                work_units(prompt_len=PROMPT_BLOCK * blocks, decode_len=steps)
+                for blocks, steps in tiles
+            ],
+            q_heads=q_heads,
+            num_ctas=num_ctas,
+        ).tolist()
+        self.assertEqual(len(plan), num_ctas)
+
+        # Per (tile, head), its parts in CTA order:
+        # (cta, work start, work end, partial, slot).
+        parts = collections.defaultdict(list)
+        # Per merged (tile, head): the CTAs whose slots the merge kernel reads.
+        merges = {}
+        # CTAs with an empty range; each marks its slot 2 * cta empty.
+        empty_ctas = set()
+        for cta, row in enumerate(plan):
+            start_tile, start_head, start_work, end_tile, end_head, end_work = row[:6]
+            merge_end = row[6]
+            first_tile_qhead = start_tile * q_heads + start_head
+            end_tile_qhead = end_tile * q_heads + end_head
+            is_empty = first_tile_qhead == end_tile_qhead and start_work == end_work
+            if is_empty:
+                empty_ctas.add(cta)
+            stop_tile_qhead = (
+                first_tile_qhead if is_empty else end_tile_qhead + (end_work > 0)
+            )
+            for tile_qhead in range(first_tile_qhead, stop_tile_qhead):
+                work_start = start_work if tile_qhead == first_tile_qhead else 0
+                stops_early = tile_qhead == end_tile_qhead
+                parts[tile_qhead].append(
+                    (
+                        cta,
+                        work_start,
+                        end_work if stops_early else num_work_units[tile_qhead],
+                        work_start > 0 or stops_early,
+                        2 * cta + (0 if work_start > 0 else 1),
+                    )
+                )
+            starts_tile_qhead = (start_tile, start_head) != (end_tile, end_head) or (
+                start_work == 0
+            )
+            if end_work > 0 and starts_tile_qhead:
+                self.assertNotIn(end_tile_qhead, merges)
+                merges[end_tile_qhead] = list(range(cta, merge_end))
+
+        written_slots = [2 * cta for cta in empty_ctas]
+        for tile_qhead, num_units in enumerate(num_work_units):
+            tile_qhead_parts = parts[tile_qhead]
+            starts = [start for _, start, _, _, _ in tile_qhead_parts]
+            ends = [end for _, _, end, _, _ in tile_qhead_parts]
+            self.assertEqual(starts, [0, *ends[:-1]])
+            self.assertEqual(ends[-1], num_units)
+            self.assertTrue(all(start < end for start, end in zip(starts, ends)))
+            if len(tile_qhead_parts) == 1:
+                self.assertFalse(tile_qhead_parts[0][3])
+                self.assertNotIn(tile_qhead, merges)
+                continue
+            self.assertTrue(all(partial for _, _, _, partial, _ in tile_qhead_parts))
+            part_slots = {cta: slot for cta, _, _, _, slot in tile_qhead_parts}
+            written_slots += part_slots.values()
+            merged_ctas = merges[tile_qhead]
+            self.assertEqual(
+                merged_ctas,
+                list(range(tile_qhead_parts[0][0], tile_qhead_parts[-1][0] + 1)),
+            )
+            # The merge kernel reads slot 2 * c + 1 of the first of them, slot 2 * c
+            # of the others; one without a part has an empty range.
+            for cta in merged_ctas:
+                slot = 2 * cta + (1 if cta == merged_ctas[0] else 0)
+                if cta in part_slots:
+                    self.assertEqual(slot, part_slots[cta])
+                else:
+                    self.assertIn(cta, empty_ctas)
+        self.assertEqual(len(written_slots), len(set(written_slots)))
+        return len(merges)
 
 
 if __name__ == "__main__":
