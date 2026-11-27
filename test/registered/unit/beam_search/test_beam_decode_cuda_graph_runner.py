@@ -32,7 +32,6 @@ from sglang.kernels.ops.attention.beam_shared_context_variable_width_stream_k im
 from sglang.srt.beam_search import (
     beam_decode_cuda_graph_runner,
     shared_context_attention,
-    shared_context_fixed_width,
     trie_output_head,
 )
 from sglang.srt.beam_search.batch_tail import BeamTailEntry
@@ -48,7 +47,7 @@ from sglang.srt.beam_search.forward_inputs import (
     BeamForwardInputs,
     build_beam_forward_inputs,
 )
-from sglang.srt.beam_search.shared_context_fixed_width import (
+from sglang.srt.beam_search.shared_context_attention import (
     BeamAttentionBucket,
     BeamAttentionMetadata,
 )
@@ -468,8 +467,8 @@ class TestVariableWidthBeamGraphInputs(CustomTestCase):
                 self.subTest(settings=settings),
                 _shared_context_server(**settings),
                 patch.object(
-                    shared_context_fixed_width,
-                    "build_fixed_width_metadata",
+                    shared_context_attention,
+                    "_build_width_buckets",
                     return_value=width_buckets,
                 ),
             ):

@@ -35,7 +35,7 @@ import torch
 from sglang.srt.beam_search import shared_context_attention
 from sglang.srt.beam_search import shared_context_variable_width as variable_width
 from sglang.srt.beam_search.forward_inputs import BeamForwardInputs
-from sglang.srt.beam_search.shared_context_fixed_width import (
+from sglang.srt.beam_search.shared_context_attention import (
     BeamAttentionBucket,
     BeamAttentionMetadata,
 )
