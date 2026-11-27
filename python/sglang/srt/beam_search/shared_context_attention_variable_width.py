@@ -297,7 +297,7 @@ def device_layout_parts(
 def _attention_kernel(stream_k: bool):
     """The kernel a layout runs, chosen by SGLANG_BEAM_SHARED_CONTEXT_KERNEL. Both
     take the same inputs; the stream-K kernel also takes its plan and grid size. Its module
-    says where each is faster."""
+    says how the two differ."""
     if stream_k:
         from sglang.kernels.ops.attention.beam_shared_context_variable_width_stream_k import (
             shared_context_attention_variable_width_stream_k,

@@ -48,7 +48,8 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
-# The SMs of an RTX PRO 6000, the grid the stream-K kernel was tuned with.
+# The grid the stream-K kernel was tuned with; fixed, so that a case's plan does
+# not depend on the test's GPU.
 TUNED_NUM_CTAS = 188
 
 

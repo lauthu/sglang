@@ -62,16 +62,13 @@ from sglang.kernels.ops.attention.beam_shared_context import (
     num_sms,
 )
 
-# Measured on RTX PRO 6000 (SM120), Qwen3-0.6B heads, 1-8 groups of 16-2,000 beams:
-# 64-token prompt blocks with 3 pipeline stages beat 32 or 128 tokens and 2 stages;
-# 4 warps are 1.7x slower.
+# Tokens per prompt block, pipeline stages and warps. Chosen by measurement.
 _BLOCK_N = 64
 _NUM_STAGES = 3
 _NUM_WARPS = 8
 # Programs per SM. The grid is fixed, so that a graph can keep it, and program p
 # of a query head takes tiles p, p + programs_per_head, ...; more programs than
-# SMs even out tiles of different lengths. Measured, same setup (2-16 tried): 8
-# is fastest for 4 groups of 2,000 beams and within 3 us of the best elsewhere.
+# SMs even out tiles of different lengths. Chosen by measurement.
 _PROGRAMS_PER_SM = 8
 
 # int32 entries of the layout's header and of one tile.
@@ -270,8 +267,8 @@ def _attend_prompt_blocks(
     # The blocks' tokens; the prompt's last block may hold fewer than BLOCK_N.
     first_token = first_block * BLOCK_N
     end_token = tl.minimum(end_block * BLOCK_N, prompt_len)
-    # Stepping by tokens, not blocks: per launch on SM120 the default kernel is 4%
-    # faster than with a block index, stream-K 2% slower.
+    # Stepping by tokens, not by a block index: the two forms compile to code of
+    # different speed, so re-time both kernels before changing it.
     for block_start in tl.range(first_token, end_token, BLOCK_N):
         token_indices = block_start + token_offsets
         token_mask = token_indices < prompt_len
@@ -662,8 +659,8 @@ def shared_context_attention_variable_width(
     - `block_m`: beams per tile; it must be the tile size the layout was built with.
     Returns the output, like `q`. The padding rows, those past the layout's real
     rows, are zeros.
-    Tuned on SM120 only. One program reads a tile's whole prompt; the stream-K
-    kernel of this layout splits long prompts over programs.
+    One program reads a tile's whole prompt; the stream-K kernel of this layout
+    splits long prompts over programs.
     """
     check_variable_width_inputs(
         q=q,
